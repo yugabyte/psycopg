@@ -3,17 +3,17 @@ requires = ["setuptools>=80.3.1", "wheel>=0.37"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "psycopg"
-description = "PostgreSQL database adapter for Python"
+name = "psycopg-yugabytedb"
+description = "YugabyteDB smart-driver fork of psycopg 3 — adds cluster-aware and topology-aware load balancing"
 
 # STOP AND READ! if you change:
-version = "3.3.4"
+version = "3.3.4.1.preview1"
 # also change:
-# - `docs/news.rst` to declare this as the current version or an unreleased one;
 # - `psycopg_c/pyproject.toml` to the same version;
+# - `psycopg_binary/pyproject.toml` to the same version;
 # - the `c ` and `binary` "optional-dependencies" below to the same version.
 #
-# NOTE: you can use `tools/bump_version.py` to maintain versions.
+# Version scheme: <upstream-psycopg-version>.N.previewM for EA, <upstream>.N for GA.
 
 license = "LGPL-3.0-only"
 license-files = ["LICENSE.txt"]
@@ -46,13 +46,15 @@ dependencies = [
 name = "Daniele Varrazzo"
 email = "daniele.varrazzo@gmail.com"
 
+[[project.authors]]
+name = "Yugabyte"
+email = "support@yugabyte.com"
+
 [project.urls]
-Homepage = "https://psycopg.org/"
-Documentation = "https://psycopg.org/psycopg3/docs/"
-Changes = "https://psycopg.org/psycopg3/docs/news.html"
-Code = "https://github.com/psycopg/psycopg"
-"Issue Tracker" = "https://github.com/psycopg/psycopg/issues"
-Funding = "https://github.com/sponsors/dvarrazzo"
+Homepage = "https://www.yugabyte.com/"
+Documentation = "https://docs.yugabyte.com/preview/drivers-orms/python/"
+"Upstream psycopg" = "https://psycopg.org/"
+Code = "https://github.com/yugabyte/psycopg-yugabytedb"
 
 [project.readme]
 file = "README.rst"
@@ -60,10 +62,10 @@ content-type = "text/x-rst"
 
 [project.optional-dependencies]
 c = [
-    "psycopg-c == 3.3.4; implementation_name != \"pypy\"",
+    "psycopg-yugabytedb-c == 3.3.4.1.preview1; implementation_name != \"pypy\"",
 ]
 binary = [
-    "psycopg-binary == 3.3.4; implementation_name != \"pypy\"",
+    "psycopg-yugabytedb-binary == 3.3.4.1.preview1; implementation_name != \"pypy\"",
 ]
 pool = [
     "psycopg-pool",

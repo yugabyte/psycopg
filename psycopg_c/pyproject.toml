@@ -22,9 +22,12 @@ backend-path = ["build_backend"]
 cython-requires = ["Cython >= 3.1.1"]
 
 [project]
-name = "psycopg-c"
-description = "PostgreSQL database adapter for Python -- C optimisation distribution"
-version = "3.3.4"
+name = "psycopg-yugabytedb-c"
+description = "YugabyteDB smart-driver — C optimisation distribution (fork of psycopg-c)"
+# Stays in lock-step with the psycopg-yugabytedb driver version.
+# The import name remains `psycopg_c` so the unmodified upstream C code can ride along
+# unchanged; only the distribution name on PyPI differs.
+version = "3.3.4.1.preview1"
 license = "LGPL-3.0-only"
 license-files = ["LICENSE.txt"]
 classifiers = [
@@ -52,13 +55,15 @@ requires-python = ">= 3.10"
 name = "Daniele Varrazzo"
 email = "daniele.varrazzo@gmail.com"
 
+[[project.authors]]
+name = "Yugabyte"
+email = "support@yugabyte.com"
+
 [project.urls]
-Homepage = "https://psycopg.org/"
-Documentation = "https://psycopg.org/psycopg3/docs/"
-Changes = "https://psycopg.org/psycopg3/docs/news.html"
-Code = "https://github.com/psycopg/psycopg"
-"Issue Tracker" = "https://github.com/psycopg/psycopg/issues"
-Funding = "https://github.com/sponsors/dvarrazzo"
+Homepage = "https://www.yugabyte.com/"
+Documentation = "https://docs.yugabyte.com/preview/drivers-orms/python/"
+"Upstream psycopg" = "https://psycopg.org/"
+Code = "https://github.com/yugabyte/psycopg-yugabytedb"
 
 [project.readme]
 file = "README.rst"
