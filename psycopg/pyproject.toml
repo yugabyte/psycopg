@@ -7,13 +7,17 @@ name = "psycopg-yugabytedb"
 description = "YugabyteDB smart-driver fork of psycopg 3 — adds cluster-aware and topology-aware load balancing"
 
 # STOP AND READ! if you change:
-version = "3.3.4.1.preview1"
+version = "3.3.4.1rc1"
 # also change:
 # - `psycopg_c/pyproject.toml` to the same version;
 # - `psycopg_binary/pyproject.toml` to the same version;
 # - the `c ` and `binary` "optional-dependencies" below to the same version.
 #
-# Version scheme: <upstream-psycopg-version>.N.previewM for EA, <upstream>.N for GA.
+# Version scheme: <upstream-psycopg-version>.N.rcM for EA pre-releases,
+# <upstream>.N for GA. `rcM` is PEP 440's canonical pre-release tag and is
+# what `pip show`, the wheel filename, and PyPI all display, so we write it
+# directly here rather than the alias `previewM` (which PEP 440 normalises
+# to the same `rcM` but leaves an inconsistent-looking source).
 
 license = "LGPL-3.0-only"
 license-files = ["LICENSE.txt"]
@@ -62,10 +66,10 @@ content-type = "text/x-rst"
 
 [project.optional-dependencies]
 c = [
-    "psycopg-yugabytedb-c == 3.3.4.1.preview1; implementation_name != \"pypy\"",
+    "psycopg-yugabytedb-c == 3.3.4.1rc1; implementation_name != \"pypy\"",
 ]
 binary = [
-    "psycopg-yugabytedb-binary == 3.3.4.1.preview1; implementation_name != \"pypy\"",
+    "psycopg-yugabytedb-binary == 3.3.4.1rc1; implementation_name != \"pypy\"",
 ]
 pool = [
     "psycopg-pool",
