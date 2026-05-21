@@ -117,11 +117,42 @@ def test_single_host_bootstrap(yb_cluster, assert_balanced):
 # --------------------------------------------------------------------- topology
 
 
-def test_topology_exact_match(yb_cluster, assert_balanced):
-    """All 3 cluster nodes are in cloud1.datacenter1.rack1. With topology_keys
-    pointing at that exact placement, all nodes are eligible — same balance
-    as the no-topology case."""
-    dsn = yb_cluster + " load_balance_hosts=true topology_keys=cloud1.datacenter1.rack1"
+def test_topology_exact_match(yb_multi_zone_cluster, assert_balanced):
+    """Multi-zone cluster: 2 nodes in zoneA (127.0.0.1, .2), 1 in zoneB (.3).
+    With `topology_keys=cloud1.datacenter1.zoneA`, only the two zoneA nodes
+    are eligible. 12 conns must distribute exactly 6/6 across them; the
+    zoneB node must receive ZERO traffic.
+
+    This is the real topology-filter test — it would FAIL (with ~4/4/4)
+    if the filter were a no-op."""
+    dsn = (yb_multi_zone_cluster
+           + " load_balance_hosts=true topology_keys=cloud1.datacenter1.zoneA")
+    conns = []
+    try:
+        for _ in range(12):
+            conns.append(psycopg.connect(dsn))
+        uuid = conns[0]._yb_uuid
+        assert_balanced(uuid, {
+            "127.0.0.1": 6,
+            "127.0.0.2": 6,
+            "127.0.0.3": 0,
+        })
+    finally:
+        for c in conns:
+            c.close()
+
+
+def test_topology_wildcard_zone(yb_multi_zone_cluster, assert_balanced):
+    """Multi-zone cluster as above. `topology_keys=cloud1.datacenter1.*`
+    wildcard-matches BOTH zoneA and zoneB, so all three nodes are eligible
+    and 12 conns distribute 4/4/4. Proves the wildcard parsing path runs
+    and that wildcards genuinely match multiple zones (not just one).
+
+    Compare with `test_topology_exact_match` (above): same cluster, same
+    conn count, but the exact-zone filter rejects zoneB → 6/6/0; the
+    wildcard matches both zones → 4/4/4."""
+    dsn = (yb_multi_zone_cluster
+           + " load_balance_hosts=true topology_keys=cloud1.datacenter1.*")
     conns = []
     try:
         for _ in range(12):
@@ -131,24 +162,6 @@ def test_topology_exact_match(yb_cluster, assert_balanced):
             "127.0.0.1": 4,
             "127.0.0.2": 4,
             "127.0.0.3": 4,
-        })
-    finally:
-        for c in conns:
-            c.close()
-
-
-def test_topology_wildcard_zone(yb_cluster, assert_balanced):
-    """Wildcard zone (`cloud1.datacenter1.*`) matches all nodes in that region."""
-    dsn = yb_cluster + " load_balance_hosts=true topology_keys=cloud1.datacenter1.*"
-    conns = []
-    try:
-        for _ in range(9):
-            conns.append(psycopg.connect(dsn))
-        uuid = conns[0]._yb_uuid
-        assert_balanced(uuid, {
-            "127.0.0.1": 3,
-            "127.0.0.2": 3,
-            "127.0.0.3": 3,
         })
     finally:
         for c in conns:

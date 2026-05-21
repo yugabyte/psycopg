@@ -60,6 +60,9 @@ else:
     _INTERRUPTED = KeyboardInterrupt
 
 logger = logging.getLogger("psycopg")
+# psycopg-yugabytedb fork: separate logger for smart-driver dispatcher lines so
+# users can tune our verbosity without touching upstream's "psycopg" channel.
+yb_logger = logging.getLogger("psycopg.yb.dispatcher")
 
 
 class AsyncConnection(BaseConnection[Row]):
@@ -117,6 +120,10 @@ class AsyncConnection(BaseConnection[Row]):
         )
 
         if not yb_params.smart_driver_enabled:
+            yb_logger.debug(
+                "smart driver disabled (load_balance_hosts absent or pass-through); "
+                "calling upstream _aconnect_plain"
+            )
             return await cls._aconnect_plain(
                 cleaned_conninfo,
                 autocommit=autocommit,
@@ -128,6 +135,12 @@ class AsyncConnection(BaseConnection[Row]):
             )
 
         # --- Smart-driver path ---
+        yb_logger.debug(
+            "smart driver enabled (topology_keys=%s, refresh_interval=%ds, ttl=%ds)",
+            yb_params.topology_keys or "—",
+            yb_params.refresh_interval_s,
+            yb_params.failed_host_reconnect_delay_s,
+        )
         registry = ClusterRegistry.instance()
         # ClusterKey wants a dict; parse the cleaned conninfo once for it.
         pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
@@ -149,6 +162,10 @@ class AsyncConnection(BaseConnection[Row]):
             node = policy.get_least_loaded_server(state, attempted, ttl)
             if node is None:
                 msg = "no eligible YugabyteDB node could be connected"
+                yb_logger.warning(
+                    "%s (attempted=%s, last_err=%s)",
+                    msg, sorted(attempted), last_err,
+                )
                 if last_err is not None:
                     raise e.OperationalError(msg) from last_err
                 raise e.OperationalError(msg)
@@ -171,6 +188,10 @@ class AsyncConnection(BaseConnection[Row]):
                 # the explicit `decrement` is belt-and-braces and keeps the
                 # invariant "every reservation pairs with a release" easy to
                 # reason about.
+                yb_logger.info(
+                    "connect failed on %s (uuid=%s); marking failed and retrying: %s",
+                    node.host, state.uuid, exc,
+                )
                 registry.decrement(state.uuid, node.host)
                 registry.mark_failed(state.uuid, node.host)
                 attempted.add(node.host)
@@ -182,11 +203,19 @@ class AsyncConnection(BaseConnection[Row]):
                 # reservation still needs releasing. Do NOT call mark_failed —
                 # the node is not necessarily down. Roll back only, then
                 # re-raise so the caller sees the original cause.
+                yb_logger.debug(
+                    "connect interrupted on %s (uuid=%s); releasing reservation",
+                    node.host, state.uuid,
+                )
                 registry.decrement(state.uuid, node.host)
                 raise
 
             conn._yb_uuid = state.uuid
             conn._yb_host = node.host
+            yb_logger.debug(
+                "smart-driver connect succeeded: host=%s, uuid=%s",
+                node.host, state.uuid,
+            )
             return conn
 
     @classmethod

@@ -91,13 +91,56 @@ Topology-aware example — bind traffic to one zone:
 
 The upstream ``psycopg-pool`` connection pool works unchanged with the smart
 driver — the dispatcher sits underneath the pool, so pool-managed connections
-honour the configured policy too.
+honour the configured policy too. Install it via the ``[pool]`` extra:
 
-The fork is `pre-release`_. Install with ``pip install --pre psycopg-yugabytedb``
-or pin to ``3.3.4.1rc1``. It cannot coexist with upstream ``psycopg`` in the
-same environment (both install into ``site-packages/psycopg/``).
+.. code-block:: bash
+
+    pip install --pre "psycopg-yugabytedb[pool]"
+
+That pulls our driver plus the unmodified upstream ``psycopg-pool``; the
+pool's ``import psycopg`` resolves to our driver and every conn the pool
+opens goes through the dispatcher.
+
+The fork is `pre-release`_. Without the ``[pool]`` extra, install with
+``pip install --pre psycopg-yugabytedb`` or pin to ``3.3.4.1rc1``. It cannot
+coexist with upstream ``psycopg`` in the same environment (both install into
+``site-packages/psycopg/``).
 
 .. _pre-release: https://packaging.python.org/en/latest/specifications/version-specifiers/#pre-releases
+
+Logging
+~~~~~~~
+
+Every smart-driver module logs to its own logger under ``psycopg.yb.*``.
+Levels follow the standard library, plus a custom ``TRACE`` level (numeric
+5, finer than ``DEBUG``) for counter-mutation-level firehose detail.
+
+* ``WARNING`` — driver gave up (no eligible nodes, control conn re-open failed)
+* ``INFO`` — cluster bootstrap, topology change observed, host quarantined,
+  control conn re-opened on a survivor
+* ``DEBUG`` — per-pick, per-refresh, per-control-conn open/close
+* ``TRACE`` — every counter increment / decrement, every filtered candidate
+
+Enable:
+
+.. code-block:: python
+
+    import logging
+    from psycopg.yb import TRACE
+
+    logging.basicConfig(level=logging.INFO)
+
+    # Lifecycle events only (default INFO above is fine):
+    logging.getLogger("psycopg.yb").setLevel(logging.INFO)
+
+    # Per-operation debug:
+    logging.getLogger("psycopg.yb").setLevel(logging.DEBUG)
+
+    # Full firehose:
+    logging.getLogger("psycopg.yb").setLevel(TRACE)
+
+    # Or narrow to one subsystem:
+    logging.getLogger("psycopg.yb.policy").setLevel(logging.DEBUG)
 
 
 Installation

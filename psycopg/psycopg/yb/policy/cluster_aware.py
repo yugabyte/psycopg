@@ -20,16 +20,20 @@ lock is released.
 
 from __future__ import annotations
 
+import logging
 import random
 import sys
 import time
 from typing import TYPE_CHECKING
 
+from .. import TRACE
 from .base import LoadBalancingPolicy, is_eligible
 
 if TYPE_CHECKING:
     from ..node import NodeInfo
     from ..registry import ClusterState
+
+logger = logging.getLogger(__name__)
 
 
 class ClusterAwarePolicy(LoadBalancingPolicy):
@@ -53,6 +57,8 @@ class ClusterAwarePolicy(LoadBalancingPolicy):
             tied: list["NodeInfo"] = []
             for n in state.nodes.values():
                 if not self._is_eligible(n, attempted, now, ttl):
+                    logger.log(TRACE, "policy filter: skip %s (count=%d, is_down=%s)",
+                               n.host, n.connection_count, n.is_down)
                     continue
                 if n.connection_count < min_count:
                     min_count = n.connection_count
@@ -60,9 +66,23 @@ class ClusterAwarePolicy(LoadBalancingPolicy):
                 elif n.connection_count == min_count:
                     tied.append(n)
             if not tied:
+                logger.debug(
+                    "policy: no eligible node (attempted=%s, total_nodes=%d)",
+                    sorted(attempted), len(state.nodes),
+                )
                 return None
             chosen = random.choice(tied)
             chosen.connection_count += 1
+            if len(tied) > 1:
+                logger.debug(
+                    "policy pick: %s (count: %d→%d) via tie-break across %d hosts",
+                    chosen.host, min_count, chosen.connection_count, len(tied),
+                )
+            else:
+                logger.debug(
+                    "policy pick: %s (count: %d→%d), unique minimum",
+                    chosen.host, min_count, chosen.connection_count,
+                )
             return chosen
 
     # Overridable for subclasses (TopologyAwarePolicy adds the placement filter).

@@ -19,13 +19,26 @@ adaptations for Python:
 
 from __future__ import annotations
 
+import logging
 import time
 import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
-from . import discovery
+from . import TRACE, discovery
 from .node import NodeInfo
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_host(conn) -> str:
+    """Best-effort `conn.info.host`. Returns "?" if info isn't available
+    (e.g. mocked connection in unit tests, or after the conn was force-
+    finished by `clear()`)."""
+    try:
+        return conn.info.host
+    except Exception:
+        return "?"
 
 if TYPE_CHECKING:
     from ..connection import Connection
@@ -149,16 +162,19 @@ class ClusterRegistry:
         with self._lock:
             uuid = self._key_to_uuid.get(key)
             if uuid is not None:
+                logger.debug("cluster cache hit: key=%s → uuid=%s", key, uuid)
                 return self._clusters[uuid]
 
         # Late import to break the cycle (connection_async imports from yb/).
         # The async version of this helper is `_aconnect_plain`; the sync sibling
         # is renamed to `_connect_plain` by async_to_sync's names_map.
         from ..connection import Connection
+        logger.debug("bootstrapping cluster via contact host(s): %s", kwargs.get("host"))
         conn = Connection._connect_plain(conninfo, **kwargs)
         try:
             nodes, uuid = discovery.fetch_servers_sync(conn)
         except Exception:
+            logger.warning("bootstrap fetch_servers failed; closing contact conn")
             try:
                 conn.close()
             except Exception:
@@ -170,8 +186,18 @@ class ClusterRegistry:
             if existing is not None:
                 self._key_to_uuid[key] = uuid
                 if existing.control_sync is None:
+                    logger.debug(
+                        "bootstrap race: aliasing key=%s to existing uuid=%s; "
+                        "attaching our conn as the sync control connection",
+                        key, uuid,
+                    )
                     existing.control_sync = conn
                 else:
+                    logger.debug(
+                        "bootstrap race: aliasing key=%s to existing uuid=%s; "
+                        "discarding redundant contact conn",
+                        key, uuid,
+                    )
                     try:
                         conn.close()
                     except Exception:
@@ -189,6 +215,14 @@ class ClusterRegistry:
             )
             self._clusters[uuid] = state
             self._key_to_uuid[key] = uuid
+            logger.info(
+                "cluster bootstrapped: uuid=%s, %d nodes (%s); sync control conn on %s",
+                uuid, len(nodes),
+                ",".join(n.host for n in nodes),
+                _safe_host(conn),
+            )
+            for n in nodes:
+                logger.log(TRACE, "  discovered node: %s", n)
             return state
 
     async def aget_or_bootstrap(
@@ -197,13 +231,19 @@ class ClusterRegistry:
         with self._lock:
             uuid = self._key_to_uuid.get(key)
             if uuid is not None:
+                logger.debug("cluster cache hit (async): key=%s → uuid=%s", key, uuid)
                 return self._clusters[uuid]
 
         from ..connection_async import AsyncConnection
+        logger.debug(
+            "bootstrapping cluster (async) via contact host(s): %s",
+            kwargs.get("host"),
+        )
         conn = await AsyncConnection._aconnect_plain(conninfo, **kwargs)
         try:
             nodes, uuid = await discovery.fetch_servers_async(conn)
         except Exception:
+            logger.warning("bootstrap fetch_servers (async) failed; closing contact conn")
             try:
                 await conn.close()
             except Exception:
@@ -215,8 +255,18 @@ class ClusterRegistry:
             if existing is not None:
                 self._key_to_uuid[key] = uuid
                 if existing.control_async is None:
+                    logger.debug(
+                        "bootstrap race (async): aliasing key=%s to existing uuid=%s; "
+                        "attaching our conn as the async control connection",
+                        key, uuid,
+                    )
                     existing.control_async = conn
                 else:
+                    logger.debug(
+                        "bootstrap race (async): aliasing key=%s to existing uuid=%s; "
+                        "discarding redundant contact conn",
+                        key, uuid,
+                    )
                     try:
                         await conn.close()
                     except Exception:
@@ -234,26 +284,54 @@ class ClusterRegistry:
             )
             self._clusters[uuid] = state
             self._key_to_uuid[key] = uuid
+            logger.info(
+                "cluster bootstrapped (async): uuid=%s, %d nodes (%s); "
+                "async control conn on %s",
+                uuid, len(nodes),
+                ",".join(n.host for n in nodes),
+                _safe_host(conn),
+            )
+            for n in nodes:
+                logger.log(TRACE, "  discovered node: %s", n)
             return state
 
     # ------------------------------------------------------------------ refresh
 
     def refresh_if_stale(self, state: ClusterState, interval_s: int) -> None:
         if not self._claim_refresh_slot(state, interval_s):
+            logger.log(TRACE, "refresh skipped: within interval (%ds)", interval_s)
             return
+        logger.debug("refresh start: uuid=%s, interval=%ds", state.uuid, interval_s)
         if not self._do_refresh_sync(state):
             # No refresh succeeded (no live control conn, or fetch failed on
             # every attempt). Re-flag so the next caller retries immediately
             # instead of waiting a full interval.
+            logger.warning(
+                "refresh failed: no usable control conn for uuid=%s; "
+                "re-flagging force_refresh", state.uuid,
+            )
             with state.lock:
                 state.force_refresh = True
+        else:
+            logger.debug("refresh complete: uuid=%s, %d nodes",
+                         state.uuid, len(state.nodes))
 
     async def arefresh_if_stale(self, state: ClusterState, interval_s: int) -> None:
         if not self._claim_refresh_slot(state, interval_s):
+            logger.log(TRACE, "refresh skipped (async): within interval (%ds)", interval_s)
             return
+        logger.debug("refresh start (async): uuid=%s, interval=%ds",
+                     state.uuid, interval_s)
         if not await self._ado_refresh_async(state):
+            logger.warning(
+                "refresh failed (async): no usable control conn for uuid=%s; "
+                "re-flagging force_refresh", state.uuid,
+            )
             with state.lock:
                 state.force_refresh = True
+        else:
+            logger.debug("refresh complete (async): uuid=%s, %d nodes",
+                         state.uuid, len(state.nodes))
 
     def _do_refresh_sync(self, state: ClusterState) -> bool:
         """Attempt the fetch+merge once. If the cached control conn fails,
@@ -266,13 +344,18 @@ class ClusterRegistry:
         first pick can already skip the dead host and discover newly-added
         nodes, without needing a second connect to drive the reopen.
         """
-        for _ in range(2):
+        for attempt in range(2):
             ctrl = self._ensure_control_sync(state)
             if ctrl is None:
+                logger.debug("refresh attempt %d: no control conn available", attempt)
                 return False
             try:
                 new_nodes, _ = discovery.fetch_servers_sync(ctrl)
-            except Exception:
+            except Exception as exc:
+                logger.info(
+                    "refresh attempt %d: fetch_servers failed on control host; "
+                    "dropping and retrying (%s)", attempt, exc,
+                )
                 self._drop_control_sync(state)
                 continue
             self._merge_new_nodes(state, new_nodes)
@@ -280,13 +363,19 @@ class ClusterRegistry:
         return False
 
     async def _ado_refresh_async(self, state: ClusterState) -> bool:
-        for _ in range(2):
+        for attempt in range(2):
             ctrl = await self._aensure_control_async(state)
             if ctrl is None:
+                logger.debug("refresh attempt %d (async): no control conn available",
+                             attempt)
                 return False
             try:
                 new_nodes, _ = await discovery.fetch_servers_async(ctrl)
-            except Exception:
+            except Exception as exc:
+                logger.info(
+                    "refresh attempt %d (async): fetch_servers failed on control "
+                    "host; dropping and retrying (%s)", attempt, exc,
+                )
                 await self._drop_control_async(state)
                 continue
             self._merge_new_nodes(state, new_nodes)
@@ -326,15 +415,22 @@ class ClusterRegistry:
             candidates = [n for n in state.nodes.values() if not n.is_down]
 
         from ..connection import Connection
+        logger.debug(
+            "control conn re-open: trying %d non-down candidate(s) for uuid=%s",
+            len(candidates), state.uuid,
+        )
         for node in candidates:
             per_host = {
                 **state.bootstrap_kwargs,
                 "host": node.host,
                 "port": node.port,
             }
+            logger.log(TRACE, "control conn re-open: trying %s", node.host)
             try:
                 conn = Connection._connect_plain(state.bootstrap_conninfo, **per_host)
-            except Exception:
+            except Exception as exc:
+                logger.log(TRACE, "control conn re-open: %s refused (%s)",
+                           node.host, exc)
                 # We just discovered this host refuses connections. Mark it
                 # failed so the dispatcher's next pick doesn't waste a real
                 # connect attempt on it.
@@ -343,13 +439,20 @@ class ClusterRegistry:
             with state.lock:
                 if state.control_sync is None:
                     state.control_sync = conn
+                    logger.info("control conn re-opened on %s for uuid=%s",
+                                node.host, state.uuid)
                     return conn
                 winner = state.control_sync
             try:
                 conn.close()
             except Exception:
                 pass
+            logger.debug("control conn re-open race lost; closing our duplicate")
             return winner
+        logger.warning(
+            "control conn re-open: every non-down candidate refused for uuid=%s; "
+            "smart driver going blind until next refresh attempt", state.uuid,
+        )
         return None
 
     async def _aensure_control_async(
@@ -365,17 +468,24 @@ class ClusterRegistry:
             candidates = [n for n in state.nodes.values() if not n.is_down]
 
         from ..connection_async import AsyncConnection
+        logger.debug(
+            "control conn re-open (async): trying %d non-down candidate(s) for uuid=%s",
+            len(candidates), state.uuid,
+        )
         for node in candidates:
             per_host = {
                 **state.bootstrap_kwargs,
                 "host": node.host,
                 "port": node.port,
             }
+            logger.log(TRACE, "control conn re-open (async): trying %s", node.host)
             try:
                 conn = await AsyncConnection._aconnect_plain(
                     state.bootstrap_conninfo, **per_host
                 )
-            except Exception:
+            except Exception as exc:
+                logger.log(TRACE, "control conn re-open (async): %s refused (%s)",
+                           node.host, exc)
                 # Refusing host → mark it failed so the dispatcher's next
                 # pick skips it for the TTL window.
                 self.mark_failed(state.uuid, node.host)
@@ -383,13 +493,23 @@ class ClusterRegistry:
             with state.lock:
                 if state.control_async is None:
                     state.control_async = conn
+                    logger.info("control conn re-opened (async) on %s for uuid=%s",
+                                node.host, state.uuid)
                     return conn
                 winner = state.control_async
             try:
                 await conn.close()
             except Exception:
                 pass
+            logger.debug(
+                "control conn re-open (async) race lost; closing our duplicate"
+            )
             return winner
+        logger.warning(
+            "control conn re-open (async): every non-down candidate refused for "
+            "uuid=%s; smart driver going blind until next refresh attempt",
+            state.uuid,
+        )
         return None
 
     def _merge_new_nodes(
@@ -403,6 +523,10 @@ class ClusterRegistry:
         `_ensure_control_sync` refusing a dead host) is now stale.
         """
         with state.lock:
+            old_hosts = set(state.nodes.keys())
+            new_hosts = {n.host for n in new_nodes}
+            added = new_hosts - old_hosts
+            removed = old_hosts - new_hosts
             new_dict: dict[str, NodeInfo] = {}
             for n in new_nodes:
                 if (existing := state.nodes.get(n.host)) is not None:
@@ -412,6 +536,11 @@ class ClusterRegistry:
                 new_dict[n.host] = n
             state.nodes = new_dict
             state.force_refresh = False
+        if added or removed:
+            logger.info(
+                "topology change observed for uuid=%s: added=%s removed=%s",
+                state.uuid, sorted(added) or "—", sorted(removed) or "—",
+            )
 
     def _drop_control_sync(self, state: ClusterState) -> None:
         with state.lock:
@@ -419,6 +548,8 @@ class ClusterRegistry:
             state.control_sync = None
             state.force_refresh = True
         if ctrl is not None:
+            logger.debug("control conn dropped for uuid=%s (was on %s)",
+                         state.uuid, _safe_host(ctrl))
             try:
                 ctrl.close()
             except Exception:
@@ -430,6 +561,8 @@ class ClusterRegistry:
             state.control_async = None
             state.force_refresh = True
         if ctrl is not None:
+            logger.debug("control conn dropped (async) for uuid=%s (was on %s)",
+                         state.uuid, _safe_host(ctrl))
             try:
                 await ctrl.close()
             except Exception:
@@ -444,6 +577,7 @@ class ClusterRegistry:
         with state.lock:
             if (ni := state.nodes.get(host)) is not None:
                 ni.connection_count += 1
+                logger.log(TRACE, "increment: %s → %d", host, ni.connection_count)
 
     def decrement(self, uuid: str, host: str) -> None:
         state = self._clusters.get(uuid)
@@ -452,6 +586,7 @@ class ClusterRegistry:
         with state.lock:
             if (ni := state.nodes.get(host)) is not None:
                 ni.connection_count = max(0, ni.connection_count - 1)
+                logger.log(TRACE, "decrement: %s → %d", host, ni.connection_count)
 
     def mark_failed(self, uuid: str, host: str) -> None:
         state = self._clusters.get(uuid)
@@ -464,6 +599,7 @@ class ClusterRegistry:
                 ni.is_down_since = now
                 ni.connection_count = 0
             state.force_refresh = True
+        logger.info("host quarantined: %s (uuid=%s) — connect failure", host, uuid)
 
     # ------------------------------------------------------------------ test hooks
     #

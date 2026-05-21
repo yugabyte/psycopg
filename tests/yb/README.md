@@ -6,15 +6,21 @@ filename — no decorators on individual tests):
 | Marker     | Files                                            | Count | Needs                            | Typical runtime |
 |------------|--------------------------------------------------|-------|----------------------------------|------------------|
 | `yb_unit`  | `test_params`, `test_node`, `test_policy`, `test_registry` | 92 | nothing (pure Python)            | < 1 s total      |
-| `yb`       | `test_smart_driver*.py` (sync + `_async` siblings) | 52 | real YB cluster + `yb-ctl`       | ~10 s/test (cluster cycle), ~15 min total |
+| `yb`       | `test_smart_driver*.py` (sync + `_async` siblings) | 77 | real YB cluster + `yb-ctl`       | ~10 s/test (cluster cycle), ~25 min total |
 | `perf`     | `perf/bench.py` (driven by `perf/run_perf.sh`)   | 3 scenarios | running cluster + pip access | ~30 s/scenario   |
 
 The integration suite intentionally mirrors every sync scenario on the async
 path. The sync surface lives in `test_smart_driver.py`,
-`test_smart_driver_failover.py`, `test_smart_driver_topology_failover.py`;
-the async siblings live in the matching `*_async.py` files. Sync/async drift
+`test_smart_driver_failover.py`, `test_smart_driver_topology_failover.py`,
+`test_smart_driver_pool.py`, and `test_smart_driver_pool_failover.py`; the
+async siblings live in the matching `*_async.py` files. Sync/async drift
 is the failure mode this mirroring is set up to catch — keep both halves in
 lockstep when adding scenarios.
+
+The {direct-connect, pool} × {cluster-aware, topology-aware} × {steady,
+failure-mode} cube is fully covered. Pool tests require `psycopg-pool`
+installed (`pytest.importorskip`); install it with the fork's `[pool]`
+extra: `pip install -e "./psycopg[pool]"`.
 
 ## Running
 
@@ -88,20 +94,24 @@ Tests that hit this path:
 
 ```
 tests/yb/
-├── conftest.py                                    pytest config + fixtures
-├── test_params.py                                 [yb_unit] conninfo parsing
-├── test_node.py                                   [yb_unit] NodeInfo, Placement
-├── test_policy.py                                 [yb_unit] policy picker behaviour
-├── test_registry.py                               [yb_unit] ClusterRegistry, ClusterKey, control reopen
-├── test_smart_driver.py                           [yb]      sync integration
-├── test_smart_driver_async.py                     [yb]      async integration mirror
-├── test_smart_driver_failover.py                  [yb]      sync failover suite
-├── test_smart_driver_failover_async.py            [yb]      async failover mirror
-├── test_smart_driver_topology_failover.py         [yb]      sync topology × node-state matrix
-├── test_smart_driver_topology_failover_async.py   [yb]      async topology mirror
+├── conftest.py                                       pytest config + fixtures
+├── test_params.py                                    [yb_unit] conninfo parsing
+├── test_node.py                                      [yb_unit] NodeInfo, Placement
+├── test_policy.py                                    [yb_unit] policy picker behaviour
+├── test_registry.py                                  [yb_unit] ClusterRegistry, ClusterKey, control reopen
+├── test_smart_driver.py                              [yb]      sync direct-connect integration
+├── test_smart_driver_async.py                        [yb]      async direct-connect mirror
+├── test_smart_driver_failover.py                     [yb]      sync cluster-aware failover suite
+├── test_smart_driver_failover_async.py               [yb]      async cluster-aware failover mirror
+├── test_smart_driver_topology_failover.py            [yb]      sync topology × node-state matrix
+├── test_smart_driver_topology_failover_async.py      [yb]      async topology × node-state mirror
+├── test_smart_driver_pool.py                         [yb]      sync ConnectionPool steady-state
+├── test_smart_driver_pool_async.py                   [yb]      async AsyncConnectionPool steady-state
+├── test_smart_driver_pool_failover.py                [yb]      sync pool × failover (cluster + topology)
+├── test_smart_driver_pool_failover_async.py          [yb]      async pool × failover mirror
 └── perf/
-    ├── bench.py                                   driver-agnostic connect+close timer
-    └── run_perf.sh                                installs upstream vs fork sequentially, compares
+    ├── bench.py                                      driver-agnostic connect+close timer
+    └── run_perf.sh                                   installs upstream vs fork sequentially, compares
 ```
 
 ## Cluster lifecycle and fixtures
@@ -192,7 +202,7 @@ topology keys union, single-pass invariant over `state.nodes.values()`.
 `build_policy` selects topology-aware when keys are set, cluster-aware
 otherwise.
 
-### Integration tests (`yb`, 52 tests, real cluster)
+### Integration tests (`yb`, 77 tests, real cluster)
 
 Every bullet runs in **both sync and async** unless explicitly noted:
 
@@ -258,6 +268,45 @@ exist on the sync path):
 * Stop node OUTSIDE topology → in-topology traffic unaffected, no detour
 * Restart stopped node IN topology → re-enters rotation after the
   failed-host TTL, sorted shape derived deterministically
+
+**ConnectionPool steady-state** (`test_smart_driver_pool*.py`, every bullet
+in both sync (`ConnectionPool`) and async (`AsyncConnectionPool`)):
+* `load_balance_hosts=false` pool — registry never touched, conns not
+  tagged with `_yb_uuid`
+* 12-conn pool with `load_balance_hosts=true` distributes exact 4/4/4 on
+  the 3-node cluster (driver counter + `/rpcz` cross-check)
+* Topology-aware pool (`topology_keys=zoneA`) on the multi-zone cluster
+  distributes exact 6/6/0 — proves the topology filter runs underneath
+  the pool path too
+* Topology-no-match → `OperationalError` raised through the pool's
+  startup
+* Borrow + return doesn't mutate the per-host counter (the counter
+  tracks open-on-server conns, not in-flight checkouts)
+* Pool close drains every per-host count back to 0 (each managed conn's
+  close path runs the smart driver's decrement)
+* Pool growth from `min_size=3` to `max_size=12` under concurrent
+  borrowers ends at exact 4/4/4 — the dispatcher's atomic reserve holds
+  across the pool's growth path
+* A pool-managed conn and a direct `psycopg.connect()` to the same
+  cluster share the process-global registry
+
+**ConnectionPool × failover matrix** (`test_smart_driver_pool_failover*.py`,
+every bullet sync + async):
+* Cluster-aware + stop_node → 10-conn pool over 3 nodes lands 5/0/5 on
+  the survivors; the stopped node is `mark_failed`-quarantined on first
+  failed pick and the rest go to the two live hosts
+* Cluster-aware + add_node → pool₁(9 conns) + add node 4 + pool₂(9 conns)
+  ends at sorted shape `[4, 4, 5, 5]` across all four hosts — same
+  deterministic walk as the direct-connect node-addition test, through
+  the pool path
+* Topology + stop a zoneA node → all 6 pool conns land on the surviving
+  zoneA node; stopped zoneA at 0 (quarantined), zoneB at 0 (filtered)
+* Topology + stop the zoneB node → topology traffic on zoneA unaffected,
+  6 pool conns split exactly 3/3 on zoneA; stopped zoneB stays at 0
+* Topology + add a zoneA node → new zoneA node attracts its share, 9
+  pool conns split exact 3/3/0/3
+* Topology + add a zoneB node → new out-of-topology node receives zero
+  traffic, 6 pool conns split exact 3/3/0/0
 
 ## Perf benchmark
 

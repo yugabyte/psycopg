@@ -9,6 +9,8 @@ The same logic underlies pgjdbc-yb's `LoadBalanceService.refresh()`.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import TYPE_CHECKING
 
 from .node import NodeInfo, Placement
@@ -16,6 +18,8 @@ from .node import NodeInfo, Placement
 if TYPE_CHECKING:
     from ..connection import Connection
     from ..connection_async import AsyncConnection
+
+logger = logging.getLogger(__name__)
 
 
 # pgjdbc-yb's GET_SERVERS_QUERY. Columns we consume below; future-proofed
@@ -84,18 +88,28 @@ def fetch_servers_sync(conn: "Connection") -> tuple[list[NodeInfo], str]:
     The connection itself is not closed — the caller stashes it as the
     cluster's control connection.
     """
+    t0 = time.perf_counter()
     cur = conn.execute(GET_SERVERS_QUERY)
     rows = cur.fetchall()
     nodes, uuid = _parse_rows(rows)
     if not uuid:
         uuid = _stable_fallback_uuid(rows)
+    logger.debug(
+        "yb_servers() returned %d row(s) in %.1fms (uuid=%s)",
+        len(rows), (time.perf_counter() - t0) * 1000, uuid,
+    )
     return nodes, uuid
 
 
 async def fetch_servers_async(conn: "AsyncConnection") -> tuple[list[NodeInfo], str]:
+    t0 = time.perf_counter()
     cur = await conn.execute(GET_SERVERS_QUERY)
     rows = await cur.fetchall()
     nodes, uuid = _parse_rows(rows)
     if not uuid:
         uuid = _stable_fallback_uuid(rows)
+    logger.debug(
+        "yb_servers() returned %d row(s) in %.1fms (uuid=%s, async)",
+        len(rows), (time.perf_counter() - t0) * 1000, uuid,
+    )
     return nodes, uuid

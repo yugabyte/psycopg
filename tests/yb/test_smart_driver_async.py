@@ -107,9 +107,33 @@ async def test_async_single_host_bootstrap(yb_cluster, assert_balanced):
 # --------------------------------------------------------------------- topology
 
 
-async def test_async_topology_exact_match(yb_cluster, assert_balanced):
-    """Async sibling of `test_topology_exact_match`."""
-    dsn = yb_cluster + " load_balance_hosts=true topology_keys=cloud1.datacenter1.rack1"
+async def test_async_topology_exact_match(yb_multi_zone_cluster, assert_balanced):
+    """Async sibling of `test_topology_exact_match`. Multi-zone cluster
+    (2 zoneA + 1 zoneB); `topology_keys=zoneA` must keep all traffic on
+    the two zoneA nodes (6/6) and leave the zoneB node at 0."""
+    dsn = (yb_multi_zone_cluster
+           + " load_balance_hosts=true topology_keys=cloud1.datacenter1.zoneA")
+    conns = []
+    try:
+        for _ in range(12):
+            conns.append(await psycopg.AsyncConnection.connect(dsn))
+        uuid = conns[0]._yb_uuid
+        assert_balanced(uuid, {
+            "127.0.0.1": 6,
+            "127.0.0.2": 6,
+            "127.0.0.3": 0,
+        })
+    finally:
+        for c in conns:
+            await c.close()
+
+
+async def test_async_topology_wildcard_zone(yb_multi_zone_cluster, assert_balanced):
+    """Async sibling of `test_topology_wildcard_zone`. Multi-zone cluster;
+    `cloud1.datacenter1.*` matches both zoneA and zoneB → all three nodes
+    eligible → 4/4/4."""
+    dsn = (yb_multi_zone_cluster
+           + " load_balance_hosts=true topology_keys=cloud1.datacenter1.*")
     conns = []
     try:
         for _ in range(12):
@@ -119,24 +143,6 @@ async def test_async_topology_exact_match(yb_cluster, assert_balanced):
             "127.0.0.1": 4,
             "127.0.0.2": 4,
             "127.0.0.3": 4,
-        })
-    finally:
-        for c in conns:
-            await c.close()
-
-
-async def test_async_topology_wildcard_zone(yb_cluster, assert_balanced):
-    """Async sibling of `test_topology_wildcard_zone`."""
-    dsn = yb_cluster + " load_balance_hosts=true topology_keys=cloud1.datacenter1.*"
-    conns = []
-    try:
-        for _ in range(9):
-            conns.append(await psycopg.AsyncConnection.connect(dsn))
-        uuid = conns[0]._yb_uuid
-        assert_balanced(uuid, {
-            "127.0.0.1": 3,
-            "127.0.0.2": 3,
-            "127.0.0.3": 3,
         })
     finally:
         for c in conns:
