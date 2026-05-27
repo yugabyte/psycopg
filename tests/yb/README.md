@@ -26,7 +26,19 @@ extra: `pip install -e "./psycopg[pool]"`.
 
 All commands assume your shell is in the fork root (the directory with
 `psycopg/`, `tests/`, `tools/`) and that you have the fork installed
-editably: `pip install -e ./psycopg`.
+editably with the `test` and `pool` extras:
+
+```bash
+pip install -e "./psycopg[test,pool]"
+```
+
+The `[test]` extra brings in `pytest`, `pytest-randomly`, `pytest-cov`,
+and `anyio` (which provides the pytest plugin our async tests rely on
+via `pytest.mark.anyio`). The `[pool]` extra brings in `psycopg-pool` —
+without it, the eight sync + eight async pool tests and the twelve
+pool-failover tests skip via `pytest.importorskip`. See the
+"Python interpreter and packages" section under Prerequisites below if
+your environment is missing any of these.
 
 ```bash
 # Unit tests — pure Python, no cluster needed.
@@ -61,6 +73,41 @@ namespace package then shadows the installed driver, so `from psycopg import
 the actual installed package.
 
 ## Prerequisites
+
+### Python interpreter and packages
+
+* **Python >= 3.10** is required. The fork's `pyproject.toml` declares
+  `requires-python = ">= 3.10"`. On macOS / Linux the system Python may
+  still default to an older version, so check first:
+  ```bash
+  python3 --version
+  ```
+  If it's older than 3.10, use a 3.10+ interpreter directly (e.g.
+  `/Library/Frameworks/Python.framework/Versions/3.11/bin/python3` on
+  macOS) when creating the venv.
+
+* **Install the fork with the `test` and `pool` extras** in a fresh
+  virtual environment. This single command brings in everything the
+  test suite needs:
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install -e "./psycopg[test,pool]"
+  ```
+  What each extra pulls in:
+  | Extra | Brings in | Why it's needed |
+  | --- | --- | --- |
+  | `[test]` | `pytest`, `pytest-randomly`, `pytest-cov`, `anyio >= 4.0` | `pytest` to run the suite; `anyio` for the `pytest.mark.anyio` marker used by every async test file |
+  | `[pool]` | `psycopg-pool` | Required for the 8 sync + 8 async pool tests and the 12 pool-failover tests; without it those tests skip via `pytest.importorskip("psycopg_pool")` |
+
+* **System `libpq`**: same prerequisite as upstream psycopg 3. On macOS:
+  `brew install libpq && brew link --force libpq`. On Debian/Ubuntu:
+  `sudo apt install libpq5`. On RHEL/Fedora: `sudo dnf install libpq`.
+
+If you skip the `[test]` extra, you'll see `ModuleNotFoundError` for
+`pytest` or `anyio` (the latter often surfaces as the marker
+`pytest.mark.anyio` being treated as "unknown"). If you skip `[pool]`,
+the integration run silently skips the 28 pool-related tests.
 
 ### Get yb-ctl
 
