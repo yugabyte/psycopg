@@ -82,18 +82,16 @@ honour the configured policy too. Install it via the ``[pool]`` extra:
 
 .. code-block:: bash
 
-    pip install --pre "psycopg-yugabytedb[pool]"
+    pip install "psycopg-yugabytedb[pool]"
 
 That pulls our driver plus the unmodified upstream ``psycopg-pool``; the
 pool's ``import psycopg`` resolves to our driver and every conn the pool
 opens goes through the dispatcher.
 
-The fork is `pre-release`_. Without the ``[pool]`` extra, install with
-``pip install --pre psycopg-yugabytedb`` or pin to ``3.3.4.1rc1``. It cannot
-coexist with upstream ``psycopg`` in the same environment (both install into
-``site-packages/psycopg/``).
-
-.. _pre-release: https://packaging.python.org/en/latest/specifications/version-specifiers/#pre-releases
+Install without the ``[pool]`` extra with ``pip install psycopg-yugabytedb``,
+or pin to a specific version (``3.3.4.1`` is the first GA release). The fork
+cannot coexist with upstream ``psycopg`` in the same environment — both
+install into ``site-packages/psycopg/``.
 
 Logging
 ~~~~~~~

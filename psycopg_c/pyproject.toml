@@ -27,7 +27,7 @@ description = "YugabyteDB smart-driver — C optimisation distribution (fork of 
 # Stays in lock-step with the psycopg-yugabytedb driver version.
 # The import name remains `psycopg_c` so the unmodified upstream C code can ride along
 # unchanged; only the distribution name on PyPI differs.
-version = "3.3.4.1rc1"
+version = "3.3.4.1"
 license = "LGPL-3.0-only"
 license-files = ["LICENSE.txt"]
 classifiers = [
