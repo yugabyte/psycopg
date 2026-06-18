@@ -346,6 +346,11 @@ class RenameAsyncToSync(ast.NodeTransformer):  # type: ignore
         "wait_async": "wait",
         "wait_conn_async": "wait_conn",
         "wait_timeout": "wait",
+        # psycopg-yugabytedb smart-driver async/sync pairs:
+        "aget_or_bootstrap": "get_or_bootstrap",
+        "arefresh_if_stale": "refresh_if_stale",
+        "aclear": "clear",
+        "_aconnect_plain": "_connect_plain",
     }
     _skip_imports = {
         "acompat": {"alist", "anext", "skip_sync"},

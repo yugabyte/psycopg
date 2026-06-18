@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 
-# Create the psycopg-binary package by renaming and patching psycopg-c
+# Create the psycopg-yugabytedb-binary package by renaming and patching psycopg-yugabytedb-c.
+#
+# Note for fork maintainers: only the *distribution* name changes (psycopg-yugabytedb-c
+# -> psycopg-yugabytedb-binary). The on-disk Python package name still flips from
+# psycopg_c to psycopg_binary so the import surface matches upstream's pattern;
+# our driver imports `from psycopg_c import pq` and `from psycopg_binary import pq`
+# unchanged, because the C extension itself isn't modified.
 
 from __future__ import annotations
 
@@ -28,8 +34,10 @@ def sed_i(pattern: str, repl: str, filename: str | Path) -> None:
 shutil.copytree(pdir / "psycopg_c", target)
 shutil.move(str(target / "psycopg_c"), str(target / "psycopg_binary"))
 shutil.move(str(target / "README-binary.rst"), str(target / "README.rst"))
-sed_i("psycopg-c", "psycopg-binary", target / "pyproject.toml")
-sed_i("psycopg-c", "psycopg-binary", target / "psycopg_binary/version.py")
+# Distribution name: psycopg-yugabytedb-c -> psycopg-yugabytedb-binary.
+sed_i("psycopg-yugabytedb-c", "psycopg-yugabytedb-binary", target / "pyproject.toml")
+sed_i("psycopg-yugabytedb-c", "psycopg-yugabytedb-binary", target / "psycopg_binary/version.py")
+# Python package name: psycopg_c -> psycopg_binary (unchanged from upstream).
 sed_i(r'"psycopg_c([\./][^"]+)?"', r'"psycopg_binary\1"', target / "pyproject.toml")
 sed_i(r"__impl__\s*=.*", '__impl__ = "binary"', target / "psycopg_binary/pq.pyx")
 for dirpath, dirnames, filenames in os.walk(target):

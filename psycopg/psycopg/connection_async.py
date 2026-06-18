@@ -34,6 +34,9 @@ from ._conninfo_utils import gssapi_requested
 from ._pipeline_async import AsyncPipeline
 from ._connection_base import BaseConnection, CursorRow, Notify
 from ._server_cursor_async import AsyncServerCursor
+from .yb.params import extract_yb_params
+from .yb.policy import build_policy
+from .yb.registry import ClusterKey, ClusterRegistry
 
 if True:  # ASYNC
     import sys
@@ -57,6 +60,9 @@ else:
     _INTERRUPTED = KeyboardInterrupt
 
 logger = logging.getLogger("psycopg")
+# psycopg-yugabytedb fork: separate logger for smart-driver dispatcher lines so
+# users can tune our verbosity without touching upstream's "psycopg" channel.
+yb_logger = logging.getLogger("psycopg.yb.dispatcher")
 
 
 class AsyncConnection(BaseConnection[Row]):
@@ -70,6 +76,12 @@ class AsyncConnection(BaseConnection[Row]):
     server_cursor_factory: type[AsyncServerCursor[Row]]
     row_factory: AsyncRowFactory[Row]
     _pipeline: AsyncPipeline | None
+
+    # Smart-driver tagging. Set per-instance after a successful smart-driver
+    # connect (see `connect` below). Stay None on the pass-through path so the
+    # `if self._yb_uuid` guard in `close` correctly skips decrement.
+    _yb_uuid: str | None = None
+    _yb_host: str | None = None
 
     def __init__(
         self,
@@ -96,6 +108,134 @@ class AsyncConnection(BaseConnection[Row]):
     ) -> Self:
         """
         Connect to a database server and return a new `AsyncConnection` instance.
+
+        psycopg-yugabytedb fork: this method is a dispatcher. When
+        `load_balance_hosts=true` is present in conninfo or kwargs, we go
+        through the smart-driver path (cluster registry → policy → per-host
+        connect). Otherwise we fall through to `_aconnect_plain` which is the
+        original upstream connect logic, unchanged.
+        """
+        yb_params, cleaned_conninfo, cleaned_kwargs = extract_yb_params(
+            conninfo, kwargs
+        )
+
+        if not yb_params.smart_driver_enabled:
+            yb_logger.debug(
+                "smart driver disabled (load_balance_hosts absent or pass-through); "
+                "calling upstream _aconnect_plain"
+            )
+            return await cls._aconnect_plain(
+                cleaned_conninfo,
+                autocommit=autocommit,
+                prepare_threshold=prepare_threshold,
+                context=context,
+                row_factory=row_factory,
+                cursor_factory=cursor_factory,
+                **cleaned_kwargs,
+            )
+
+        # --- Smart-driver path ---
+        yb_logger.debug(
+            "smart driver enabled (topology_keys=%s, refresh_interval=%ds, ttl=%ds)",
+            yb_params.topology_keys or "—",
+            yb_params.refresh_interval_s,
+            yb_params.failed_host_reconnect_delay_s,
+        )
+        registry = ClusterRegistry.instance()
+        # ClusterKey wants a dict; parse the cleaned conninfo once for it.
+        pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
+        key = ClusterKey.from_params(pg_dict)
+        state = await registry.aget_or_bootstrap(
+            key, cleaned_conninfo, cleaned_kwargs
+        )
+        await registry.arefresh_if_stale(state, yb_params.refresh_interval_s)
+        policy = build_policy(yb_params)
+
+        attempted: set[str] = set()
+        last_err: e.Error | None = None
+        ttl = float(yb_params.failed_host_reconnect_delay_s)
+        while True:
+            # `get_least_loaded_server` atomically chooses the least-loaded
+            # node AND increments its counter under state.lock. Concurrent
+            # connects see each other's reservations and distribute exactly —
+            # closing the race where N callers pick the same "min count" node.
+            node = policy.get_least_loaded_server(state, attempted, ttl)
+            if node is None:
+                msg = "no eligible YugabyteDB node could be connected"
+                yb_logger.warning(
+                    "%s (attempted=%s, last_err=%s)",
+                    msg, sorted(attempted), last_err,
+                )
+                if last_err is not None:
+                    raise e.OperationalError(msg) from last_err
+                raise e.OperationalError(msg)
+
+            # Per-host kwargs override the multi-host list in the conninfo.
+            per_host_kwargs = {**cleaned_kwargs, "host": node.host, "port": node.port}
+            try:
+                conn = await cls._aconnect_plain(
+                    cleaned_conninfo,
+                    autocommit=autocommit,
+                    prepare_threshold=prepare_threshold,
+                    context=context,
+                    row_factory=row_factory,
+                    cursor_factory=cursor_factory,
+                    **per_host_kwargs,
+                )
+            except e.OperationalError as exc:
+                # Real connect failure: roll back the reservation AND quarantine
+                # the host for the TTL. `mark_failed` zeros the count outright;
+                # the explicit `decrement` is belt-and-braces and keeps the
+                # invariant "every reservation pairs with a release" easy to
+                # reason about.
+                yb_logger.info(
+                    "connect failed on %s (uuid=%s); marking failed and retrying: %s",
+                    node.host, state.uuid, exc,
+                )
+                registry.decrement(state.uuid, node.host)
+                registry.mark_failed(state.uuid, node.host)
+                attempted.add(node.host)
+                last_err = exc
+                continue
+            except BaseException:
+                # Anything else mid-connect (CancelledError, KeyboardInterrupt,
+                # SystemExit, an adapter raising) is not a node failure but the
+                # reservation still needs releasing. Do NOT call mark_failed —
+                # the node is not necessarily down. Roll back only, then
+                # re-raise so the caller sees the original cause.
+                yb_logger.debug(
+                    "connect interrupted on %s (uuid=%s); releasing reservation",
+                    node.host, state.uuid,
+                )
+                registry.decrement(state.uuid, node.host)
+                raise
+
+            conn._yb_uuid = state.uuid
+            conn._yb_host = node.host
+            yb_logger.debug(
+                "smart-driver connect succeeded: host=%s, uuid=%s",
+                node.host, state.uuid,
+            )
+            return conn
+
+    @classmethod
+    async def _aconnect_plain(
+        cls,
+        conninfo: str = "",
+        *,
+        autocommit: bool = False,
+        prepare_threshold: int | None = 5,
+        context: AdaptContext | None = None,
+        row_factory: AsyncRowFactory[Row] | None = None,
+        cursor_factory: type[AsyncCursor[Row]] | None = None,
+        **kwargs: ConnParam,
+    ) -> Self:
+        """
+        The original upstream connect logic, lifted into a helper.
+
+        Called from `connect` (the smart-driver dispatcher) on the pass-through
+        path and per-host on the smart-driver path. Also called from the
+        registry's bootstrap path to open the initial control connection.
         """
         if True:  # ASYNC
             if sys.platform == "win32":
@@ -211,11 +351,18 @@ class AsyncConnection(BaseConnection[Row]):
             await pool.putconn(self)
             return
 
-        self._closed = True
+        try:
+            self._closed = True
 
-        # TODO: maybe send a cancel on close, if the connection is ACTIVE?
+            # TODO: maybe send a cancel on close, if the connection is ACTIVE?
 
-        self.pgconn.finish()
+            self.pgconn.finish()
+        finally:
+            # Smart-driver: decrement the cluster's per-host counter. Guarded
+            # by `_yb_uuid` so pass-through connections (which never set it)
+            # don't touch the registry.
+            if self._yb_uuid is not None and self._yb_host is not None:
+                ClusterRegistry.instance().decrement(self._yb_uuid, self._yb_host)
 
     @overload
     def cursor(self, *, binary: bool = False) -> AsyncCursor[Row]: ...
