@@ -82,6 +82,11 @@ class AsyncConnection(BaseConnection[Row]):
     # `if self._yb_uuid` guard in `close` correctly skips decrement.
     _yb_uuid: str | None = None
     _yb_host: str | None = None
+    # xCluster tagging. "primary" / "secondary" when the conn was routed via a
+    # FailoverGroup; None for the single-cluster smart-driver path and for
+    # pass-through. Used by `psycopg.yb.pool.xcluster_check` to decide whether
+    # to evict pool-managed conns on failover.
+    _yb_cluster: str | None = None
 
     def __init__(
         self,
@@ -136,18 +141,44 @@ class AsyncConnection(BaseConnection[Row]):
 
         # --- Smart-driver path ---
         yb_logger.debug(
-            "smart driver enabled (topology_keys=%s, refresh_interval=%ds, ttl=%ds)",
+            "smart driver enabled (topology_keys=%s, refresh_interval=%ds, ttl=%ds, "
+            "xcluster=%s)",
             yb_params.topology_keys or "—",
             yb_params.refresh_interval_s,
             yb_params.failed_host_reconnect_delay_s,
+            yb_params.xcluster_enabled,
         )
         registry = ClusterRegistry.instance()
-        # ClusterKey wants a dict; parse the cleaned conninfo once for it.
-        pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
-        key = ClusterKey.from_params(pg_dict)
-        state = await registry.aget_or_bootstrap(
-            key, cleaned_conninfo, cleaned_kwargs
-        )
+
+        # xCluster path — bootstrap a FailoverGroup and pick the active cluster
+        # based on the CB status flag. Falls through to the single-cluster path
+        # when xcluster_enabled is False (the common case).
+        active_cluster: str | None = None
+        failover_group = None
+        if yb_params.xcluster_enabled:
+            from .yb.health import HealthResult       # late import; cycle-safe
+            failover_group = await registry.aget_or_bootstrap_failover_group(
+                yb_params, cleaned_conninfo, cleaned_kwargs
+            )
+            with failover_group.lock:
+                if failover_group.status == HealthResult.UNHEALTHY:
+                    state = failover_group.secondary
+                    active_cluster = "secondary"
+                else:
+                    state = failover_group.primary
+                    active_cluster = "primary"
+            yb_logger.debug(
+                "xcluster active cluster: %s (primary_uuid=%s)",
+                active_cluster, failover_group.primary.uuid,
+            )
+        else:
+            # ClusterKey wants a dict; parse the cleaned conninfo once for it.
+            pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
+            key = ClusterKey.from_params(pg_dict)
+            state = await registry.aget_or_bootstrap(
+                key, cleaned_conninfo, cleaned_kwargs
+            )
+
         await registry.arefresh_if_stale(state, yb_params.refresh_interval_s)
         policy = build_policy(yb_params)
 
@@ -212,9 +243,12 @@ class AsyncConnection(BaseConnection[Row]):
 
             conn._yb_uuid = state.uuid
             conn._yb_host = node.host
+            # `active_cluster` is "primary"/"secondary" iff we routed via a
+            # FailoverGroup; None for the single-cluster smart-driver path.
+            conn._yb_cluster = active_cluster
             yb_logger.debug(
-                "smart-driver connect succeeded: host=%s, uuid=%s",
-                node.host, state.uuid,
+                "smart-driver connect succeeded: host=%s, uuid=%s, cluster=%s",
+                node.host, state.uuid, active_cluster or "(single-cluster)",
             )
             return conn
 

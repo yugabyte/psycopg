@@ -93,6 +93,105 @@ or pin to a specific version (``3.3.4.1`` is the first GA release). The fork
 cannot coexist with upstream ``psycopg`` in the same environment — both
 install into ``site-packages/psycopg/``.
 
+xCluster failover (preview, stub-first)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The driver can be configured with a secondary YugabyteDB cluster to fail
+over to when the primary becomes unusable. Opt-in is gated on BOTH
+``load_balance_hosts=true`` AND a non-empty
+``yb.failover.secondaryClusterHosts`` — when those conditions hold, the
+driver eagerly bootstraps both clusters, starts a background health-probe
+thread, and routes new connections through whichever cluster is currently
+HEALTHY. ``psycopg-pool``'s ``check=`` callback can evict stale primary
+connections on failover via the bundled ``xcluster_check`` helper.
+
+Configuration (libpq conninfo keys; ``.``, ``_``, and ``-`` are all
+accepted as separators between tokens):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 12 50
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``yb.failover.secondaryClusterHosts``
+     - (empty)
+     - Comma-separated secondary-cluster host list. One host is enough —
+       the rest of the cluster is discovered via ``yb_servers()``.
+       Setting this is the opt-in trigger for xCluster failover.
+   * - ``yb.failover.trackerTableTablets``
+     - ``9``
+     - Reserved for the eventual tracker-table-based health check
+       (currently a no-op stub — see below).
+   * - ``yb.failover.maxUpdateFailuresAllowed``
+     - ``0``
+     - Reserved for the tracker-table check. Number of consecutive
+       UPDATE failures tolerated before flipping the status to
+       UNHEALTHY.
+   * - ``yb.failover.cooldownSecs``
+     - ``1500``
+     - Minimum interval between status transitions in either direction.
+       Prevents rapid ping-pong when the primary is flapping.
+
+Example:
+
+.. code-block:: python
+
+    import psycopg
+
+    conn = psycopg.connect(
+        "host=primary1,primary2,primary3 port=5433 user=yugabyte dbname=yugabyte "
+        "load_balance_hosts=true "
+        "yb.failover.secondaryClusterHosts=secondary1,secondary2,secondary3"
+    )
+
+With ``psycopg-pool``:
+
+.. code-block:: python
+
+    from psycopg.yb.pool import xcluster_check
+    from psycopg_pool import ConnectionPool
+
+    pool = ConnectionPool(
+        "host=primary1,primary2,primary3 load_balance_hosts=true "
+        "yb.failover.secondaryClusterHosts=secondary1,secondary2,secondary3",
+        check=xcluster_check,
+        min_size=4, max_size=20,
+    )
+
+Stub-first caveat
+^^^^^^^^^^^^^^^^^
+
+In this release, the health-detection function
+``psycopg.yb.health.cluster_status_check`` is a **stub** that always
+returns HEALTHY. The plumbing is fully wired — operators can drive
+failover manually via the Python API for testing or migration scenarios:
+
+.. code-block:: python
+
+    from psycopg.yb.health import HealthResult
+    from psycopg.yb.registry import ClusterRegistry
+
+    group = ClusterRegistry.instance().get_failover_group(primary_uuid)
+    group.force_status(HealthResult.UNHEALTHY)  # route new conns to secondary
+    # ...
+    ClusterRegistry.instance().reset_failover_group(primary_uuid)  # failback
+
+The tracker-table-based detection logic (which periodically runs
+``UPDATE yb_cluster_health_tracker SET last_updated = NOW()`` on the
+primary's control connection) lands in a follow-on patch. At that point
+the operator API stays available for manual override.
+
+Per-process semantics
+^^^^^^^^^^^^^^^^^^^^^
+
+Each Python process maintains its own ``ClusterRegistry`` and therefore
+its own xCluster status flag. In a multi-worker deployment (gunicorn,
+``ProcessPoolExecutor``, Celery), workers independently observe failures
+and independently decide to fail over. Brief divergence during the
+detection window is expected and accepted for v1 (see design doc §11).
+
 Logging
 ~~~~~~~
 

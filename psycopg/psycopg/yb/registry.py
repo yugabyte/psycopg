@@ -109,6 +109,72 @@ class ClusterState:
     bootstrap_kwargs: dict = field(default_factory=dict)
 
 
+@dataclass
+class FailoverGroup:
+    """A primary + secondary cluster pair for xCluster failover.
+
+    See /tmp/xcluster_failover_design.html §3–§8 for the full design. The
+    dispatcher reads ``status`` on every connect; if UNHEALTHY, traffic
+    routes to ``secondary`` instead of ``primary``. The status flag is
+    written only by:
+
+      * ``HealthProbe`` (Phase 4) on each probe tick, based on the result of
+        ``cluster_status_check`` (Phase 3 stub: always returns HEALTHY).
+      * ``FailoverGroup.force_status`` — public test hook (Phase 3).
+      * ``ClusterRegistry.reset_failover_group`` — operator API (Phase 3).
+
+    ``cooldown_s`` enforces a minimum interval between transitions in either
+    direction; ``can_transition`` is the gate the probe consults before
+    writing a status change.
+
+    ``tracker_table_tablets`` and ``max_update_failures_allowed`` are
+    reserved for the Phase 9 tracker-table-based health check; the v1 stub
+    ignores them.
+
+    ``probe`` is the daemon ``HealthProbe`` thread (Phase 4). Lifecycle is
+    managed by ``ClusterRegistry`` — created at bootstrap, stopped by
+    ``clear()`` / ``aclear()``.
+    """
+
+    primary: ClusterState
+    secondary: ClusterState
+    lock: threading.Lock
+    # Cluster status — written under `lock`. v1 stub: always stays HEALTHY
+    # unless test code flips it via `force_status`.
+    status: "HealthResult"
+    # `0.0` (any time in the past) at construction so a newly-spawned process
+    # can transition at its first probe tick — no "fresh-app starvation"
+    # window. See design doc §6.
+    last_transition_time: float = 0.0
+    cooldown_s: int = 1500
+    # Reserved for the Phase 9 tracker-table check; v1 stub ignores them.
+    tracker_table_tablets: int = 9
+    max_update_failures_allowed: int = 0
+    # Type kept loose to avoid a circular import on health_probe.HealthProbe.
+    probe: "object | None" = None
+
+    def force_status(self, status: "HealthResult") -> None:
+        """TEST HOOK. Manually set the cluster status flag.
+
+        In production, ``status`` is set only by ``HealthProbe`` running
+        ``cluster_status_check``. Integration tests use this hook to drive
+        failover deterministically before the real check exists (Phase 9).
+        Stays public after Phase 9 — still useful for unit tests that
+        don't spin up a real cluster.
+        """
+        now = time.monotonic()
+        with self.lock:
+            self.status = status
+            self.last_transition_time = now
+
+    def can_transition(self, now: float) -> bool:
+        """Return True iff the cool-down window has elapsed since the last
+        status transition. The probe consults this before writing changes.
+        ``last_transition_time = 0.0`` at construction → always True on
+        first call, so freshly-bootstrapped groups react immediately."""
+        return (now - self.last_transition_time) >= self.cooldown_s
+
+
 class ClusterRegistry:
     """Process-wide singleton holding all cluster state.
 
@@ -120,21 +186,37 @@ class ClusterRegistry:
       * `increment` / `decrement` — per-connect bookkeeping
       * `mark_failed` — quarantine a node after connect failure
 
+    xCluster failover (when `yb_params.xcluster_enabled` is True):
+
+      * `get_or_bootstrap_failover_group` / `aget_or_bootstrap_failover_group`
+        — pair primary + secondary cluster states under one `FailoverGroup`
+      * `get_failover_group(primary_uuid)` — by primary uuid
+      * `get_failover_group_by_uuid(any_uuid)` — searches both primary AND
+        secondary uuids (used by `xcluster_check` pool callback)
+      * `reset_failover_group(primary_uuid)` — operator failback API:
+        flips status back to HEALTHY immediately
+      * `get_failover_status(primary_uuid)` — read current status + last
+        transition timestamp
+
     Test hooks (mirroring pgjdbc-yb's `LoadBalanceService.getLoad/clear`):
 
       * `get_load(uuid, host)` — read current count without mutating
-      * `clear()` — drop all state (closes sync control conns best-effort)
+      * `clear()` — drop all state (closes sync control conns best-effort,
+        stops all probe threads)
     """
 
     _instance: ClassVar["ClusterRegistry | None"] = None
     _instance_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self) -> None:
-        # Protects the two maps (their identity, not their values' identity).
+        # Protects the three maps (their identity, not their values' identity).
         # Per-cluster ClusterState.lock protects each cluster's nodes dict.
+        # Per-group FailoverGroup.lock protects each group's status flag.
         self._lock = threading.Lock()
         self._clusters: dict[str, ClusterState] = {}
         self._key_to_uuid: dict[ClusterKey, str] = {}
+        # xCluster failover: keyed by PRIMARY uuid (one group per primary cluster).
+        self._failover_groups: dict[str, "FailoverGroup"] = {}
 
     @classmethod
     def instance(cls) -> "ClusterRegistry":
@@ -294,6 +376,226 @@ class ClusterRegistry:
             for n in nodes:
                 logger.log(TRACE, "  discovered node: %s", n)
             return state
+
+    # ------------------------------------------------------------------ xCluster failover
+    #
+    # `get_or_bootstrap_failover_group` (and its async sibling) is the entry
+    # point the dispatcher calls when `yb_params.xcluster_enabled` is True.
+    # The pattern:
+    #   1. Bootstrap the primary (re-uses `get_or_bootstrap` — cached on
+    #      repeat calls with the same ClusterKey).
+    #   2. Check `_failover_groups[primary.uuid]` — return if already present.
+    #   3. Bootstrap the secondary using the same kwargs but with the host
+    #      list overridden to `yb_params.secondary_cluster_hosts`. The
+    #      secondary becomes its own ClusterState in `_clusters` under its
+    #      own uuid.
+    #   4. Construct the `FailoverGroup` and install it (race-checked).
+    #   5. Start the `HealthProbe` thread on the group.
+
+    def _make_secondary_kwargs(
+        self, kwargs: dict[str, object], secondary_hosts: list[str]
+    ) -> dict[str, object]:
+        """Return a copy of `kwargs` with `host` replaced by the secondary
+        cluster's host list. All other params (port, user, dbname,
+        ssl-related, topology, refresh interval, ...) carry over verbatim —
+        spec §5 says existing smart-driver params apply to both clusters."""
+        sec_kwargs = dict(kwargs)
+        sec_kwargs["host"] = ",".join(secondary_hosts)
+        return sec_kwargs
+
+    def get_or_bootstrap_failover_group(
+        self,
+        yb_params,                                  # YBParams; lazy-typed to dodge cycle
+        conninfo: str,
+        kwargs: dict[str, object],
+    ) -> "FailoverGroup":
+        """Sync bootstrap of a primary + secondary `FailoverGroup`. Idempotent
+        on primary uuid. Spec §5 / design §3."""
+        from .health import HealthResult            # late import — health.py imports FailoverGroup forward-ref
+
+        # 1. Bootstrap primary (cached on repeats).
+        primary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, kwargs)
+        )
+        primary = self.get_or_bootstrap(primary_key, conninfo, kwargs)
+
+        # 2. Already paired?
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+        if existing is not None:
+            logger.debug(
+                "failover group cache hit: primary_uuid=%s", primary.uuid
+            )
+            return existing
+
+        # 3. Bootstrap secondary.
+        sec_kwargs = self._make_secondary_kwargs(
+            kwargs, yb_params.secondary_cluster_hosts
+        )
+        secondary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, sec_kwargs)
+        )
+        secondary = self.get_or_bootstrap(secondary_key, conninfo, sec_kwargs)
+
+        # 4. Install (race-checked).
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+            if existing is not None:
+                logger.debug(
+                    "failover group race lost; discarding our pairing for "
+                    "primary_uuid=%s", primary.uuid,
+                )
+                return existing
+            group = FailoverGroup(
+                primary=primary,
+                secondary=secondary,
+                lock=threading.Lock(),
+                status=HealthResult.HEALTHY,
+                cooldown_s=yb_params.cooldown_s,
+                tracker_table_tablets=yb_params.tracker_table_tablets,
+                max_update_failures_allowed=yb_params.max_update_failures_allowed,
+            )
+            self._failover_groups[primary.uuid] = group
+
+        logger.info(
+            "failover group bootstrapped: primary_uuid=%s, secondary_uuid=%s, "
+            "secondary_hosts=%s, cooldown_s=%d",
+            primary.uuid, secondary.uuid,
+            ",".join(yb_params.secondary_cluster_hosts),
+            yb_params.cooldown_s,
+        )
+
+        # 5. Start the probe thread (Phase 4 wiring).
+        self._start_probe(group, yb_params.refresh_interval_s)
+        return group
+
+    async def aget_or_bootstrap_failover_group(
+        self,
+        yb_params,
+        conninfo: str,
+        kwargs: dict[str, object],
+    ) -> "FailoverGroup":
+        """Async sibling. Same shape, awaits the async primary + secondary
+        bootstraps. The probe thread itself is sync regardless of caller
+        (see design doc §10)."""
+        from .health import HealthResult
+
+        primary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, kwargs)
+        )
+        primary = await self.aget_or_bootstrap(primary_key, conninfo, kwargs)
+
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+        if existing is not None:
+            logger.debug(
+                "failover group cache hit (async): primary_uuid=%s", primary.uuid
+            )
+            return existing
+
+        sec_kwargs = self._make_secondary_kwargs(
+            kwargs, yb_params.secondary_cluster_hosts
+        )
+        secondary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, sec_kwargs)
+        )
+        secondary = await self.aget_or_bootstrap(
+            secondary_key, conninfo, sec_kwargs
+        )
+
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+            if existing is not None:
+                logger.debug(
+                    "failover group race lost (async); discarding our pairing "
+                    "for primary_uuid=%s", primary.uuid,
+                )
+                return existing
+            group = FailoverGroup(
+                primary=primary,
+                secondary=secondary,
+                lock=threading.Lock(),
+                status=HealthResult.HEALTHY,
+                cooldown_s=yb_params.cooldown_s,
+                tracker_table_tablets=yb_params.tracker_table_tablets,
+                max_update_failures_allowed=yb_params.max_update_failures_allowed,
+            )
+            self._failover_groups[primary.uuid] = group
+
+        logger.info(
+            "failover group bootstrapped (async): primary_uuid=%s, "
+            "secondary_uuid=%s, secondary_hosts=%s, cooldown_s=%d",
+            primary.uuid, secondary.uuid,
+            ",".join(yb_params.secondary_cluster_hosts),
+            yb_params.cooldown_s,
+        )
+
+        self._start_probe(group, yb_params.refresh_interval_s)
+        return group
+
+    def _param_dict_for_key(
+        self, conninfo: str, kwargs: dict[str, object]
+    ) -> dict[str, object]:
+        """Build the dict ClusterKey wants for hashing. Mirrors the way the
+        dispatcher constructs ClusterKey before calling `get_or_bootstrap`
+        — late import of `conninfo_to_dict` to avoid pulling psycopg's
+        full conninfo module at registry import time."""
+        from ..conninfo import conninfo_to_dict
+        return conninfo_to_dict(conninfo, **kwargs)
+
+    def _start_probe(self, group: "FailoverGroup", interval_s: int) -> None:
+        """Spin up the daemon `HealthProbe` thread for the group. Phase 4
+        wires the actual `HealthProbe` class; this method is the
+        single integration point. Idempotent — safe to call twice."""
+        if group.probe is not None:
+            return
+        from .health_probe import HealthProbe       # late import; phase-4 file
+        probe = HealthProbe(group, interval_s)
+        group.probe = probe
+        probe.start()
+
+    def get_failover_group(self, primary_uuid: str) -> "FailoverGroup | None":
+        """Lookup by primary uuid. Returns None if no group exists for it."""
+        with self._lock:
+            return self._failover_groups.get(primary_uuid)
+
+    def get_failover_group_by_uuid(
+        self, any_uuid: str
+    ) -> "FailoverGroup | None":
+        """Lookup by EITHER primary or secondary uuid. The pool's
+        `xcluster_check` (Phase 6) calls this on a conn whose `_yb_uuid`
+        could be either side of the pair."""
+        with self._lock:
+            for group in self._failover_groups.values():
+                if group.primary.uuid == any_uuid or group.secondary.uuid == any_uuid:
+                    return group
+            return None
+
+    def reset_failover_group(self, primary_uuid: str) -> bool:
+        """Operator failback API. Flips status back to HEALTHY immediately.
+        Returns True if a group existed and was reset, False otherwise.
+        Equivalent of JDBC's JMX failback operation (design doc §8)."""
+        from .health import HealthResult
+        group = self.get_failover_group(primary_uuid)
+        if group is None:
+            return False
+        group.force_status(HealthResult.HEALTHY)
+        logger.info(
+            "failover group reset to HEALTHY by operator: primary_uuid=%s",
+            primary_uuid,
+        )
+        return True
+
+    def get_failover_status(
+        self, primary_uuid: str
+    ) -> "tuple[HealthResult, float] | None":
+        """Read current `(status, last_transition_time)` without mutating.
+        Returns None if no group exists for the uuid."""
+        group = self.get_failover_group(primary_uuid)
+        if group is None:
+            return None
+        with group.lock:
+            return (group.status, group.last_transition_time)
 
     # ------------------------------------------------------------------ refresh
 
@@ -614,8 +916,36 @@ class ClusterRegistry:
             ni = state.nodes.get(host)
             return ni.connection_count if ni is not None else 0
 
+    def _drain_failover_groups(self) -> "list[FailoverGroup]":
+        """Pop all failover groups and stop their probe threads. Returns the
+        popped groups so callers can do any further cleanup (currently none
+        needed beyond the probe-stop). Called from `clear()` / `aclear()`
+        with `self._lock` held by the caller."""
+        groups = list(self._failover_groups.values())
+        self._failover_groups.clear()
+        return groups
+
+    def _stop_probes_best_effort(
+        self, groups: "list[FailoverGroup]"
+    ) -> None:
+        """Stop each probe thread outside `self._lock` — joining a thread
+        while holding a class-level lock would deadlock if the probe ever
+        re-enters the registry."""
+        for group in groups:
+            probe = group.probe
+            if probe is None:
+                continue
+            try:
+                probe.stop()
+            except Exception:
+                logger.warning(
+                    "probe stop failed during clear(); ignoring",
+                    exc_info=True,
+                )
+
     def clear(self) -> None:
-        """Drop all state. Best-effort closes any control connections held.
+        """Drop all state. Best-effort closes any control connections held
+        and stops all xCluster probe threads.
 
         Async control connections are closed by force-finishing the underlying
         libpq handle directly (bypassing the async wrapper) — this lets us
@@ -627,6 +957,9 @@ class ClusterRegistry:
             clusters = list(self._clusters.values())
             self._clusters.clear()
             self._key_to_uuid.clear()
+            groups = self._drain_failover_groups()
+        # Probes stopped OUTSIDE the registry lock (see _stop_probes_best_effort).
+        self._stop_probes_best_effort(groups)
         for state in clusters:
             if state.control_sync is not None:
                 try:
@@ -651,6 +984,8 @@ class ClusterRegistry:
             clusters = list(self._clusters.values())
             self._clusters.clear()
             self._key_to_uuid.clear()
+            groups = self._drain_failover_groups()
+        self._stop_probes_best_effort(groups)
         for state in clusters:
             if state.control_sync is not None:
                 try:

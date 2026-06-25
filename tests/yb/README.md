@@ -5,7 +5,7 @@ filename — no decorators on individual tests):
 
 | Marker     | Files                                            | Count | Needs                            | Typical runtime |
 |------------|--------------------------------------------------|-------|----------------------------------|------------------|
-| `yb_unit`  | `test_params`, `test_node`, `test_policy`, `test_registry` | 92 | nothing (pure Python)            | < 1 s total      |
+| `yb_unit`  | `test_params*`, `test_node`, `test_policy`, `test_registry*`, `test_dispatcher_failover`, `test_pool_check`, `test_xcluster_failover` | 167 | nothing (pure Python)            | ~1 s total       |
 | `yb`       | `test_smart_driver*.py` (sync + `_async` siblings) | 77 | real YB cluster + `yb-ctl`       | ~10 s/test (cluster cycle), ~25 min total |
 | `perf`     | `perf/bench.py` (driven by `perf/run_perf.sh`)   | 3 scenarios | running cluster + pip access | ~30 s/scenario   |
 
@@ -143,9 +143,14 @@ Tests that hit this path:
 tests/yb/
 ├── conftest.py                                       pytest config + fixtures
 ├── test_params.py                                    [yb_unit] conninfo parsing
+├── test_params_failover.py                           [yb_unit] xCluster conninfo params (Phase 1)
 ├── test_node.py                                      [yb_unit] NodeInfo, Placement
 ├── test_policy.py                                    [yb_unit] policy picker behaviour
 ├── test_registry.py                                  [yb_unit] ClusterRegistry, ClusterKey, control reopen
+├── test_registry_failover.py                         [yb_unit] FailoverGroup, registry pairing, HealthProbe (Phases 2-4)
+├── test_dispatcher_failover.py                       [yb_unit] dispatcher routing on group.status (Phase 5)
+├── test_pool_check.py                                [yb_unit] xcluster_check pool callback (Phase 6)
+├── test_xcluster_failover.py                         [yb_unit] Tier 1 integration via force_status (Phase 7)
 ├── test_smart_driver.py                              [yb]      sync direct-connect integration
 ├── test_smart_driver_async.py                        [yb]      async direct-connect mirror
 ├── test_smart_driver_failover.py                     [yb]      sync cluster-aware failover suite

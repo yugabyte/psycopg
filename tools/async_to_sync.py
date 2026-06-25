@@ -351,6 +351,8 @@ class RenameAsyncToSync(ast.NodeTransformer):  # type: ignore
         "arefresh_if_stale": "refresh_if_stale",
         "aclear": "clear",
         "_aconnect_plain": "_connect_plain",
+        # xCluster failover async/sync pair (Phase 5):
+        "aget_or_bootstrap_failover_group": "get_or_bootstrap_failover_group",
     }
     _skip_imports = {
         "acompat": {"alist", "anext", "skip_sync"},

@@ -14,11 +14,23 @@ Logging
 Every smart-driver module uses ``logging.getLogger(__name__)``, so the
 loggers form a tree rooted at ``psycopg.yb``:
 
-  * ``psycopg.yb.registry``           — bootstrap, refresh, counters, control conn
+  * ``psycopg.yb.registry``           — bootstrap, refresh, counters, control conn,
+                                         FailoverGroup pairing + operator API
   * ``psycopg.yb.discovery``          — yb_servers() query
   * ``psycopg.yb.policy.base``        — eligibility filter
   * ``psycopg.yb.policy.cluster_aware``  — least-loaded pick, tie-break
   * ``psycopg.yb.policy.topology_aware`` — placement filter
+  * ``psycopg.yb.health``             — cluster_status_check stub + transitions
+                                         (will host the tracker-table check in a
+                                         follow-on patch — currently a no-op stub)
+  * ``psycopg.yb.health_probe``       — xCluster background probe thread
+                                         (INFO on transitions, DEBUG per tick,
+                                         WARNING on probe exceptions)
+  * ``psycopg.yb.pool``               — pool ``check=`` callback that evicts
+                                         conns belonging to the inactive cluster
+  * ``psycopg.yb.dispatcher``         — connect-time branch on
+                                         ``FailoverGroup.status`` to route to
+                                         primary or secondary cluster
 
 Tune verbosity per subsystem, or set the parent ``psycopg.yb`` once:
 
