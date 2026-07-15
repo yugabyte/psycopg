@@ -181,6 +181,19 @@ _XCLUSTER_SECONDARY_IP_START = 4   # 127.0.0.4 / .5 / .6
 _XCLUSTER_PRIMARY_HOSTS = ("127.0.0.1", "127.0.0.2", "127.0.0.3")
 _XCLUSTER_SECONDARY_HOSTS = ("127.0.0.4", "127.0.0.5", "127.0.0.6")
 
+# Used by tests that need a real xCluster-replicated user table to write
+# rows on the primary and read them on the secondary. Created on both
+# clusters at session-fixture startup and registered with
+# `setup_universe_replication` so primary writes flow to secondary.
+_XCLUSTER_TEST_TABLE = "xcluster_test_data"
+_XCLUSTER_REPL_GROUP_ID = "xcluster_test_repl"
+_XCLUSTER_PRIMARY_MASTERS = ",".join(
+    f"{h}:7100" for h in _XCLUSTER_PRIMARY_HOSTS
+)
+_XCLUSTER_SECONDARY_MASTERS = ",".join(
+    f"{h}:7100" for h in _XCLUSTER_SECONDARY_HOSTS
+)
+
 
 def _ybctl_destroy_silent():
     """Destroy any existing cluster. Best-effort with escalating force:
@@ -240,8 +253,15 @@ def _ybctl_create(placement: str, rf: int):
         )
 
 
-def _wait_for_cluster_ready(dsn: str):
-    """Block until the cluster accepts ysql connections."""
+def _wait_for_cluster_ready(dsn: str, expected_nodes: int = 3):
+    """Block until ``yb_servers()`` reports ``expected_nodes`` tservers.
+
+    Just-TCP-reachable isn't enough for tests that assert per-host
+    distribution: a node whose tserver is up but hasn't yet registered
+    with the master is invisible to ``yb_servers()`` and therefore won't
+    be in the dispatcher's node list. Waiting for the full topology
+    eliminates a class of test-order flakiness.
+    """
     import psycopg
     import time as _time
     deadline = _time.monotonic() + WAIT_FOR_READY_TIMEOUT
@@ -252,14 +272,14 @@ def _wait_for_cluster_ready(dsn: str):
                 with conn.cursor() as cur:
                     cur.execute("SELECT count(*) FROM yb_servers()")
                     (n,) = cur.fetchone()
-                    if n > 0:
+                    if n >= expected_nodes:
                         return
         except Exception as exc:
             last_err = exc
         _time.sleep(1.0)
     raise RuntimeError(
-        f"cluster did not become ready within {WAIT_FOR_READY_TIMEOUT}s: "
-        f"last error: {last_err!r}"
+        f"cluster did not reach {expected_nodes} tservers within "
+        f"{WAIT_FOR_READY_TIMEOUT}s: last error: {last_err!r}"
     )
 
 
@@ -440,17 +460,25 @@ def _ybctl_create_at(
 
 @pytest.fixture(scope="session")
 def yb_xcluster_clusters():
-    """Session-scoped: two independent yb-ctl clusters running concurrently.
+    """Session-scoped: two yb-ctl clusters + REAL xCluster replication.
 
     Returns ``(primary_dsn, secondary_dsn)`` where each is a libpq conninfo
-    string. The two clusters have distinct ``universe_uuid``s; no
-    replication is configured between them (Tier 2 tests verify the
-    driver's routing/pool semantics, not actual data replication).
+    string. The two clusters have distinct ``universe_uuid``s AND the
+    fixture sets up unidirectional xCluster replication from primary to
+    secondary on the ``xcluster_test_data`` table (created on both at
+    session startup). Tests that just exercise routing/pool semantics
+    via ``FailoverGroup.force_status`` can ignore the table; tests in
+    ``test_smart_driver_xcluster_data.py`` use it to verify data
+    continuity across a primary failure.
 
     Session-scoped because the tests don't mutate cluster state — failover
     is driven by ``FailoverGroup.force_status``, not by stopping real
-    nodes. This amortises the ~20s two-cluster setup over the whole
-    xCluster integration suite.
+    nodes (with the exception of the suites in
+    ``test_smart_driver_xcluster_cb.py`` and
+    ``test_smart_driver_xcluster_data.py``, which DO stop nodes and
+    restart them in their own finally blocks). This amortises the ~20s
+    two-cluster setup plus the ~5s xCluster setup over the whole xCluster
+    integration suite.
 
     Loopback aliases for 127.0.0.4 / .5 / .6 must be present (macOS):
 
@@ -516,8 +544,21 @@ def yb_xcluster_clusters():
         raise
 
     try:
+        _setup_xcluster_replication()
+    except Exception:
+        _ybctl_destroy_at(_YB_PRIMARY_DATA_DIR, _XCLUSTER_PRIMARY_IP_START)
+        _ybctl_destroy_at(_YB_SECONDARY_DATA_DIR, _XCLUSTER_SECONDARY_IP_START)
+        raise
+
+    try:
         yield (primary_dsn, secondary_dsn)
     finally:
+        # Best-effort: delete the replication stream first, then destroy
+        # the clusters. If primary is already stopped (a stop_node test
+        # left it that way and recover_primary_cluster's restart_node
+        # failed), delete_universe_replication still works on the consumer
+        # side because we run it against the secondary's masters.
+        _teardown_xcluster_replication()
         _ybctl_destroy_at(_YB_PRIMARY_DATA_DIR, _XCLUSTER_PRIMARY_IP_START)
         _ybctl_destroy_at(_YB_SECONDARY_DATA_DIR, _XCLUSTER_SECONDARY_IP_START)
 
@@ -626,7 +667,8 @@ def yb_failover_group(fresh_registry, fake_state):
         primary=primary,
         secondary=secondary,
         lock=threading.Lock(),
-        status=HealthResult.HEALTHY,
+        primary_status=HealthResult.HEALTHY,
+        secondary_status=HealthResult.HEALTHY,
         cooldown_s=0,
     )
     fresh_registry._clusters[primary.uuid] = primary
@@ -637,10 +679,11 @@ def yb_failover_group(fresh_registry, fake_state):
 
 @pytest.fixture
 def flip_to_unhealthy_after(yb_failover_group):
-    """Returns a ``flip(delay_s, status=UNHEALTHY)`` callable.
+    """Returns a ``flip(delay_s, status=UNHEALTHY, which="primary")`` callable.
 
     The callable schedules a background daemon thread that sleeps
-    ``delay_s`` seconds then calls ``yb_failover_group.force_status``.
+    ``delay_s`` seconds then calls ``yb_failover_group.force_primary_status``
+    or ``yb_failover_group.force_secondary_status`` depending on ``which``.
     Multiple flips can be scheduled per test. All threads are stopped
     cleanly at teardown via a shared ``threading.Event``.
 
@@ -653,11 +696,17 @@ def flip_to_unhealthy_after(yb_failover_group):
     stop_event = threading.Event()
     threads: list[threading.Thread] = []
 
-    def flip(delay_s: float, status: "HealthResult" = HealthResult.UNHEALTHY):
+    def flip(
+        delay_s: float,
+        status: "HealthResult" = HealthResult.UNHEALTHY,
+        which: str = "primary",
+    ):
+        setter = getattr(yb_failover_group, f"force_{which}_status")
+
         def run():
             if stop_event.wait(timeout=delay_s):
                 return  # teardown happened first; abort
-            yb_failover_group.force_status(status)
+            setter(status)
 
         t = threading.Thread(target=run, daemon=True)
         t.start()
@@ -782,6 +831,118 @@ def assert_balanced(rpcz):
 
 YB_CTL_PATH = os.environ.get("YB_CTL", "yb-ctl")
 
+# yb-admin lives next to yb-ctl in a standard YB install. Tests that
+# configure xCluster replication need it; if YB_ADMIN is explicitly set
+# in the environment we honor that, otherwise we derive it from YB_CTL.
+YB_ADMIN_PATH = os.environ.get("YB_ADMIN") or (
+    os.path.join(os.path.dirname(YB_CTL_PATH), "yb-admin")
+    if os.path.dirname(YB_CTL_PATH)
+    else "yb-admin"
+)
+
+
+def _run_yb_admin(
+    args: list[str], *, timeout: int = 60
+) -> subprocess.CompletedProcess:
+    """Invoke yb-admin. Tests use this for `setup_universe_replication`
+    + `delete_universe_replication`; the fixture handles the lifecycle."""
+    cmd = [YB_ADMIN_PATH, *args]
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except FileNotFoundError:
+        pytest.skip(
+            f"yb-admin not found at {YB_ADMIN_PATH!r}; set YB_ADMIN env var "
+            f"(usually lives next to yb-ctl)"
+        )
+
+
+def _setup_xcluster_replication() -> None:
+    """Create the test table on both clusters and establish unidirectional
+    xCluster replication primary -> secondary. Idempotent — `CREATE TABLE
+    IF NOT EXISTS` + a fixed replication group id. Called from
+    `yb_xcluster_clusters` once both clusters are ready."""
+    import psycopg as _ps
+
+    for host in (_XCLUSTER_PRIMARY_HOSTS[0], _XCLUSTER_SECONDARY_HOSTS[0]):
+        dsn = (
+            f"host={host} port=5433 user=yugabyte dbname=yugabyte "
+            f"connect_timeout=5"
+        )
+        with _ps.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {_XCLUSTER_TEST_TABLE} "
+                    "(id INT PRIMARY KEY, ts TIMESTAMP, payload TEXT)"
+                )
+            conn.commit()
+
+    # Look up the producer's table id via `yb-admin list_tables`.
+    r = _run_yb_admin(
+        ["-master_addresses", _XCLUSTER_PRIMARY_MASTERS,
+         "list_tables", "include_table_id"],
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"yb-admin list_tables failed: {r.stderr or r.stdout}"
+        )
+    table_id = None
+    for line in r.stdout.splitlines():
+        # Format: "<namespace>.<name> <table_id>"
+        parts = line.split()
+        if (len(parts) == 2
+                and parts[0] == f"yugabyte.{_XCLUSTER_TEST_TABLE}"):
+            table_id = parts[1]
+            break
+    if not table_id:
+        raise RuntimeError(
+            f"could not find table id for {_XCLUSTER_TEST_TABLE} in "
+            f"yb-admin list_tables output: {r.stdout[:500]}"
+        )
+
+    # Run setup_universe_replication against the CONSUMER (secondary)
+    # masters, pointing at the PRODUCER (primary) masters and table id.
+    r = _run_yb_admin(
+        ["-master_addresses", _XCLUSTER_SECONDARY_MASTERS,
+         "setup_universe_replication",
+         _XCLUSTER_REPL_GROUP_ID,
+         _XCLUSTER_PRIMARY_MASTERS,
+         table_id],
+        timeout=60,
+    )
+    if r.returncode != 0:
+        # If the stream already exists from an earlier interrupted run,
+        # delete it and try once more. Otherwise propagate.
+        if "already exists" in (r.stderr + r.stdout):
+            _teardown_xcluster_replication()
+            r = _run_yb_admin(
+                ["-master_addresses", _XCLUSTER_SECONDARY_MASTERS,
+                 "setup_universe_replication",
+                 _XCLUSTER_REPL_GROUP_ID,
+                 _XCLUSTER_PRIMARY_MASTERS,
+                 table_id],
+                timeout=60,
+            )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"setup_universe_replication failed: "
+                f"{r.stderr or r.stdout}"
+            )
+
+
+def _teardown_xcluster_replication() -> None:
+    """Delete the test replication stream. Best-effort: a stopped primary
+    won't have a reachable master, but the consumer side can still drop
+    the local stream config."""
+    _run_yb_admin(
+        ["-master_addresses", _XCLUSTER_SECONDARY_MASTERS,
+         "delete_universe_replication",
+         _XCLUSTER_REPL_GROUP_ID,
+         "ignore-errors"],
+        timeout=60,
+    )
+
 
 def _run_yb_ctl(
     args: list[str], *, timeout: int = 30, data_dir: str | None = None
@@ -851,6 +1012,178 @@ def yb_ctl():
     if probe.returncode != 0 and "Usage" not in (probe.stdout + probe.stderr):
         pytest.skip(f"yb-ctl not usable: {probe.stderr.strip()}")
     return YBCtl()
+
+
+class _XClusterCtl:
+    """yb-ctl wrappers scoped to the two-cluster xCluster fixture.
+
+    The default ``YBCtl`` operates on the single-cluster ``_YB_DATA_DIR``;
+    the xCluster Tier 2 tests need to target either the primary or the
+    secondary cluster by passing the matching ``--data_dir``. This class
+    bundles those four operations so tests don't have to thread the
+    data_dir through every call.
+    """
+
+    @staticmethod
+    def stop_primary_node(n: int):
+        r = _run_yb_ctl(
+            ["stop_node", str(n)],
+            timeout=YBCtl.STOP_TIMEOUT,
+            data_dir=_YB_PRIMARY_DATA_DIR,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"yb-ctl stop_node {n} (primary) failed: {r.stderr}"
+            )
+
+    @staticmethod
+    def start_primary_node(n: int):
+        r = _run_yb_ctl(
+            ["start_node", str(n)],
+            timeout=YBCtl.START_TIMEOUT,
+            data_dir=_YB_PRIMARY_DATA_DIR,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"yb-ctl start_node {n} (primary) failed: {r.stderr}"
+            )
+
+    @staticmethod
+    def stop_secondary_node(n: int):
+        r = _run_yb_ctl(
+            ["stop_node", str(n)],
+            timeout=YBCtl.STOP_TIMEOUT,
+            data_dir=_YB_SECONDARY_DATA_DIR,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"yb-ctl stop_node {n} (secondary) failed: {r.stderr}"
+            )
+
+    @staticmethod
+    def start_secondary_node(n: int):
+        r = _run_yb_ctl(
+            ["start_node", str(n)],
+            timeout=YBCtl.START_TIMEOUT,
+            data_dir=_YB_SECONDARY_DATA_DIR,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"yb-ctl start_node {n} (secondary) failed: {r.stderr}"
+            )
+
+    @staticmethod
+    def restart_primary_node(n: int):
+        """``restart_node`` against the primary cluster. Unlike ``start_node``,
+        this works whether yb-ctl thinks the node is running or not — important
+        for recovering from the master-quorum-loss cascade, where stopping two
+        of three masters causes the third tserver's postmaster to also exit
+        but yb-ctl still reports it as "running"."""
+        r = _run_yb_ctl(
+            ["restart_node", str(n)],
+            timeout=YBCtl.START_TIMEOUT,
+            data_dir=_YB_PRIMARY_DATA_DIR,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"yb-ctl restart_node {n} (primary) failed: {r.stderr}"
+            )
+
+    @staticmethod
+    def recover_primary_cluster():
+        """Best-effort restore: ensure every primary node accepts TCP
+        connects on port 5433. Healthy nodes are skipped (fast — ~1 ms
+        probe); only actually-down nodes get ``restart_node`` (slow —
+        ~30 s per restart).
+
+        Catches two failure modes:
+          * Nodes the test explicitly stopped.
+          * Node 1's postmaster exiting via master-quorum-loss cascade
+            when masters 2+3 are killed — yb-ctl still reports it as
+            "running" so ``start_node 1`` would error out, but
+            ``restart_node 1`` works.
+
+        Errors per node are swallowed so a partial cleanup doesn't mask
+        the original test failure."""
+        import socket as _socket
+        for n in (1, 2, 3):
+            host = f"127.0.0.{n}"
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            reachable = False
+            try:
+                s.connect((host, 5433))
+                reachable = True
+            except (OSError, _socket.timeout):
+                pass
+            finally:
+                s.close()
+            if reachable:
+                continue
+            try:
+                _XClusterCtl.restart_primary_node(n)
+            except Exception:
+                pass
+
+        # After restart_node returns the tserver PROCESS is up, but full
+        # convergence of the cluster state across all three masters AND
+        # all three tservers can lag a few more seconds. We require:
+        #   (a) every host individually answers a SELECT
+        #   (b) yb_servers() returns 3 rows from EACH host (master state
+        #       is consistent across the cluster, not just on one master)
+        # Without (b), a subsequent test's bootstrap might land on a
+        # contact host whose master replica still reports 2 tservers; the
+        # dispatcher then picks from a 2-host subset and a distribution
+        # assertion fails. After the join check passes we settle 2 more
+        # seconds because YB's master-to-master gossip can briefly admit
+        # a still-registering tserver before all tservers see it.
+        import psycopg as _ps
+
+        def _hosts_all_see_three(timeout_s: float) -> bool:
+            deadline_local = time.monotonic() + timeout_s
+            while time.monotonic() < deadline_local:
+                ok = True
+                for probe_host in _XCLUSTER_PRIMARY_HOSTS:
+                    try:
+                        with _ps.connect(
+                            f"host={probe_host} port=5433 user=yugabyte "
+                            f"dbname=yugabyte connect_timeout=2"
+                        ) as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "SELECT count(*) FROM yb_servers()"
+                                )
+                                row = cur.fetchone()
+                                if row is None or row[0] < 3:
+                                    ok = False
+                                    break
+                    except Exception:
+                        ok = False
+                        break
+                if ok:
+                    return True
+                time.sleep(1.0)
+            return False
+
+        if _hosts_all_see_three(60):
+            # Give the cluster's last-mover gossip a moment to settle.
+            time.sleep(2)
+
+
+@pytest.fixture
+def yb_xcluster_ctl():
+    """``_XClusterCtl`` helper for failure injection on either xCluster.
+
+    Skips the test if ``yb-ctl`` isn't available. Pair with the
+    ``yb_xcluster_clusters`` session fixture so the two clusters exist
+    before the test starts stopping nodes.
+    """
+    probe = subprocess.run(
+        [YB_CTL_PATH, "--help"], capture_output=True, text=True
+    )
+    if probe.returncode != 0 and "Usage" not in (probe.stdout + probe.stderr):
+        pytest.skip(f"yb-ctl not usable: {probe.stderr.strip()}")
+    return _XClusterCtl()
 
 
 # --------------------------------------------------------------------- cleanup

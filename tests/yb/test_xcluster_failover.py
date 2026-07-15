@@ -111,10 +111,10 @@ def test_flip_fixture_drives_a_transition(
     """Verify the ``flip_to_unhealthy_after`` fixture actually flips the
     status after the requested delay."""
     _patch_dispatcher_for_group(monkeypatch, fresh_registry, yb_failover_group)
-    assert yb_failover_group.status == HealthResult.HEALTHY
+    assert yb_failover_group.primary_status == HealthResult.HEALTHY
     flip_to_unhealthy_after(0.05)
     time.sleep(0.15)
-    assert yb_failover_group.status == HealthResult.UNHEALTHY
+    assert yb_failover_group.primary_status == HealthResult.UNHEALTHY
 
 
 # ----------------------------------------------------------------- routing observed end-to-end
@@ -154,9 +154,9 @@ def test_concurrent_connects_and_flip_no_torn_reads(
 
     def flipper():
         while not stop.is_set():
-            yb_failover_group.force_status(
+            yb_failover_group.force_primary_status(
                 HealthResult.UNHEALTHY
-                if yb_failover_group.status == HealthResult.HEALTHY
+                if yb_failover_group.primary_status == HealthResult.HEALTHY
                 else HealthResult.HEALTHY
             )
 
@@ -172,7 +172,7 @@ def test_concurrent_connects_and_flip_no_torn_reads(
             # Snapshot status under the group's lock to avoid a torn read
             # against the flipper.
             with yb_failover_group.lock:
-                status_now = yb_failover_group.status
+                status_now = yb_failover_group.primary_status
             with obs_lock:
                 observations.append((conn._yb_cluster, status_now))
 
@@ -217,18 +217,22 @@ def test_probe_cool_down_blocks_flip_via_probe(
     from psycopg.yb.health_probe import HealthProbe
 
     monkeypatch.setattr(
-        hp_mod, "cluster_status_check",
+        hp_mod, "check_primary_cluster",
         lambda g: HealthResult.UNHEALTHY,
     )
+    monkeypatch.setattr(
+        hp_mod, "check_secondary_cluster",
+        lambda g: HealthResult.HEALTHY,
+    )
     yb_failover_group.cooldown_s = 999
-    yb_failover_group.last_transition_time = time.monotonic()
+    yb_failover_group.primary_last_transition_time = time.monotonic()
 
     probe = HealthProbe(yb_failover_group, interval_s=0.02)
     probe.start()
     time.sleep(0.2)
     probe.stop()
 
-    assert yb_failover_group.status == HealthResult.HEALTHY
+    assert yb_failover_group.primary_status == HealthResult.HEALTHY
 
 
 # ----------------------------------------------------------------- pool eviction
@@ -249,7 +253,7 @@ def test_pool_xcluster_check_evicts_on_flip(
     xcluster_check(C())
 
     # Flip → primary-tagged conns must be evicted (raise).
-    yb_failover_group.force_status(HealthResult.UNHEALTHY)
+    yb_failover_group.force_primary_status(HealthResult.UNHEALTHY)
     with pytest.raises(psycopg.OperationalError, match="xcluster_check"):
         xcluster_check(C())
 
@@ -265,7 +269,7 @@ async def test_async_dispatcher_observes_flip(
     c1 = await psycopg.AsyncConnection.connect(_DSN)
     assert c1._yb_cluster == "primary"
 
-    yb_failover_group.force_status(HealthResult.UNHEALTHY)
+    yb_failover_group.force_primary_status(HealthResult.UNHEALTHY)
 
     c2 = await psycopg.AsyncConnection.connect(_DSN)
     assert c2._yb_cluster == "secondary"
@@ -280,6 +284,6 @@ async def test_async_pool_check_evicts_on_flip(
 
     await xcluster_check_async(C())  # HEALTHY → pass
 
-    yb_failover_group.force_status(HealthResult.UNHEALTHY)
+    yb_failover_group.force_primary_status(HealthResult.UNHEALTHY)
     with pytest.raises(psycopg.OperationalError, match="xcluster_check"):
         await xcluster_check_async(C())

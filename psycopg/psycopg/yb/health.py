@@ -1,18 +1,23 @@
 """
 Cluster-health decision surface for xCluster failover.
 
-This module defines the contract — ``HealthResult`` and the single function
-``cluster_status_check(group)`` — that the ``HealthProbe`` background thread
-calls on each tick to decide whether the primary cluster should be marked
-HEALTHY or UNHEALTHY.
+This module defines the contract — ``HealthResult`` — and the two thin
+delegating helpers the ``HealthProbe`` thread calls on each tick to
+decide whether each cluster should be marked HEALTHY or UNHEALTHY:
 
-The function is implemented in this revision as an always-HEALTHY **stub**.
-When the tracker-table-based detection logic from the spec lands (the
-"Phase 9" follow-on), only the body of ``cluster_status_check`` changes —
-the signature, callers, and surrounding plumbing stay identical.
+  * ``check_primary_cluster(group)`` — delegates to
+    ``group.primary_circuit_breaker.check(group)``
+  * ``check_secondary_cluster(group)`` — delegates to
+    ``group.secondary_circuit_breaker.check(group)``
 
-See /tmp/xcluster_failover_design.html §6 for the full design and the
-phase-9 sketch.
+Both fall back to HEALTHY if the corresponding circuit breaker slot is
+``None`` — this is what tests get when they build a ``FailoverGroup``
+without attaching breakers (the default at bootstrap is a
+``TrackerTableCircuitBreaker`` per cluster, but unit tests often skip
+that).
+
+See docs/xcluster_failover_design.html §4 for the full design and the
+per-cluster CB rationale.
 """
 
 # Copyright (C) 2026 Yugabyte
@@ -37,22 +42,29 @@ class HealthResult(Enum):
     UNHEALTHY = "unhealthy"
 
 
-def cluster_status_check(group: "FailoverGroup") -> HealthResult:
+def check_primary_cluster(group: "FailoverGroup") -> HealthResult:
     """Decide whether ``group.primary`` is currently usable.
 
-    **STUB IMPLEMENTATION** — always returns ``HealthResult.HEALTHY``.
+    Thin dispatcher — delegates to ``group.primary_circuit_breaker.check(group)``.
+    The default at bootstrap is a ``TrackerTableCircuitBreaker`` pointed at
+    the primary cluster; tests can swap it by assigning to
+    ``group.primary_circuit_breaker``.
 
-    The signature is the stable contract. The eventual tracker-table-based
-    check (spec §"Circuit Breaker") replaces only the body:
-
-      * runs ``UPDATE yb_cluster_health_tracker SET last_updated = NOW()``
-        on ``group.primary.control_sync``
-      * recreates the table on TABLE-NOT-FOUND
-      * filters auth / TLS errors out of the failure counter
-      * returns UNHEALTHY after
-        ``group.max_update_failures_allowed + 1`` consecutive failures
-
-    Until that lands, integration tests drive failover via
-    ``FailoverGroup.force_status`` (Phase 7 §14 Tier 1).
+    Returns HEALTHY if the slot is ``None`` — matches the pre-CB stub
+    semantics and keeps the contract well-defined for unit tests that
+    build a group without attaching a breaker.
     """
-    return HealthResult.HEALTHY
+    cb = group.primary_circuit_breaker
+    if cb is None:
+        return HealthResult.HEALTHY
+    return cb.check(group)
+
+
+def check_secondary_cluster(group: "FailoverGroup") -> HealthResult:
+    """Symmetric to :func:`check_primary_cluster` for the secondary cluster.
+    Delegates to ``group.secondary_circuit_breaker.check(group)`` and
+    falls back to HEALTHY if the slot is ``None``."""
+    cb = group.secondary_circuit_breaker
+    if cb is None:
+        return HealthResult.HEALTHY
+    return cb.check(group)

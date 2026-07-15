@@ -48,7 +48,7 @@ def _install_group(reg, fake_state, cooldown_s=0):
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = FailoverGroup(
         primary=p, secondary=s, lock=threading.Lock(),
-        status=HealthResult.HEALTHY, cooldown_s=cooldown_s,
+        primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY, cooldown_s=cooldown_s,
     )
     reg._clusters[p.uuid] = p
     reg._clusters[s.uuid] = s
@@ -135,7 +135,7 @@ def test_sync_dispatcher_routes_to_secondary_when_unhealthy(
     fresh_registry, fake_state, monkeypatch
 ):
     group = _install_group(fresh_registry, fake_state)
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
     _patch_dispatcher_internals(monkeypatch, fresh_registry, group)
 
     from psycopg import Connection
@@ -209,7 +209,7 @@ async def test_async_dispatcher_routes_to_secondary_when_unhealthy(
     fresh_registry, fake_state, monkeypatch
 ):
     group = _install_group(fresh_registry, fake_state)
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
     _patch_dispatcher_internals(monkeypatch, fresh_registry, group)
 
     from psycopg import AsyncConnection
@@ -238,14 +238,14 @@ def test_sync_dispatcher_flip_after_first_connect(
     )
     assert c1._yb_cluster == "primary"
 
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
     c2 = Connection.connect(
         "host=p1 load_balance_hosts=true "
         "yb.failover.secondaryClusterHosts=s1"
     )
     assert c2._yb_cluster == "secondary"
 
-    group.force_status(HealthResult.HEALTHY)
+    group.force_primary_status(HealthResult.HEALTHY)
     c3 = Connection.connect(
         "host=p1 load_balance_hosts=true "
         "yb.failover.secondaryClusterHosts=s1"

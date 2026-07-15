@@ -92,7 +92,7 @@ def test_bootstrap_creates_failover_group(yb_xcluster_clusters):
             conn._yb_uuid
         )
         assert group is not None
-        assert group.status == HealthResult.HEALTHY
+        assert group.primary_status == HealthResult.HEALTHY
         assert group.primary.uuid != group.secondary.uuid, (
             "Primary and secondary should report distinct universe_uuids — "
             "two separate clusters."
@@ -129,7 +129,7 @@ def test_dispatcher_routes_to_secondary_after_force_unhealthy(
     tagged as 'secondary'."""
     # Bootstrap and grab the group.
     group, primary_uuid = _bootstrap_group_and_get(_XCLUSTER_DSN)
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
 
     conns = []
     try:
@@ -150,7 +150,7 @@ def test_failback_routes_back_to_primary(yb_xcluster_clusters):
     """Set UNHEALTHY → route to secondary. Reset to HEALTHY (via
     `reset_failover_group`) → route to primary again."""
     group, primary_uuid = _bootstrap_group_and_get(_XCLUSTER_DSN)
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
 
     c1 = psycopg.connect(_XCLUSTER_DSN)
     try:
@@ -178,7 +178,7 @@ def test_failover_via_background_thread(yb_xcluster_clusters):
     'a separate thread that will mark the primary cluster as unhealthy
     for the failover to trigger'."""
     group, _ = _bootstrap_group_and_get(_XCLUSTER_DSN)
-    assert group.status == HealthResult.HEALTHY
+    assert group.primary_status == HealthResult.HEALTHY
 
     flip_time = [None]   # set when the flip actually fires
     stop_event = threading.Event()
@@ -187,7 +187,7 @@ def test_failover_via_background_thread(yb_xcluster_clusters):
         # Wait ~0.4s then flip. Test code opens conns either side of this.
         if stop_event.wait(timeout=0.4):
             return
-        group.force_status(HealthResult.UNHEALTHY)
+        group.force_primary_status(HealthResult.UNHEALTHY)
         flip_time[0] = time.monotonic()
 
     t = threading.Thread(target=flipper, daemon=True)
@@ -247,7 +247,7 @@ def test_pool_evicts_primary_conns_after_force_unhealthy(yb_xcluster_clusters):
         # Grab the group and flip to UNHEALTHY.
         group = ClusterRegistry.instance().get_failover_group_by_uuid(primary_uuid)
         assert group is not None
-        group.force_status(HealthResult.UNHEALTHY)
+        group.force_primary_status(HealthResult.UNHEALTHY)
 
         # Phase 2: borrow several conns. Each borrow should fail the
         # xcluster_check (because the cached pool conn is tagged primary
@@ -272,7 +272,7 @@ async def test_async_dispatcher_routes_to_secondary_after_flip(
     # Bootstrap via sync connect to grab the group (the async path also
     # creates a FailoverGroup, but using sync here is simpler).
     group, primary_uuid = _bootstrap_group_and_get(_XCLUSTER_DSN)
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
 
     conns = []
     try:
@@ -302,7 +302,7 @@ async def test_async_pool_evicts_primary_conns_after_flip(yb_xcluster_clusters):
             assert conn._yb_cluster == "primary"
 
         group = ClusterRegistry.instance().get_failover_group_by_uuid(primary_uuid)
-        group.force_status(HealthResult.UNHEALTHY)
+        group.force_primary_status(HealthResult.UNHEALTHY)
 
         for _ in range(4):
             async with pool.connection() as conn:

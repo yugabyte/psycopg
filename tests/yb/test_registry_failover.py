@@ -19,7 +19,11 @@ import time
 
 import pytest
 
-from psycopg.yb.health import HealthResult, cluster_status_check
+from psycopg.yb.health import (
+    HealthResult,
+    check_primary_cluster,
+    check_secondary_cluster,
+)
 from psycopg.yb.health_probe import HealthProbe
 from psycopg.yb.params import YBParams
 from psycopg.yb.registry import ClusterRegistry, ClusterState, FailoverGroup
@@ -51,7 +55,7 @@ def _install_group(
         primary=primary,
         secondary=secondary,
         lock=threading.Lock(),
-        status=HealthResult.HEALTHY,
+        primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY,
         cooldown_s=cooldown_s,
     )
     reg._clusters[primary.uuid] = primary
@@ -70,11 +74,12 @@ def test_failover_group_initial_state(fake_state):
     )
     group = FailoverGroup(
         primary=primary, secondary=secondary,
-        lock=threading.Lock(), status=HealthResult.HEALTHY,
+        lock=threading.Lock(), primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY,
     )
-    assert group.status == HealthResult.HEALTHY
-    assert group.last_transition_time == 0.0   # initial-state, can transition immediately
-    assert group.probe is None
+    assert group.primary_status == HealthResult.HEALTHY
+    assert group.primary_last_transition_time == 0.0   # initial-state, can transition immediately
+    assert group.primary_probe is None
+    assert group.secondary_probe is None
 
 
 def test_force_status_flips_and_updates_timestamp(fake_state):
@@ -82,13 +87,13 @@ def test_force_status_flips_and_updates_timestamp(fake_state):
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="sec")
     group = FailoverGroup(
         primary=p, secondary=s, lock=threading.Lock(),
-        status=HealthResult.HEALTHY,
+        primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY,
     )
     before = time.monotonic()
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
     after = time.monotonic()
-    assert group.status == HealthResult.UNHEALTHY
-    assert before <= group.last_transition_time <= after
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert before <= group.primary_last_transition_time <= after
 
 
 def test_can_transition_initial_true(fake_state):
@@ -97,9 +102,9 @@ def test_can_transition_initial_true(fake_state):
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="sec")
     group = FailoverGroup(
         primary=p, secondary=s, lock=threading.Lock(),
-        status=HealthResult.HEALTHY, cooldown_s=999,
+        primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY, cooldown_s=999,
     )
-    assert group.can_transition(time.monotonic()) is True
+    assert group.can_transition_primary(time.monotonic()) is True
 
 
 def test_can_transition_honours_cooldown(fake_state):
@@ -107,13 +112,13 @@ def test_can_transition_honours_cooldown(fake_state):
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="sec")
     group = FailoverGroup(
         primary=p, secondary=s, lock=threading.Lock(),
-        status=HealthResult.HEALTHY, cooldown_s=999,
+        primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY, cooldown_s=999,
     )
-    group.force_status(HealthResult.UNHEALTHY)
+    group.force_primary_status(HealthResult.UNHEALTHY)
     # Cool-down just started; no second transition allowed.
-    assert group.can_transition(time.monotonic()) is False
+    assert group.can_transition_primary(time.monotonic()) is False
     # Time-warp past cool-down → True.
-    assert group.can_transition(group.last_transition_time + 1000) is True
+    assert group.can_transition_primary(group.primary_last_transition_time + 1000) is True
 
 
 # ----------------------------------------------------------------- registry lookups
@@ -146,25 +151,34 @@ def test_reset_failover_group_flips_to_healthy(fresh_registry, fake_state):
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = _install_group(fresh_registry, p, s)
-    group.force_status(HealthResult.UNHEALTHY)
-    assert group.status == HealthResult.UNHEALTHY
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    assert group.primary_status == HealthResult.UNHEALTHY
 
     assert fresh_registry.reset_failover_group("P") is True
-    assert group.status == HealthResult.HEALTHY
+    assert group.primary_status == HealthResult.HEALTHY
 
 
 def test_get_failover_status_returns_state_and_timestamp(fresh_registry, fake_state):
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = _install_group(fresh_registry, p, s)
-    status, ts = fresh_registry.get_failover_status("P")
-    assert status == HealthResult.HEALTHY
-    assert ts == 0.0   # initial
+    p_status, s_status, p_ts, s_ts = fresh_registry.get_failover_status("P")
+    assert p_status == HealthResult.HEALTHY
+    assert s_status == HealthResult.HEALTHY
+    assert p_ts == 0.0   # initial
+    assert s_ts == 0.0   # initial
 
-    group.force_status(HealthResult.UNHEALTHY)
-    status, ts = fresh_registry.get_failover_status("P")
-    assert status == HealthResult.UNHEALTHY
-    assert ts > 0.0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    p_status, s_status, p_ts, s_ts = fresh_registry.get_failover_status("P")
+    assert p_status == HealthResult.UNHEALTHY
+    assert s_status == HealthResult.HEALTHY   # untouched
+    assert p_ts > 0.0
+    assert s_ts == 0.0
+
+    group.force_secondary_status(HealthResult.UNHEALTHY)
+    p_status, s_status, _, s_ts2 = fresh_registry.get_failover_status("P")
+    assert s_status == HealthResult.UNHEALTHY
+    assert s_ts2 > 0.0
 
     assert fresh_registry.get_failover_status("nonexistent") is None
 
@@ -197,7 +211,7 @@ def test_bootstrap_creates_group_with_correct_uuids(fresh_registry, fake_state, 
     )
     assert group.primary.uuid == "P"
     assert group.secondary.uuid == "S"
-    assert group.status == HealthResult.HEALTHY
+    assert group.primary_status == HealthResult.HEALTHY
     assert group.cooldown_s == 5
     assert "P" in fresh_registry._failover_groups
     # (_clusters bookkeeping is tested separately — this test monkeypatches
@@ -280,29 +294,38 @@ def test_clear_drops_groups_and_stops_probes(fresh_registry, fake_state):
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = _install_group(fresh_registry, p, s)
 
-    # Attach a fake probe to verify stop() is called.
-    stopped = {"called": False}
+    # Attach fake probes to verify stop() is called on BOTH.
+    stop_counts = {"primary": 0, "secondary": 0}
     class FakeProbe:
+        def __init__(self, name: str) -> None:
+            self._name = name
         def stop(self):
-            stopped["called"] = True
-    group.probe = FakeProbe()
+            stop_counts[self._name] += 1
+    group.primary_probe = FakeProbe("primary")
+    group.secondary_probe = FakeProbe("secondary")
 
     fresh_registry.clear()
     assert fresh_registry._failover_groups == {}
-    assert stopped["called"] is True
+    assert stop_counts == {"primary": 1, "secondary": 1}
 
 
-# ----------------------------------------------------------------- cluster_status_check stub
+# ----------------------------------------------------------------- CB-None fallback
 
-def test_stub_always_returns_healthy(fake_state):
-    """Phase 3 contract: the stub always returns HEALTHY regardless of input."""
+def test_check_functions_fall_back_to_healthy_when_cb_is_none(fake_state):
+    """When a per-cluster CB slot is ``None`` (e.g. synthetic test group),
+    ``check_primary_cluster`` and ``check_secondary_cluster`` return HEALTHY
+    — matches the pre-CB stub semantics."""
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = FailoverGroup(
         primary=p, secondary=s, lock=threading.Lock(),
-        status=HealthResult.UNHEALTHY,  # even if status is already UNHEALTHY
+        primary_status=HealthResult.UNHEALTHY, secondary_status=HealthResult.UNHEALTHY,
     )
-    assert cluster_status_check(group) == HealthResult.HEALTHY
+    # No CBs installed → both fall back to HEALTHY regardless of stored status.
+    assert group.primary_circuit_breaker is None
+    assert group.secondary_circuit_breaker is None
+    assert check_primary_cluster(group) == HealthResult.HEALTHY
+    assert check_secondary_cluster(group) == HealthResult.HEALTHY
 
 
 # ----------------------------------------------------------------- HealthProbe
@@ -312,7 +335,7 @@ def _make_probe_target_group(fake_state, cooldown_s=0):
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     return FailoverGroup(
         primary=p, secondary=s, lock=threading.Lock(),
-        status=HealthResult.HEALTHY, cooldown_s=cooldown_s,
+        primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY, cooldown_s=cooldown_s,
     )
 
 
@@ -332,18 +355,23 @@ def test_probe_flips_status_on_first_tick(fake_state, monkeypatch):
     `last_transition_time=0.0`, the very first tick must flip status."""
     import psycopg.yb.health_probe as hp_mod
     monkeypatch.setattr(
-        hp_mod, "cluster_status_check",
+        hp_mod, "check_primary_cluster",
         lambda g: HealthResult.UNHEALTHY,
+    )
+    # Keep secondary HEALTHY so we only exercise the primary transition path.
+    monkeypatch.setattr(
+        hp_mod, "check_secondary_cluster",
+        lambda g: HealthResult.HEALTHY,
     )
     group = _make_probe_target_group(fake_state, cooldown_s=0)
     probe = HealthProbe(group, interval_s=0.02)
     probe.start()
     # Allow a few ticks.
     deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline and group.status == HealthResult.HEALTHY:
+    while time.monotonic() < deadline and group.primary_status == HealthResult.HEALTHY:
         time.sleep(0.02)
     probe.stop()
-    assert group.status == HealthResult.UNHEALTHY
+    assert group.primary_status == HealthResult.UNHEALTHY
 
 
 def test_probe_honours_cooldown(fake_state, monkeypatch):
@@ -351,20 +379,25 @@ def test_probe_honours_cooldown(fake_state, monkeypatch):
     NOT flip status even with the strategy returning UNHEALTHY."""
     import psycopg.yb.health_probe as hp_mod
     monkeypatch.setattr(
-        hp_mod, "cluster_status_check",
+        hp_mod, "check_primary_cluster",
         lambda g: HealthResult.UNHEALTHY,
     )
+    # Keep secondary HEALTHY so we only exercise the primary transition path.
+    monkeypatch.setattr(
+        hp_mod, "check_secondary_cluster",
+        lambda g: HealthResult.HEALTHY,
+    )
     group = _make_probe_target_group(fake_state, cooldown_s=999)
-    group.last_transition_time = time.monotonic()  # cool-down just started
+    group.primary_last_transition_time = time.monotonic()  # cool-down just started
     probe = HealthProbe(group, interval_s=0.02)
     probe.start()
     time.sleep(0.2)  # several probe ticks
     probe.stop()
-    assert group.status == HealthResult.HEALTHY  # cool-down kept us pinned
+    assert group.primary_status == HealthResult.HEALTHY  # cool-down kept us pinned
 
 
 def test_probe_swallows_exceptions(fake_state, monkeypatch):
-    """If `cluster_status_check` raises, the probe loop must NOT exit."""
+    """If a CB check raises, the probe loop must NOT exit."""
     import psycopg.yb.health_probe as hp_mod
 
     call_count = {"n": 0}
@@ -372,7 +405,8 @@ def test_probe_swallows_exceptions(fake_state, monkeypatch):
         call_count["n"] += 1
         raise RuntimeError("synthetic")
 
-    monkeypatch.setattr(hp_mod, "cluster_status_check", boom)
+    monkeypatch.setattr(hp_mod, "check_primary_cluster", boom)
+    monkeypatch.setattr(hp_mod, "check_secondary_cluster", boom)
     group = _make_probe_target_group(fake_state)
     probe = HealthProbe(group, interval_s=0.02)
     probe.start()
@@ -381,4 +415,4 @@ def test_probe_swallows_exceptions(fake_state, monkeypatch):
     # Loop ran multiple times despite the exception each time.
     assert call_count["n"] >= 2
     # Status unchanged.
-    assert group.status == HealthResult.HEALTHY
+    assert group.primary_status == HealthResult.HEALTHY

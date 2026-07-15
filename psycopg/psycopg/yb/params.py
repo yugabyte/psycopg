@@ -39,6 +39,14 @@ MAX_FAILED_HOST_RECONNECT_DELAY_SEC = 60
 DEFAULT_TRACKER_TABLE_TABLETS = 9
 DEFAULT_MAX_UPDATE_FAILURES_ALLOWED = 0
 DEFAULT_COOLDOWN_SEC = 1500
+# `check_timeout_s` default is derived from `refresh_interval_s` at parse
+# time — see extract_yb_params. `1` here is the floor when no refresh is set.
+DEFAULT_CHECK_TIMEOUT_SEC = 1
+# Barrier-with-timeout drain default (design doc §3.3). Sentinel values:
+#   -1 → wait indefinitely for in-flight transactions; never force-close.
+#    0 → force-close in-flight transactions immediately. No drain window.
+#    N > 0 → wait up to N seconds, then force-close survivors.
+DEFAULT_DRAIN_TIMEOUT_SEC = 10
 
 # Conninfo keys that always come out of the string before libpq parses it.
 # `load_balance_hosts` is special-cased: libpq-recognised values stay; our
@@ -54,6 +62,8 @@ _PURE_YB_KEYS = frozenset({
     "yb_failover_tracker_table_tablets",
     "yb_failover_max_update_failures_allowed",
     "yb_failover_cooldown_secs",
+    "yb_failover_check_timeout_secs",
+    "yb_failover_drain_timeout_secs",
 })
 _LOAD_BALANCE_KEY = "load_balance_hosts"
 _OUR_LB_VALUES = frozenset({"true", "false"})
@@ -76,6 +86,8 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failover[._-](?:trackerTableTablets|tracker[._-]table[._-]tablets)"
     r"|yb[._-]failover[._-](?:maxUpdateFailuresAllowed|max[._-]update[._-]failures[._-]allowed)"
     r"|yb[._-]failover[._-](?:cooldownSecs|cooldown[._-]secs)"
+    r"|yb[._-]failover[._-](?:checkTimeoutSecs|check[._-]timeout[._-]secs)"
+    r"|yb[._-]failover[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
     r"))\s*=\s*"
     # Value: bare token (no whitespace), or single-quoted, or double-quoted.
     # libpq's wire format technically supports backslash escapes inside quotes;
@@ -101,6 +113,8 @@ _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failover_trackertabletablets":       "yb_failover_tracker_table_tablets",
     "yb_failover_maxupdatefailuresallowed":  "yb_failover_max_update_failures_allowed",
     "yb_failover_cooldownsecs":              "yb_failover_cooldown_secs",
+    "yb_failover_checktimeoutsecs":          "yb_failover_check_timeout_secs",
+    "yb_failover_draintimeoutsecs":          "yb_failover_drain_timeout_secs",
 }
 
 
@@ -144,6 +158,17 @@ class YBParams:
     tracker_table_tablets: int = DEFAULT_TRACKER_TABLE_TABLETS
     max_update_failures_allowed: int = DEFAULT_MAX_UPDATE_FAILURES_ALLOWED
     cooldown_s: int = DEFAULT_COOLDOWN_SEC
+    # Wall-clock cap on each CircuitBreaker.check() call, enforced by the
+    # probe thread. Ticks that exceed the cap are abandoned; the previous
+    # per-cluster status is preserved. Prevents a blocking custom CB from
+    # stalling failover. Default: max(1, refresh_interval_s // 2) —
+    # computed at parse time in extract_yb_params.
+    check_timeout_s: int = DEFAULT_CHECK_TIMEOUT_SEC
+    # Barrier-with-timeout drain (design doc §3.3). Sentinel values:
+    #   -1 → wait indefinitely; never force-close in-flight transactions.
+    #    0 → force-close immediately; no drain window.
+    #    N > 0 → wait up to N seconds, then force-close survivors.
+    drain_timeout_s: int = DEFAULT_DRAIN_TIMEOUT_SEC
 
     @property
     def xcluster_enabled(self) -> bool:
@@ -275,6 +300,24 @@ def extract_yb_params(
         int(raw.get("yb_failover_cooldown_secs", DEFAULT_COOLDOWN_SEC)),
         0,
     )
+    # Wall-clock cap on each CB check(). Default: max(1, refresh // 2). The
+    # `max(1, ...)` guards against `refresh=0` producing a 0-second cap.
+    # Explicit user values win; clamp floor is 1 second so probes always
+    # get at least some chance to complete.
+    check_timeout = _clamp_lo(
+        int(raw.get(
+            "yb_failover_check_timeout_secs",
+            max(1, refresh // 2),
+        )),
+        1,
+    )
+    # Drain timeout. Sentinels (-1, 0) are meaningful — do NOT clamp them
+    # to a positive floor. Anything < -1 collapses to -1 (wait forever).
+    drain_timeout_raw = int(raw.get(
+        "yb_failover_drain_timeout_secs", DEFAULT_DRAIN_TIMEOUT_SEC,
+    ))
+    if drain_timeout_raw < -1:
+        drain_timeout_raw = -1
 
     return (
         YBParams(
@@ -286,6 +329,8 @@ def extract_yb_params(
             tracker_table_tablets=tablets,
             max_update_failures_allowed=max_fail,
             cooldown_s=cooldown,
+            check_timeout_s=check_timeout,
+            drain_timeout_s=drain_timeout_raw,
         ),
         cleaned_conninfo,
         cleaned_kwargs,
