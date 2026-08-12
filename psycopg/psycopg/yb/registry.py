@@ -135,19 +135,16 @@ class FailoverGroup:
         — wall-clock (monotonic) of the last transition. ``0.0`` at
         construction so a newly-spawned process can transition on its very
         first probe tick — no "fresh-app starvation" window.
-      * ``primary_circuit_breaker`` / ``secondary_circuit_breaker`` — the CB
-        instances. Default at bootstrap is a ``TrackerTableCircuitBreaker``
-        pointed at each cluster; tests can assign their own. If either is
-        ``None``, ``check_primary_cluster`` / ``check_secondary_cluster``
-        falls back to HEALTHY.
+      * ``primary_circuit_breaker`` / ``secondary_circuit_breaker`` — the
+        CB instances. The driver does NOT install a default; both slots
+        are ``None`` at bootstrap. Applications MUST attach an
+        implementation to each slot before opening connections — the
+        dispatcher raises ``MissingCircuitBreakerError`` otherwise. See
+        ``demo/samples/`` for reference CBs.
 
     ``cooldown_s`` applies symmetrically to both — the probe consults
     ``can_transition_primary`` / ``can_transition_secondary`` before writing
-    a status change (§7.3 Q1: symmetric-parameters default).
-
-    ``tracker_table_tablets`` and ``max_update_failures_allowed`` are the
-    per-cluster CB knobs, kept on the group so synthetic test groups can
-    inspect them without reaching into the CBs.
+    a status change.
 
     ``primary_probe`` / ``secondary_probe`` are the per-cluster
     ``HealthProbe`` daemons. Each polls its own cluster and refreshes the
@@ -164,18 +161,15 @@ class FailoverGroup:
     primary_last_transition_time: float = 0.0
     secondary_last_transition_time: float = 0.0
     cooldown_s: int = 1500
-    # Tracker-table config — consumed by the default
-    # TrackerTableCircuitBreaker instances (one per cluster).
-    tracker_table_tablets: int = 9
-    max_update_failures_allowed: int = 0
     # Per-cluster probes. Type kept loose to avoid a circular import on
     # health_probe.HealthProbe.
     primary_probe: "object | None" = None
     secondary_probe: "object | None" = None
-    # The per-cluster CircuitBreaker instances. Set during bootstrap by
-    # `get_or_bootstrap_failover_group`. Tests can assign their own. If
-    # left `None`, the `check_primary_cluster` / `check_secondary_cluster`
-    # delegating helpers return HEALTHY.
+    # The per-cluster CircuitBreaker instances. The driver does NOT install
+    # a default — applications MUST attach implementations after calling
+    # bootstrap_failover_group and before any psycopg.connect() traffic.
+    # The dispatcher raises MissingCircuitBreakerError if either slot is
+    # still None at connect time. See demo/samples/ for reference CBs.
     primary_circuit_breaker: "object | None" = None
     secondary_circuit_breaker: "object | None" = None
     # Dispatch pause flag (Phase D — see design doc §3). When True, new
@@ -516,10 +510,11 @@ class ClusterRegistry:
                     "primary_uuid=%s", primary.uuid,
                 )
                 return existing
-            # Late import — circuit_breaker imports HealthResult from
-            # health.py, which forward-refs FailoverGroup → cycle if we
-            # import at module top.
-            from .circuit_breaker import TrackerTableCircuitBreaker
+            # Both CB slots start empty. The application MUST attach
+            # implementations after this call returns and before any
+            # psycopg.connect() traffic. The dispatcher raises
+            # MissingCircuitBreakerError if either slot is still None at
+            # connect time. See demo/samples/ for reference CBs.
             group = FailoverGroup(
                 primary=primary,
                 secondary=secondary,
@@ -527,18 +522,8 @@ class ClusterRegistry:
                 primary_status=HealthResult.HEALTHY,
                 secondary_status=HealthResult.HEALTHY,
                 cooldown_s=yb_params.cooldown_s,
-                tracker_table_tablets=yb_params.tracker_table_tablets,
-                max_update_failures_allowed=yb_params.max_update_failures_allowed,
-                primary_circuit_breaker=TrackerTableCircuitBreaker(
-                    which_cluster="primary",
-                    tracker_table_tablets=yb_params.tracker_table_tablets,
-                    max_update_failures_allowed=yb_params.max_update_failures_allowed,
-                ),
-                secondary_circuit_breaker=TrackerTableCircuitBreaker(
-                    which_cluster="secondary",
-                    tracker_table_tablets=yb_params.tracker_table_tablets,
-                    max_update_failures_allowed=yb_params.max_update_failures_allowed,
-                ),
+                primary_circuit_breaker=None,
+                secondary_circuit_breaker=None,
             )
             self._failover_groups[primary.uuid] = group
 
@@ -596,10 +581,11 @@ class ClusterRegistry:
                     "for primary_uuid=%s", primary.uuid,
                 )
                 return existing
-            # Late import — circuit_breaker imports HealthResult from
-            # health.py, which forward-refs FailoverGroup → cycle if we
-            # import at module top.
-            from .circuit_breaker import TrackerTableCircuitBreaker
+            # Both CB slots start empty. The application MUST attach
+            # implementations after this call returns and before any
+            # psycopg.connect() traffic. The dispatcher raises
+            # MissingCircuitBreakerError if either slot is still None at
+            # connect time. See demo/samples/ for reference CBs.
             group = FailoverGroup(
                 primary=primary,
                 secondary=secondary,
@@ -607,18 +593,8 @@ class ClusterRegistry:
                 primary_status=HealthResult.HEALTHY,
                 secondary_status=HealthResult.HEALTHY,
                 cooldown_s=yb_params.cooldown_s,
-                tracker_table_tablets=yb_params.tracker_table_tablets,
-                max_update_failures_allowed=yb_params.max_update_failures_allowed,
-                primary_circuit_breaker=TrackerTableCircuitBreaker(
-                    which_cluster="primary",
-                    tracker_table_tablets=yb_params.tracker_table_tablets,
-                    max_update_failures_allowed=yb_params.max_update_failures_allowed,
-                ),
-                secondary_circuit_breaker=TrackerTableCircuitBreaker(
-                    which_cluster="secondary",
-                    tracker_table_tablets=yb_params.tracker_table_tablets,
-                    max_update_failures_allowed=yb_params.max_update_failures_allowed,
-                ),
+                primary_circuit_breaker=None,
+                secondary_circuit_breaker=None,
             )
             self._failover_groups[primary.uuid] = group
 

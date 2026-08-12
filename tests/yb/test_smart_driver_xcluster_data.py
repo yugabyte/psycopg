@@ -28,8 +28,11 @@ from contextlib import ExitStack
 import pytest
 
 import psycopg
+from psycopg.yb import bootstrap_failover_group
 from psycopg.yb.health import HealthResult
 from psycopg.yb.registry import ClusterRegistry
+
+from demo.samples.tracker_table_cb import TrackerTableCircuitBreaker
 
 
 PRIMARY_HOSTS = "127.0.0.1,127.0.0.2,127.0.0.3"
@@ -43,7 +46,6 @@ _CB_DSN = (
     f"load_balance_hosts=true "
     f"yb.failover.secondaryClusterHosts={SECONDARY_HOSTS} "
     f"yb_servers_refresh_interval={PROBE_INTERVAL_S} "
-    f"yb.failover.maxUpdateFailuresAllowed={MAX_UPDATE_FAILURES_ALLOWED} "
     f"yb.failover.cooldownSecs=0"
 )
 
@@ -113,15 +115,23 @@ def _wait_for_status(group, expected: HealthResult, timeout_s: float) -> bool:
 
 
 def _bootstrap_group():
-    conn = psycopg.connect(_CB_DSN)
-    try:
-        group = ClusterRegistry.instance().get_failover_group_by_uuid(
-            conn._yb_uuid
+    """Bootstrap the FailoverGroup, attach sample tracker-table CBs to
+    both slots, and return the group. Must run BEFORE any
+    ``psycopg.connect(_CB_DSN)`` — the dispatcher raises
+    ``MissingCircuitBreakerError`` if CB slots are still None."""
+    group = bootstrap_failover_group(_CB_DSN)
+    assert group is not None
+    if group.primary_circuit_breaker is None:
+        group.primary_circuit_breaker = TrackerTableCircuitBreaker(
+            which_cluster="primary",
+            max_update_failures_allowed=MAX_UPDATE_FAILURES_ALLOWED,
         )
-        assert group is not None
-        return group
-    finally:
-        conn.close()
+    if group.secondary_circuit_breaker is None:
+        group.secondary_circuit_breaker = TrackerTableCircuitBreaker(
+            which_cluster="secondary",
+            max_update_failures_allowed=MAX_UPDATE_FAILURES_ALLOWED,
+        )
+    return group
 
 
 def _histogram(conns) -> dict[str, int]:

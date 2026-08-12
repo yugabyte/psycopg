@@ -1,5 +1,10 @@
 """
-Unit tests for ``psycopg.yb.circuit_breaker``.
+Unit tests for the reference ``TrackerTableCircuitBreaker`` sample.
+
+The class lives at ``demo/samples/tracker_table_cb.py`` — the driver
+no longer ships a default CB (Amogh's ask: applications choose their
+own strategy). These tests verify the sample still behaves correctly
+so it stays a good starting point for adopters.
 
 Verify the tracker-table-based circuit breaker:
 
@@ -29,15 +34,16 @@ import threading
 import pytest
 
 from psycopg import errors as e
-from psycopg.yb.circuit_breaker import (
-    AlwaysHealthyCircuitBreaker,
+from psycopg.yb.circuit_breaker import AlwaysHealthyCircuitBreaker
+from psycopg.yb.health import HealthResult
+from psycopg.yb.registry import FailoverGroup
+
+from demo.samples.tracker_table_cb import (
     TrackerTableCircuitBreaker,
     _create_table_sql,
     _insert_sql,
     _row_ids_for_tablets,
 )
-from psycopg.yb.health import HealthResult
-from psycopg.yb.registry import FailoverGroup
 
 
 pytestmark = pytest.mark.yb_unit

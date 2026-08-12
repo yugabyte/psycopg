@@ -150,18 +150,29 @@ class Connection(BaseConnection[Row]):
         # is False (the common case).
         active_cluster: str | None = None
         failover_group = None
-        if yb_params.xcluster_enabled:
-            from .yb import NoViableClusterError  # late import; cycle-safe
+        if yb_params.xcluster_enabled:  # late import; cycle-safe
+            from .yb import MissingCircuitBreakerError, NoViableClusterError
             from .yb.state import active_cluster as _active_cluster
             from .yb.state import wait_for_dispatch as _wait_for_dispatch
 
             failover_group = registry.get_or_bootstrap_failover_group(
                 yb_params, cleaned_conninfo, cleaned_kwargs
             )
+            # Fail fast — the driver ships without a default CB. The app
+            # must attach both slots via bootstrap_failover_group + explicit
+            # assignment before any connect. Better to raise here than to
+            # silently route based on a status flag no CB is writing to.
+            if (
+                failover_group.primary_circuit_breaker is None
+                or failover_group.secondary_circuit_breaker is None
+            ):
+                raise MissingCircuitBreakerError(
+                    "Configuration error: 'yb.failover.secondaryClusterHosts' requires circuit breaker class to be configured. Exiting."
+                )
             # Barrier: if a drain sequence has paused dispatch, block here
-            # until it releases (Phase D). No timeout in the direct-connect
-            # path — Phase E's drain is bounded by drainTimeoutSecs, so
-            # the wait is inherently short.
+            # until it releases. No timeout in the direct-connect path —
+            # the drain is bounded by drainTimeoutSecs, so the wait is
+            # inherently short.
             _wait_for_dispatch(failover_group)
             which = _active_cluster(failover_group)
             if which is None:
@@ -178,11 +189,11 @@ class Connection(BaseConnection[Row]):
                 active_cluster,
                 failover_group.primary.uuid,
             )
+        else:
             # xCluster deployments have per-cluster probe threads that
             # refresh yb_servers() on each tick (design doc §4.1). The
             # lazy on-demand refresh path is skipped here — the probe
             # cadence is authoritative for topology in xCluster mode.
-        else:
             # ClusterKey wants a dict; parse the cleaned conninfo once for it.
             pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
             key = ClusterKey.from_params(pg_dict)

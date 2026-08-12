@@ -1,13 +1,17 @@
 """
-Unit tests for xCluster failover conninfo parsing (Phase 1 of the xCluster
-failover implementation plan).
+Unit tests for xCluster failover conninfo parsing.
 
-These tests cover the four new ``yb.failover.*`` parameters:
+These tests cover the ``yb.failover.*`` parameters the driver still owns:
 
 * ``yb.failover.secondaryClusterHosts`` (string, comma-separated host list)
-* ``yb.failover.trackerTableTablets`` (int, default 9)
-* ``yb.failover.maxUpdateFailuresAllowed`` (int, default 0)
 * ``yb.failover.cooldownSecs`` (int, default 1500)
+* ``yb.failover.drainTimeoutSecs`` (int, default 10, sentinels: -1, 0, N)
+* ``yb.failover.checkTimeoutSecs`` (int)
+
+The ``trackerTableTablets`` and ``maxUpdateFailuresAllowed`` params were
+removed when the default CB was moved to ``demo/samples/`` — they were
+tracker-table-specific knobs, and custom CBs configure themselves via
+their own constructors.
 
 Plus the derived ``xcluster_enabled`` property — both
 ``load_balance_hosts=true`` AND a non-empty secondary host list must be set
@@ -24,8 +28,6 @@ import pytest
 
 from psycopg.yb.params import (
     DEFAULT_COOLDOWN_SEC,
-    DEFAULT_MAX_UPDATE_FAILURES_ALLOWED,
-    DEFAULT_TRACKER_TABLE_TABLETS,
     YBParams,
     extract_yb_params,
 )
@@ -36,8 +38,6 @@ from psycopg.yb.params import (
 def test_defaults_when_no_failover_params():
     yb, _, _ = extract_yb_params("host=h1", {})
     assert yb.secondary_cluster_hosts == []
-    assert yb.tracker_table_tablets == DEFAULT_TRACKER_TABLE_TABLETS  # 9
-    assert yb.max_update_failures_allowed == DEFAULT_MAX_UPDATE_FAILURES_ALLOWED  # 0
     assert yb.cooldown_s == DEFAULT_COOLDOWN_SEC  # 1500
     assert yb.xcluster_enabled is False
 
@@ -65,28 +65,6 @@ def test_secondary_hosts_accepts_all_key_forms(key_form):
     assert "s1" not in cleaned  # value also gone with the key
     # Original host parameter survives.
     assert "host=h1" in cleaned
-
-
-@pytest.mark.parametrize("key_form,expected_value", [
-    ("yb.failover.trackerTableTablets", 27),
-    ("yb_failover_tracker_table_tablets", 27),
-    ("yb-failover-tracker-table-tablets", 27),
-])
-def test_tracker_table_tablets_accepts_all_key_forms(key_form, expected_value):
-    conninfo = f"host=h1 {key_form}={expected_value}"
-    yb, _, _ = extract_yb_params(conninfo, {})
-    assert yb.tracker_table_tablets == expected_value
-
-
-@pytest.mark.parametrize("key_form", [
-    "yb.failover.maxUpdateFailuresAllowed",
-    "yb_failover_max_update_failures_allowed",
-    "yb-failover-max-update-failures-allowed",
-])
-def test_max_update_failures_allowed_accepts_all_key_forms(key_form):
-    conninfo = f"host=h1 {key_form}=5"
-    yb, _, _ = extract_yb_params(conninfo, {})
-    assert yb.max_update_failures_allowed == 5
 
 
 @pytest.mark.parametrize("key_form", [
@@ -200,45 +178,21 @@ def test_kwargs_override_conninfo():
     assert yb.secondary_cluster_hosts == ["kwarg_host"]
 
 
-def test_all_four_xcluster_kwargs_via_spread():
+def test_xcluster_kwargs_via_spread():
     yb, _, cleaned_kwargs = extract_yb_params(
         "host=h1 load_balance_hosts=true",
         {
             "yb.failover.secondaryClusterHosts": "s1,s2",
-            "yb.failover.trackerTableTablets": "42",
-            "yb.failover.maxUpdateFailuresAllowed": "3",
             "yb.failover.cooldownSecs": "600",
         },
     )
     assert yb.secondary_cluster_hosts == ["s1", "s2"]
-    assert yb.tracker_table_tablets == 42
-    assert yb.max_update_failures_allowed == 3
     assert yb.cooldown_s == 600
     # None of them leaked into the cleaned kwargs.
     assert cleaned_kwargs == {}
 
 
 # ----------------------------------------------------------------- clamps
-
-def test_tracker_table_tablets_clamps_to_minimum_1():
-    """Zero / negative tablet count is meaningless; clamp to 1."""
-    yb, _, _ = extract_yb_params(
-        "host=h1 yb.failover.trackerTableTablets=0", {}
-    )
-    assert yb.tracker_table_tablets == 1
-
-    yb, _, _ = extract_yb_params(
-        "host=h1 yb.failover.trackerTableTablets=-5", {}
-    )
-    assert yb.tracker_table_tablets == 1
-
-
-def test_max_update_failures_allowed_clamps_to_minimum_0():
-    yb, _, _ = extract_yb_params(
-        "host=h1 yb.failover.maxUpdateFailuresAllowed=-1", {}
-    )
-    assert yb.max_update_failures_allowed == 0
-
 
 def test_cooldown_secs_clamps_to_minimum_0():
     yb, _, _ = extract_yb_params(
@@ -262,8 +216,6 @@ def test_failover_keys_stripped_from_cleaned_conninfo():
         "host=h1,h2 port=5433 user=u dbname=d "
         "load_balance_hosts=true "
         "yb.failover.secondaryClusterHosts=s1,s2,s3 "
-        "yb.failover.trackerTableTablets=9 "
-        "yb.failover.maxUpdateFailuresAllowed=0 "
         "yb.failover.cooldownSecs=300"
     )
     yb, cleaned, _ = extract_yb_params(conninfo, {})
@@ -280,8 +232,6 @@ def test_failover_keys_stripped_from_cleaned_conninfo():
     assert not cleaned.endswith("=")
     # Sanity: the YBParams object got the values.
     assert yb.secondary_cluster_hosts == ["s1", "s2", "s3"]
-    assert yb.tracker_table_tablets == 9
-    assert yb.max_update_failures_allowed == 0
     assert yb.cooldown_s == 300
 
 

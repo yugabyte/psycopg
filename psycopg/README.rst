@@ -147,16 +147,6 @@ accepted as separators between tokens):
      - Comma-separated secondary-cluster host list. One host is enough —
        the rest of the cluster is discovered via ``yb_servers()``.
        Setting this is the opt-in trigger for xCluster failover.
-   * - ``yb.failover.trackerTableTablets``
-     - ``9``
-     - Tablet count for the default tracker-table CB's DDL. Each tablet
-       gets one seed row; the CB's UPDATE touches all rows, exercising
-       every tablet leader on each tick.
-   * - ``yb.failover.maxUpdateFailuresAllowed``
-     - ``0``
-     - Consecutive UPDATE failures tolerated on the tracker-table CB
-       before it reports UNHEALTHY. Symmetric hysteresis — same
-       threshold governs the UNHEALTHY→HEALTHY recovery direction.
    * - ``yb.failover.cooldownSecs``
      - ``1500``
      - Minimum interval between status transitions in either direction
@@ -208,23 +198,26 @@ Pluggable circuit breaker
 
 Health signals enter the driver through a ``CircuitBreaker`` object —
 any class with ``check(group) -> HealthResult`` satisfies the contract.
-Attach a custom one at startup, per-cluster:
+**The driver ships no default.** After bootstrap you MUST attach an
+implementation to BOTH ``group.primary_circuit_breaker`` and
+``group.secondary_circuit_breaker`` before opening any connection —
+``psycopg.connect(...)`` raises ``MissingCircuitBreakerError``
+otherwise.
 
 .. code-block:: python
 
     from psycopg.yb import bootstrap_failover_group
-    from psycopg.yb.circuit_breaker import ExternalSignalCircuitBreaker
+    from demo.samples.tracker_table_cb import TrackerTableCircuitBreaker
 
     group = bootstrap_failover_group(dsn)
-    group.primary_circuit_breaker   = ExternalSignalCircuitBreaker(which_cluster="primary")
-    group.secondary_circuit_breaker = ExternalSignalCircuitBreaker(which_cluster="secondary")
+    group.primary_circuit_breaker   = TrackerTableCircuitBreaker(which_cluster="primary")
+    group.secondary_circuit_breaker = TrackerTableCircuitBreaker(which_cluster="secondary")
 
-Provided implementations:
+Reference implementations under ``demo/samples/``:
 
-* ``TrackerTableCircuitBreaker`` — default. UPDATE-based probe over
+* ``TrackerTableCircuitBreaker`` — UPDATE-based probe over
   ``yb_cluster_health_tracker``. Tablet-splits the table so the UPDATE
   touches every leader, catching partial-cluster failures.
-* ``AlwaysHealthyCircuitBreaker`` — inert; for tests.
 * ``ExternalSignalCircuitBreaker`` — reads ``target_status`` from a
   well-known signal table. Operator writes a row to trigger a manual
   failover / failback:
@@ -233,6 +226,11 @@ Provided implementations:
 
       INSERT INTO yb_failover_signals (group_id, target_status, reason)
       VALUES ('<primary-uuid>', 'UNHEALTHY', 'planned maintenance');
+
+Ships in ``psycopg.yb.circuit_breaker``:
+
+* ``CircuitBreaker`` — the Protocol every CB implements.
+* ``AlwaysHealthyCircuitBreaker`` — inert; for tests only.
 
 Manual failover from Python (test / migration):
 

@@ -38,8 +38,6 @@ def _make_yb_params(secondary_hosts, cooldown_s=5, refresh_s=300):
         secondary_cluster_hosts=list(secondary_hosts),
         cooldown_s=cooldown_s,
         refresh_interval_s=refresh_s,
-        tracker_table_tablets=9,
-        max_update_failures_allowed=0,
     )
 
 

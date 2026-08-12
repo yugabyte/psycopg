@@ -39,6 +39,17 @@ import pytest
 # under tests/yb/ run on the same loop as the rest of the suite.
 from ..conftest import asyncio_options
 
+# The driver no longer ships default CB implementations — reference
+# CBs live under demo/samples/. Put the repo root on sys.path so tests
+# and integration harnesses can do `from demo.samples.tracker_table_cb
+# import TrackerTableCircuitBreaker` without an editable install of the
+# demo/ tree.
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 
 # --------------------------------------------------------------------- markers
 #
@@ -650,6 +661,7 @@ def yb_failover_group(fresh_registry, fake_state):
     without time-warping. Set ``group.cooldown_s = N`` directly if a test
     needs to exercise cool-down behaviour.
     """
+    from psycopg.yb.circuit_breaker import AlwaysHealthyCircuitBreaker
     from psycopg.yb.health import HealthResult
     from psycopg.yb.registry import FailoverGroup
 
@@ -663,6 +675,8 @@ def yb_failover_group(fresh_registry, fake_state):
         ("s2", "aws", "us-east", "us-east-1b", "primary"),
         uuid="secondary-uuid",
     )
+    # Attach inert CBs so the dispatcher's fail-fast check passes;
+    # these tests drive status via ``force_*_status`` directly.
     group = FailoverGroup(
         primary=primary,
         secondary=secondary,
@@ -670,6 +684,8 @@ def yb_failover_group(fresh_registry, fake_state):
         primary_status=HealthResult.HEALTHY,
         secondary_status=HealthResult.HEALTHY,
         cooldown_s=0,
+        primary_circuit_breaker=AlwaysHealthyCircuitBreaker(),
+        secondary_circuit_breaker=AlwaysHealthyCircuitBreaker(),
     )
     fresh_registry._clusters[primary.uuid] = primary
     fresh_registry._clusters[secondary.uuid] = secondary

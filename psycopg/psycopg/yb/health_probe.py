@@ -67,9 +67,10 @@ def _emit_startup_notice_once() -> None:
         _STARTUP_NOTICE_EMITTED = True
     logger.info(
         "xCluster failover plumbing active; per-cluster probes started. "
-        "Health detection via TrackerTableCircuitBreaker per cluster (see "
-        "psycopg.yb.circuit_breaker). Status transitions will be logged "
-        "at INFO."
+        "Health detection via the CircuitBreaker attached to "
+        "group.primary_circuit_breaker / group.secondary_circuit_breaker "
+        "(see demo/samples/ for reference implementations). Status "
+        "transitions will be logged at INFO."
     )
 
 

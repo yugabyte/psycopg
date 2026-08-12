@@ -1,6 +1,7 @@
 """
-Unit tests for ``psycopg.yb.circuit_breaker.ExternalSignalCircuitBreaker``
-(Phase F of the xCluster failover implementation plan).
+Unit tests for the reference ``ExternalSignalCircuitBreaker`` sample
+(``demo/samples/external_signal_cb.py`` — Phase F of the xCluster
+failover implementation plan).
 
 Verifies:
 
@@ -22,9 +23,10 @@ import threading
 
 import pytest
 
-from psycopg.yb.circuit_breaker import ExternalSignalCircuitBreaker
 from psycopg.yb.health import HealthResult
 from psycopg.yb.registry import ClusterState, FailoverGroup
+
+from demo.samples.external_signal_cb import ExternalSignalCircuitBreaker
 
 
 pytestmark = pytest.mark.yb_unit

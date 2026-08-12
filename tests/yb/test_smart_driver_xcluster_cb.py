@@ -1,16 +1,21 @@
 """
-Tier 2 xCluster integration tests against the REAL ``TrackerTableCircuitBreaker``.
+Tier 2 xCluster integration tests against the REAL sample
+``TrackerTableCircuitBreaker`` (``demo/samples/tracker_table_cb.py``).
 
 These exercise the full end-to-end loop:
 
   * Real two yb-ctl clusters (primary on 127.0.0.1-.3, secondary on .4-.6)
   * Real ``HealthProbe`` daemon thread running real tracker-table UPDATEs
     on the primary's control connection
-  * Real ``TrackerTableCircuitBreaker`` observing real cluster failures
-    via UPDATE failures, transitioning ``group.primary_status`` HEALTHY ↔ UNHEALTHY
+  * The reference sample CB observing real cluster failures via UPDATE
+    failures, transitioning ``group.primary_status`` HEALTHY ↔ UNHEALTHY
   * Real dispatcher rerouting new connections to the secondary cluster on
     UNHEALTHY, back to primary on HEALTHY
   * Real ``ConnectionPool(check=xcluster_check)`` evicting stale conns
+
+Since the driver no longer ships a default CB, ``_bootstrap_group`` here
+also attaches sample tracker CBs to both slots. That's the same shape a
+real application takes.
 
 Failure injection is by ``yb-ctl stop_node`` / ``start_node`` against the
 primary cluster's ``--data_dir``. The companion test file
@@ -18,14 +23,14 @@ primary cluster's ``--data_dir``. The companion test file
 deterministically via ``FailoverGroup.force_status`` (fast, no node
 stop/start needed); this file is the slower end-to-end counterpart.
 
-Tunables baked into ``_CB_DSN``:
+Tunables:
 
   * ``yb_servers_refresh_interval=3`` — short probe interval so tests
     don't need to wait minutes for the CB to tick.
-  * ``yb.failover.maxUpdateFailuresAllowed=1`` — threshold of 2: rides
-    out a single leader-election blip when one of three RF=3 nodes
-    drops. Without this, a brief tablet-leader gap during the single-
-    node-down test would spuriously trip the CB.
+  * ``max_update_failures_allowed=1`` on the CB constructor (threshold
+    of 2): rides out a single leader-election blip when one of three
+    RF=3 nodes drops. Without this, a brief tablet-leader gap during
+    the single-node-down test would spuriously trip the CB.
   * ``yb.failover.cooldownSecs=0`` — no cool-down between transitions
     so the test reads the most recent status.
 
@@ -45,8 +50,11 @@ from collections import Counter
 import pytest
 
 import psycopg
+from psycopg.yb import bootstrap_failover_group
 from psycopg.yb.health import HealthResult
 from psycopg.yb.registry import ClusterRegistry
+
+from demo.samples.tracker_table_cb import TrackerTableCircuitBreaker
 
 
 PRIMARY_HOSTS = "127.0.0.1,127.0.0.2,127.0.0.3"
@@ -61,23 +69,29 @@ _CB_DSN = (
     f"load_balance_hosts=true "
     f"yb.failover.secondaryClusterHosts={SECONDARY_HOSTS} "
     f"yb_servers_refresh_interval={PROBE_INTERVAL_S} "
-    f"yb.failover.maxUpdateFailuresAllowed={MAX_UPDATE_FAILURES_ALLOWED} "
     f"yb.failover.cooldownSecs=0"
 )
 
 
 def _bootstrap_group():
-    """Open one connection to trigger ``FailoverGroup`` bootstrap, then
-    return the group handle so the test can observe ``group.primary_status``."""
-    conn = psycopg.connect(_CB_DSN)
-    try:
-        group = ClusterRegistry.instance().get_failover_group_by_uuid(
-            conn._yb_uuid
+    """Bootstrap the FailoverGroup, attach the sample tracker-table CBs
+    to both slots, and return the group so the test can observe
+    ``group.primary_status``. Must be called BEFORE any
+    ``psycopg.connect(_CB_DSN)`` — the dispatcher raises
+    ``MissingCircuitBreakerError`` if the slots are still None."""
+    group = bootstrap_failover_group(_CB_DSN)
+    assert group is not None, "FailoverGroup must be created at bootstrap"
+    if group.primary_circuit_breaker is None:
+        group.primary_circuit_breaker = TrackerTableCircuitBreaker(
+            which_cluster="primary",
+            max_update_failures_allowed=MAX_UPDATE_FAILURES_ALLOWED,
         )
-        assert group is not None, "FailoverGroup must be created at bootstrap"
-        return group
-    finally:
-        conn.close()
+    if group.secondary_circuit_breaker is None:
+        group.secondary_circuit_breaker = TrackerTableCircuitBreaker(
+            which_cluster="secondary",
+            max_update_failures_allowed=MAX_UPDATE_FAILURES_ALLOWED,
+        )
+    return group
 
 
 def _wait_for_status(
@@ -237,7 +251,7 @@ def test_cb_stays_healthy_when_single_primary_node_down(
 ):
     """Single primary tserver down → CB MUST NOT trip.
 
-    With RF=3 and ``maxUpdateFailuresAllowed=1`` (threshold=2), a single
+    With RF=3 and ``max_update_failures_allowed=1`` (threshold=2), a single
     leader-election blip for tablets whose leader was on the dropped node
     is absorbed: the next tick succeeds, the failure counter resets, and
     the CB stays HEALTHY. This is the "single node failure should not

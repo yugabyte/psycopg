@@ -43,12 +43,19 @@ class _StubConn:
 
 
 def _install_group(reg, fake_state, cooldown_s=0):
-    """Install a FailoverGroup directly, bypassing bootstrap."""
+    """Install a FailoverGroup directly, bypassing bootstrap. Attaches
+    ``AlwaysHealthyCircuitBreaker`` to both slots so the dispatcher's
+    fail-fast check passes — these tests exercise routing, not health
+    detection; the ``primary_status`` / ``secondary_status`` fields are
+    driven by ``force_*_status`` directly."""
+    from psycopg.yb.circuit_breaker import AlwaysHealthyCircuitBreaker
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = FailoverGroup(
         primary=p, secondary=s, lock=threading.Lock(),
         primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY, cooldown_s=cooldown_s,
+        primary_circuit_breaker=AlwaysHealthyCircuitBreaker(),
+        secondary_circuit_breaker=AlwaysHealthyCircuitBreaker(),
     )
     reg._clusters[p.uuid] = p
     reg._clusters[s.uuid] = s

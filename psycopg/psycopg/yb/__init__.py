@@ -94,6 +94,19 @@ class NoViableClusterError(_OperationalError):
     """
 
 
+class MissingCircuitBreakerError(_OperationalError):
+    """Raised when a connection is attempted against an xCluster-enabled
+    DSN before both circuit breakers have been attached to the group.
+
+    The driver no longer ships a default CB implementation — applications
+    MUST attach one to ``group.primary_circuit_breaker`` and
+    ``group.secondary_circuit_breaker`` after bootstrap and before any
+    ``psycopg.connect(dsn)`` traffic. See ``demo/samples/`` for reference
+    implementations. Subclass of ``OperationalError`` so applications'
+    generic error handling picks it up.
+    """
+
+
 # Install `logger.trace(...)` as a convenience so call sites read like the
 # other levels. We only install if no other library beat us to it, so we
 # don't clobber a third-party `trace` method that might use it differently.
@@ -333,6 +346,7 @@ async def _awarn_statement_timeout_async(group, drain_timeout_s: int) -> None:
 __all__ = [
     "TRACE",
     "NoViableClusterError",
+    "MissingCircuitBreakerError",
     "bootstrap_failover_group",
     "abootstrap_failover_group",
 ]

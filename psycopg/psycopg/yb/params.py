@@ -36,8 +36,11 @@ DEFAULT_FAILED_HOST_RECONNECT_DELAY_SEC = 5
 MAX_FAILED_HOST_RECONNECT_DELAY_SEC = 60
 
 # xCluster failover defaults — see /tmp/xcluster_failover_design.html §5.
-DEFAULT_TRACKER_TABLE_TABLETS = 9
-DEFAULT_MAX_UPDATE_FAILURES_ALLOWED = 0
+# `trackerTableTablets` and `maxUpdateFailuresAllowed` used to live here;
+# they were tracker-table-CB-specific config. Now that the driver ships
+# without a default CB, that config moves to the sample implementation
+# (see demo/samples/tracker_table_cb.py). Keep only the driver-generic
+# knobs here.
 DEFAULT_COOLDOWN_SEC = 1500
 # `check_timeout_s` default is derived from `refresh_interval_s` at parse
 # time — see extract_yb_params. `1` here is the floor when no refresh is set.
@@ -59,8 +62,6 @@ _PURE_YB_KEYS = frozenset({
     # accepts camelCase, dotted, dashed, and snake forms; all normalise to
     # these names.
     "yb_failover_secondary_cluster_hosts",
-    "yb_failover_tracker_table_tablets",
-    "yb_failover_max_update_failures_allowed",
     "yb_failover_cooldown_secs",
     "yb_failover_check_timeout_secs",
     "yb_failover_drain_timeout_secs",
@@ -83,8 +84,6 @@ _YB_KEY_RE = re.compile(
     r"|failed[_-]host[_-]reconnect[_-]delay[_-]secs"
     r"|load[_-]balance[_-]hosts"
     r"|yb[._-]failover[._-](?:secondaryClusterHosts|secondary[._-]cluster[._-]hosts)"
-    r"|yb[._-]failover[._-](?:trackerTableTablets|tracker[._-]table[._-]tablets)"
-    r"|yb[._-]failover[._-](?:maxUpdateFailuresAllowed|max[._-]update[._-]failures[._-]allowed)"
     r"|yb[._-]failover[._-](?:cooldownSecs|cooldown[._-]secs)"
     r"|yb[._-]failover[._-](?:checkTimeoutSecs|check[._-]timeout[._-]secs)"
     r"|yb[._-]failover[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
@@ -110,8 +109,6 @@ _CAMEL_BOUNDARY_RE = re.compile(r"([a-z])([A-Z])")
 # folds those single-token forms back to the canonical snake_case name.
 _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failover_secondaryclusterhosts":     "yb_failover_secondary_cluster_hosts",
-    "yb_failover_trackertabletablets":       "yb_failover_tracker_table_tablets",
-    "yb_failover_maxupdatefailuresallowed":  "yb_failover_max_update_failures_allowed",
     "yb_failover_cooldownsecs":              "yb_failover_cooldown_secs",
     "yb_failover_checktimeoutsecs":          "yb_failover_check_timeout_secs",
     "yb_failover_draintimeoutsecs":          "yb_failover_drain_timeout_secs",
@@ -151,12 +148,10 @@ class YBParams:
     refresh_interval_s: int = DEFAULT_REFRESH_INTERVAL_SEC
     failed_host_reconnect_delay_s: int = DEFAULT_FAILED_HOST_RECONNECT_DELAY_SEC
 
-    # xCluster failover parameters — see /tmp/xcluster_failover_design.html §5.
-    # All four are inert defaults unless `xcluster_enabled` is True (gated on
-    # `secondaryClusterHosts` non-empty AND `load_balance_hosts=true`).
+    # xCluster failover parameters. All inert unless `xcluster_enabled` is
+    # True (gated on `secondaryClusterHosts` non-empty AND
+    # `load_balance_hosts=true`).
     secondary_cluster_hosts: list[str] = field(default_factory=list)
-    tracker_table_tablets: int = DEFAULT_TRACKER_TABLE_TABLETS
-    max_update_failures_allowed: int = DEFAULT_MAX_UPDATE_FAILURES_ALLOWED
     cooldown_s: int = DEFAULT_COOLDOWN_SEC
     # Wall-clock cap on each CircuitBreaker.check() call, enforced by the
     # probe thread. Ticks that exceed the cap are abandoned; the previous
@@ -282,20 +277,6 @@ def extract_yb_params(
     secondary_hosts: list[str] = []
     if (sh_raw := raw.get("yb_failover_secondary_cluster_hosts")):
         secondary_hosts = _parse_host_list(sh_raw)
-    tablets = _clamp_lo(
-        int(raw.get(
-            "yb_failover_tracker_table_tablets",
-            DEFAULT_TRACKER_TABLE_TABLETS,
-        )),
-        1,
-    )
-    max_fail = _clamp_lo(
-        int(raw.get(
-            "yb_failover_max_update_failures_allowed",
-            DEFAULT_MAX_UPDATE_FAILURES_ALLOWED,
-        )),
-        0,
-    )
     cooldown = _clamp_lo(
         int(raw.get("yb_failover_cooldown_secs", DEFAULT_COOLDOWN_SEC)),
         0,
@@ -326,8 +307,6 @@ def extract_yb_params(
             refresh_interval_s=refresh,
             failed_host_reconnect_delay_s=delay,
             secondary_cluster_hosts=secondary_hosts,
-            tracker_table_tablets=tablets,
-            max_update_failures_allowed=max_fail,
             cooldown_s=cooldown,
             check_timeout_s=check_timeout,
             drain_timeout_s=drain_timeout_raw,
