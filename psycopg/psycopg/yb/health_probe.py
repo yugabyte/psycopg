@@ -136,6 +136,11 @@ class HealthProbe:
             thread_name_prefix=f"yb-check-{which_cluster}-{id(group):x}",
         )
         self._pending_future: concurrent.futures.Future | None = None
+        # Set after the first tick completes (success, timeout, or raised).
+        # ``FailoverGroup.wait_for_first_check`` waits on this so callers
+        # can synchronise routing decisions with actual CB observations
+        # (design doc §4.6). See ``run_first_check_synchronously``.
+        self._first_check_complete = threading.Event()
 
     def start(self) -> None:
         """Spin up the daemon thread. Idempotent."""
@@ -203,49 +208,71 @@ class HealthProbe:
         check is a CB bug, not a cluster signal). If the executor is
         still busy with a previous stuck check, skip this tick entirely
         so a wedged CB doesn't accumulate a backlog."""
-        # Previous check still running past its cap? Skip this tick.
-        if (
-            self._pending_future is not None
-            and not self._pending_future.done()
-        ):
-            logger.warning(
-                "%s CB check still running past checkTimeoutSecs=%.1fs; "
-                "skipping tick (primary_uuid=%s)",
-                self._which, self._check_timeout_s,
-                self._group.primary.uuid,
-            )
-            return
-        # Read from module globals so tests can monkeypatch either
-        # ``psycopg.yb.health_probe.check_primary_cluster`` or
-        # ``psycopg.yb.health.check_primary_cluster``.
-        module_scope = _get_module_scope()
-        check_fn: Callable[["FailoverGroup"], HealthResult] = (
-            module_scope[f"check_{self._which}_cluster"]
-        )
-        future = self._executor.submit(check_fn, self._group)
-        self._pending_future = future
         try:
-            result = future.result(timeout=self._check_timeout_s)
-        except concurrent.futures.TimeoutError:
-            logger.warning(
-                "%s CB check exceeded checkTimeoutSecs=%.1fs; preserving "
-                "previous status (primary_uuid=%s)",
-                self._which, self._check_timeout_s,
-                self._group.primary.uuid,
+            # Previous check still running past its cap? Skip this tick.
+            if (
+                self._pending_future is not None
+                and not self._pending_future.done()
+            ):
+                logger.warning(
+                    "%s CB check still running past checkTimeoutSecs=%.1fs; "
+                    "skipping tick (primary_uuid=%s)",
+                    self._which, self._check_timeout_s,
+                    self._group.primary.uuid,
+                )
+                return
+            # Read from module globals so tests can monkeypatch either
+            # ``psycopg.yb.health_probe.check_primary_cluster`` or
+            # ``psycopg.yb.health.check_primary_cluster``.
+            module_scope = _get_module_scope()
+            check_fn: Callable[["FailoverGroup"], HealthResult] = (
+                module_scope[f"check_{self._which}_cluster"]
             )
-            # Leave `_pending_future` in place so the next tick sees the
-            # still-running check and skips itself.
-            return
-        except Exception:
-            logger.warning(
-                "%s CB check raised; treating as no-change (primary_uuid=%s)",
-                self._which, self._group.primary.uuid,
-                exc_info=True,
-            )
+            future = self._executor.submit(check_fn, self._group)
+            self._pending_future = future
+            try:
+                result = future.result(timeout=self._check_timeout_s)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "%s CB check exceeded checkTimeoutSecs=%.1fs; preserving "
+                    "previous status (primary_uuid=%s)",
+                    self._which, self._check_timeout_s,
+                    self._group.primary.uuid,
+                )
+                # Leave `_pending_future` in place so the next tick sees the
+                # still-running check and skips itself.
+                return
+            except Exception:
+                logger.warning(
+                    "%s CB check raised; treating as no-change (primary_uuid=%s)",
+                    self._which, self._group.primary.uuid,
+                    exc_info=True,
+                )
+                self._pending_future = None
+                return
             self._pending_future = None
+            self._maybe_apply(result)
+        finally:
+            # Any tick — success, timeout, exception, or "still-running
+            # skip" — counts as "first check ran" for the bootstrap gate.
+            # Callers waiting on ``wait_for_first_check`` only need one
+            # datapoint per CB, however that datapoint arrives.
+            self._first_check_complete.set()
+
+    @property
+    def first_check_complete(self) -> bool:
+        return self._first_check_complete.is_set()
+
+    def run_first_check_synchronously(self) -> None:
+        """Force one synchronous ``_tick_check`` and block until it
+        completes. Used by ``FailoverGroup.wait_for_first_check``.
+        Idempotent — a no-op if the first tick has already fired.
+
+        Bounded by ``check_timeout_s`` inside ``_tick_check`` — if the
+        CB hangs, this returns anyway."""
+        if self._first_check_complete.is_set():
             return
-        self._pending_future = None
-        self._maybe_apply(result)
+        self._tick_check()
 
     def _maybe_apply(self, result: HealthResult) -> None:
         """If ``result`` differs from the current per-cluster status AND

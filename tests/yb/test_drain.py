@@ -315,3 +315,179 @@ def test_drain_completes_before_deadline_when_conns_drain_naturally(
         f"drain should end when conn goes idle, took {elapsed:.2f}s"
     )
     assert conn.closed is False   # committed cleanly; not force-closed
+
+
+# ============================================================
+# autoFailbackEnabled suppression (P1.2)
+# ============================================================
+
+def test_auto_failback_true_still_fails_back(fake_state):
+    """Default behaviour — primary UNHEALTHY → HEALTHY triggers the
+    drain (drain of secondary + flip to primary)."""
+    group = _make_group(fake_state)
+    # Start on secondary (primary unhealthy).
+    group.primary_status = HealthResult.UNHEALTHY
+    assert group.auto_failback_enabled is True   # default
+
+    conn = _FakeConn(TransactionStatus.IDLE)
+    group.secondary.tracked_conns.add(conn)
+
+    trigger_drain(
+        group,
+        which_cluster="primary",
+        new_status=HealthResult.HEALTHY,
+        drain_timeout_s=1,
+    )
+
+    # Status flipped back — failback ran.
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_auto_failback_false_suppresses_failback(fake_state, caplog):
+    """autoFailbackEnabled=false — primary CB reports HEALTHY but the
+    driver leaves primary_status UNHEALTHY and dispatch stays on
+    secondary. Logs a WARNING so the operator sees it."""
+    import logging
+    group = _make_group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY   # failover already done
+    group.auto_failback_enabled = False
+
+    # Watch pause_dispatch to prove the drain never fired.
+    pause_observations: list[bool] = []
+    orig_pause = group.pause_dispatch
+
+    def watched_pause():
+        pause_observations.append(True)
+        orig_pause()
+    group.pause_dispatch = watched_pause  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING, logger="psycopg.yb.drain"):
+        trigger_drain(
+            group,
+            which_cluster="primary",
+            new_status=HealthResult.HEALTHY,
+            drain_timeout_s=1,
+        )
+
+    # Status NOT flipped — dispatch stays on secondary.
+    assert group.primary_status == HealthResult.UNHEALTHY
+    # Drain never ran.
+    assert pause_observations == []
+    # Operator got a heads-up in the log.
+    assert any(
+        "failback suppressed" in rec.message
+        for rec in caplog.records
+    ), f"expected suppression WARNING, got: {[r.message for r in caplog.records]}"
+
+
+def test_auto_failback_false_still_allows_failover(fake_state):
+    """autoFailbackEnabled=false only blocks failback (HEALTHY → serving
+    primary). Failover (primary UNHEALTHY, moving to secondary) still
+    runs unconditionally — the toggle is asymmetric."""
+    group = _make_group(fake_state)
+    # Start healthy on primary.
+    group.auto_failback_enabled = False
+
+    trigger_drain(
+        group,
+        which_cluster="primary",
+        new_status=HealthResult.UNHEALTHY,
+        drain_timeout_s=1,
+    )
+    assert group.primary_status == HealthResult.UNHEALTHY   # failover ran
+
+
+
+# ============================================================
+# Per-stage timestamps on FailoverGroup (P1.5)
+# ============================================================
+
+def test_per_stage_timestamps_populated_on_failover(fake_state):
+    """Full failover cycle: all four stage timestamps get populated,
+    in strictly increasing monotonic order."""
+    import time as _time
+    group = _make_group(fake_state)
+    # No conns to drain — fast.
+    t_before = _time.monotonic()
+    trigger_drain(
+        group,
+        which_cluster="primary",
+        new_status=HealthResult.UNHEALTHY,
+        drain_timeout_s=0,
+    )
+    t_after = _time.monotonic()
+
+    assert t_before <= group.last_cb_trip_ts <= t_after
+    assert t_before <= group.last_failover_start_ts <= t_after
+    assert t_before <= group.last_phase1_complete_ts <= t_after
+    assert t_before <= group.last_phase2_complete_ts <= t_after
+    assert t_before <= group.last_failover_complete_ts <= t_after
+    # Monotonic order along the pipeline.
+    assert group.last_cb_trip_ts <= group.last_failover_start_ts
+    assert group.last_failover_start_ts <= group.last_phase1_complete_ts
+    assert group.last_phase1_complete_ts <= group.last_phase2_complete_ts
+    assert group.last_phase2_complete_ts <= group.last_failover_complete_ts
+    # Failback did NOT fire on a failover.
+    assert group.last_failback_complete_ts == 0.0
+
+
+def test_per_stage_timestamps_populated_on_failback(fake_state):
+    """Failback path stamps last_failback_complete_ts (not
+    last_failover_complete_ts)."""
+    import time as _time
+    group = _make_group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY   # already failed over
+    # Simulate a completed prior failover stamp so we can verify the
+    # failback timestamp is set fresh.
+    group.last_failover_complete_ts = 1.0
+    prior_failover_ts = group.last_failover_complete_ts
+
+    t_before = _time.monotonic()
+    trigger_drain(
+        group,
+        which_cluster="primary",
+        new_status=HealthResult.HEALTHY,
+        drain_timeout_s=0,
+    )
+    t_after = _time.monotonic()
+
+    # Failback ran → last_failback_complete_ts stamped.
+    assert t_before <= group.last_failback_complete_ts <= t_after
+    # Failover completion was NOT re-stamped on a failback.
+    assert group.last_failover_complete_ts == prior_failover_ts
+    # cb_trip_ts should NOT fire on a HEALTHY transition (no cluster
+    # went from healthy → unhealthy this round).
+    assert group.last_cb_trip_ts == 0.0
+
+
+def test_last_cb_trip_ts_only_fires_on_unhealthy_primary(fake_state):
+    """cb_trip fires on primary → UNHEALTHY; secondary flipping should
+    not set it (design doc §3.8 — its motivating case is the primary
+    going bad)."""
+    group = _make_group(fake_state)
+    # Flip secondary UNHEALTHY — no routing change, no timestamps.
+    trigger_drain(
+        group,
+        which_cluster="secondary",
+        new_status=HealthResult.UNHEALTHY,
+        drain_timeout_s=0,
+    )
+    assert group.last_cb_trip_ts == 0.0
+
+
+def test_timestamps_not_touched_when_no_routing_change(fake_state):
+    """A CB flip that does not change the routing target should NOT
+    stamp the drain-cycle timestamps (there is no drain cycle)."""
+    group = _make_group(fake_state)
+    trigger_drain(
+        group,
+        which_cluster="secondary",
+        new_status=HealthResult.UNHEALTHY,
+        drain_timeout_s=0,
+    )
+    assert group.last_failover_start_ts == 0.0
+    assert group.last_phase1_complete_ts == 0.0
+    assert group.last_phase2_complete_ts == 0.0
+    assert group.last_failover_complete_ts == 0.0
+    assert group.last_failback_complete_ts == 0.0
+

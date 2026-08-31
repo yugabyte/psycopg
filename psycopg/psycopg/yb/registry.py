@@ -184,6 +184,58 @@ class FailoverGroup:
         default=None, repr=False,
     )
 
+    # YBA lag-wait phase (Amogh's flow, 2026-08-11). ``yba_client`` is set
+    # by bootstrap when ``yba_endpoint`` + ``yba_api_token`` +
+    # ``replication_name`` are configured in the DSN; ``None`` means the
+    # lag-wait phase is disabled and the drain flip proceeds immediately
+    # after the txn drain.
+    #
+    # ``yba_customer_uuid`` and ``xcluster_config_uuid`` are figured out
+    # once at bootstrap by the driver — the user does NOT supply them —
+    # and are read on every Phase-2 poll. All fields stay stable for the
+    # group's lifetime; no ``lock`` required for reads.
+    #
+    # Empirically (2026-08-20 against portal.dev): YBA's /metrics only
+    # needs xClusterConfigUuid to identify the lag stream. We do NOT
+    # cache nodePrefix — it's redundant and its per-side lookup was the
+    # main reason we needed the YBA-side universe UUID at bootstrap
+    # (which doesn't necessarily match yb_servers().universe_uuid).
+    yba_client: "object | None" = None
+    yba_customer_uuid: str = ""
+    xcluster_config_uuid: str = ""
+    threshold_replication_lag_ms: int = 0
+    lag_wait_timeout_s: int = 30
+
+    # Failback-direction (B→A) Phase 2 config (design doc §3.5.1).
+    # Populated at bootstrap only when the operator set
+    # ``yb.failback.replicationName`` — resolved to a distinct xCluster
+    # config UUID via the same /universes walk used for the A→B side.
+    # An empty ``failback_xcluster_config_uuid`` means "Phase 2 skipped
+    # on failback" (fail-open) — same behaviour as YBA being unreachable.
+    failback_xcluster_config_uuid: str = ""
+    failback_threshold_replication_lag_ms: int = 0
+    failback_lag_wait_timeout_s: int = 30
+
+    # Auto-failback toggle (see design doc §3.5.1 / §7.3). When False,
+    # the driver stays on secondary even after the primary CB reports
+    # HEALTHY. Failback requires operator action (e.g. writing UNHEALTHY
+    # then HEALTHY to an ExternalSignalCircuitBreaker's signal table
+    # from the operator's side). Default True preserves v1 behaviour.
+    auto_failback_enabled: bool = True
+
+    # Per-stage timestamps (design doc §3.8). All ``time.monotonic()``
+    # floats. Zero means "never fired". Written under ``self.lock`` at
+    # the stage boundary; safe to read without the lock (float writes
+    # are atomic on CPython). Custom CBs (e.g. a debounced secondary CB
+    # that reads ``last_failover_complete_ts`` before returning HEALTHY
+    # to avoid an immediate failback) rely on these.
+    last_cb_trip_ts: float = 0.0
+    last_failover_start_ts: float = 0.0
+    last_phase1_complete_ts: float = 0.0
+    last_phase2_complete_ts: float = 0.0
+    last_failover_complete_ts: float = 0.0
+    last_failback_complete_ts: float = 0.0
+
     def __post_init__(self) -> None:
         # Bind the condition to `lock` — so wait/notify releases and re-
         # acquires the same lock the rest of the group's state changes
@@ -207,6 +259,44 @@ class FailoverGroup:
             self.dispatch_paused = False
             assert self.dispatch_paused_condition is not None
             self.dispatch_paused_condition.notify_all()
+
+    def wait_for_first_check(self, timeout_s: "float | None" = None) -> bool:
+        """Block until each attached CB has completed its first
+        ``check()`` — either as a natural probe tick or via an explicit
+        synchronous call here.
+
+        Design doc §4.6: prevents the race where an app opens
+        connections after ``bootstrap_failover_group()`` returns but
+        before the probe has had any actual data about the clusters.
+        Call this AFTER attaching CBs and BEFORE opening application
+        connections.
+
+        Bounded by ``check_timeout_s`` per CB (already enforced inside
+        each probe's ``_tick_check``). If ``timeout_s`` is provided,
+        this call gives up after that many seconds and returns ``False``
+        (individual probes may still complete afterwards). Returns
+        ``True`` when both first checks have fired.
+
+        Idempotent — calling twice with both first-checks already
+        complete returns immediately."""
+        probes = [
+            p for p in (self.primary_probe, self.secondary_probe)
+            if p is not None
+        ]
+        if not probes:
+            return True   # no probes wired yet — nothing to wait on
+        # Force a synchronous first tick on each probe that hasn't
+        # ticked yet. Probes with an already-complete first tick skip
+        # this internally (idempotent).
+        import time as _time
+        deadline = None if timeout_s is None else _time.monotonic() + timeout_s
+        for p in probes:
+            # `run_first_check_synchronously` returns after the tick
+            # completes OR the probe's own check_timeout_s cap fires.
+            p.run_first_check_synchronously()
+            if deadline is not None and _time.monotonic() >= deadline:
+                return all(p.first_check_complete for p in probes)
+        return True
 
     def force_primary_status(self, status: "HealthResult") -> None:
         """TEST HOOK. Manually set ``primary_status``.
@@ -467,6 +557,119 @@ class ClusterRegistry:
         sec_kwargs["host"] = ",".join(secondary_hosts)
         return sec_kwargs
 
+    def _wire_yba_lag_phase(self, group: "FailoverGroup", yb_params) -> None:
+        """Bootstrap-time YBA client setup. Called once per FailoverGroup
+        after construction, before probes start.
+
+        Steps (per Amogh's 2026-08-11 spec, revised 2026-08-20):
+          1. Instantiate ``YBAClient`` with the DSN's endpoint + token.
+          2. Fetch ``customerUUID`` via ``/session_info`` → cache on group.
+          3. Resolve ``replicationName`` → ``xClusterConfigUUID`` by
+             walking every universe's ``sourceXClusterConfigs`` → cache
+             on group.
+
+        Only two YBA identifiers ever leave the bootstrap: customerUUID
+        and xClusterConfigUUID. YBA's /metrics endpoint doesn't need a
+        node_prefix when the config UUID is set, so we skip the two
+        /universes/{uuid} calls that were previously needed. This also
+        means we don't need the YBA-side universeUUID at all — which
+        avoided a real portability problem (YBA's universeUUID doesn't
+        necessarily match yb_servers().universe_uuid).
+
+        Best-effort: any failure (YBA unreachable, bad token, unknown
+        replication name) is logged at WARNING and leaves
+        ``group.yba_client`` as ``None``. The lag-wait phase in
+        ``drain.py`` treats a ``None`` client as "feature disabled" and
+        proceeds with the immediate flip after the txn drain. This
+        means a broken YBA never blocks failover.
+        """
+        if not yb_params.lag_wait_enabled:
+            return
+
+        from .yba_client import YBAClient, YBAClientError
+
+        # Stash the immutable knobs first — even if the initial YBA
+        # probe fails, they're preserved so the drain code can log
+        # them consistently.
+        group.threshold_replication_lag_ms = yb_params.threshold_replication_lag_ms
+        group.lag_wait_timeout_s = yb_params.lag_wait_timeout_s
+        # Failback-direction knobs. `failback_xcluster_config_uuid` is
+        # populated below only if the operator set
+        # yb.failback.replicationName.
+        group.failback_threshold_replication_lag_ms = (
+            yb_params.failback_threshold_replication_lag_ms
+        )
+        group.failback_lag_wait_timeout_s = yb_params.failback_lag_wait_timeout_s
+
+        try:
+            client = YBAClient(
+                endpoint=yb_params.yba_endpoint,
+                api_token=yb_params.yba_api_token,
+                connect_timeout_s=yb_params.yba_connect_timeout_s,
+                read_timeout_s=yb_params.yba_read_timeout_s,
+            )
+            # 1. Customer UUID. Cached inside the client too, but we
+            #    surface it on the group so operators can see it in
+            #    diagnostics without poking at the client.
+            group.yba_customer_uuid = client.get_session_info()
+
+            # 2. Resolve replication_name → xClusterConfigUUID by
+            #    walking all universes' sourceXClusterConfigs. One
+            #    /universes call + one /xcluster_configs/{uuid} per
+            #    candidate.
+            group.xcluster_config_uuid = client.resolve_xcluster_config_uuid(
+                yb_params.replication_name,
+            )
+
+            # 3. If the operator configured a failback (B→A) replication
+            #    name, resolve it to a second xCluster config UUID.
+            #    Best-effort: a failure here leaves failback_xcluster_config_uuid
+            #    empty, which the drain treats as "no Phase 2 on failback"
+            #    (fail-open) but still allows the A→B Phase 2 to work.
+            if yb_params.failback_replication_name:
+                try:
+                    group.failback_xcluster_config_uuid = (
+                        client.resolve_xcluster_config_uuid(
+                            yb_params.failback_replication_name,
+                        )
+                    )
+                except YBAClientError as exc:
+                    logger.warning(
+                        "YBA failback Phase 2 disabled — could not resolve "
+                        "yb.failback.replicationName=%r: %s. Failover (A→B) "
+                        "Phase 2 still active; failback (B→A) will skip "
+                        "Phase 2 (fail-open).",
+                        yb_params.failback_replication_name, exc,
+                    )
+        except YBAClientError as exc:
+            logger.warning(
+                "YBA lag phase disabled — bootstrap probe failed: %s. "
+                "Failover drain will flip routing immediately after the "
+                "txn drain; no replication-lag wait.",
+                exc,
+            )
+            return
+        except Exception:
+            logger.warning(
+                "YBA lag phase disabled — unexpected error during bootstrap probe. "
+                "Failover drain will flip routing immediately after the txn drain.",
+                exc_info=True,
+            )
+            return
+
+        group.yba_client = client
+        logger.info(
+            "YBA lag phase enabled: endpoint=%s, replication_name=%s, "
+            "customer_uuid=%s, xcluster_config_uuid=%s, "
+            "threshold=%dms, wait_timeout=%ds",
+            yb_params.yba_endpoint,
+            yb_params.replication_name,
+            group.yba_customer_uuid,
+            group.xcluster_config_uuid,
+            yb_params.threshold_replication_lag_ms,
+            yb_params.lag_wait_timeout_s,
+        )
+
     def get_or_bootstrap_failover_group(
         self,
         yb_params,                                  # YBParams; lazy-typed to dodge cycle
@@ -524,6 +727,7 @@ class ClusterRegistry:
                 cooldown_s=yb_params.cooldown_s,
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
+                auto_failback_enabled=yb_params.auto_failback_enabled,
             )
             self._failover_groups[primary.uuid] = group
 
@@ -535,7 +739,10 @@ class ClusterRegistry:
             yb_params.cooldown_s,
         )
 
-        # 5. Start the probe thread (Phase 4 wiring).
+        # 5. YBA lag phase — best-effort. Silently disables if unreachable.
+        self._wire_yba_lag_phase(group, yb_params)
+
+        # 6. Start the probe thread (Phase 4 wiring).
         self._start_probe(group, yb_params.refresh_interval_s, yb_params.check_timeout_s, yb_params.drain_timeout_s)
         return group
 
@@ -595,6 +802,7 @@ class ClusterRegistry:
                 cooldown_s=yb_params.cooldown_s,
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
+                auto_failback_enabled=yb_params.auto_failback_enabled,
             )
             self._failover_groups[primary.uuid] = group
 
@@ -606,6 +814,7 @@ class ClusterRegistry:
             yb_params.cooldown_s,
         )
 
+        self._wire_yba_lag_phase(group, yb_params)
         self._start_probe(group, yb_params.refresh_interval_s, yb_params.check_timeout_s, yb_params.drain_timeout_s)
         return group
 

@@ -12,9 +12,9 @@ How this CB works (the tracker-table strategy):
      (via ``SPLIT AT VALUES``). N is a constructor arg (default 9).
   2. Insert one row per tablet (row id chosen to land in that tablet's
      range; ``ON CONFLICT DO NOTHING`` makes it idempotent across apps).
-  3. On each tick, run ``UPDATE yb_cluster_health_tracker SET
-     last_updated = NOW()`` — touches all rows, which YB routes across
-     every tablet leader. Any unreachable leader fails the UPDATE.
+  3. On each tick, run ``SELECT COUNT(*) FROM yb_cluster_health_tracker``
+     — the aggregate forces YB to visit every tablet leader. Any
+     unreachable leader fails the read.
   4. Count consecutive failures. After ``max_update_failures_allowed + 1``
      consecutive failures, return UNHEALTHY.
   5. Reset the failure counter after the same number of consecutive
@@ -68,7 +68,16 @@ logger = logging.getLogger(__name__)
 # Single coordinator UPDATE touches every row → routed to every tablet leader.
 # If any leader is unreachable, the statement fails. That's exactly the
 # signal we want.
-_UPDATE_SQL = "UPDATE yb_cluster_health_tracker SET last_updated = NOW()"
+# Bootstrap: single INSERT ... ON CONFLICT DO NOTHING seeds one row per
+# tablet so every tablet has at least one row. Steady state health check:
+# COUNT(*) forces YB to visit every tablet leader — if any leader is
+# unreachable, the aggregate fails. A read is enough; we don't need to
+# write on every tick (the bootstrap INSERT already exercised the write
+# path once). This drops steady-state write pressure on the tracker table
+# to zero.
+_HEALTH_CHECK_SQL = (
+    "SELECT COUNT(*) FROM yb_cluster_health_tracker"
+)
 
 # Bound the per-statement wait on the CB's control connection.
 #
@@ -242,9 +251,14 @@ class TrackerTableCircuitBreaker:
             if not self._table_setup_done:
                 self._setup_table(conn)
             with conn.cursor() as cur:
-                cur.execute(_UPDATE_SQL)
-                if cur.rowcount == 0:
-                    # Table exists but seed INSERT never ran — re-seed.
+                cur.execute(_HEALTH_CHECK_SQL)
+                row = cur.fetchone()
+                # COUNT(*) always returns exactly one row; the count
+                # itself is zero iff bootstrap's INSERT never ran. In
+                # that case, re-seed so the next tick has something to
+                # count (belt-and-braces — bootstrap should have done
+                # this at first tick already).
+                if row is not None and row[0] == 0:
                     logger.debug(
                         "tracker table has no rows; re-seeding "
                         "(%s_uuid=%s)", self.which_cluster, state.uuid,
@@ -311,13 +325,13 @@ class TrackerTableCircuitBreaker:
             # Auth / TLS / permissions / db-doesn't-exist — config error,
             # not cluster failure. Log loud, don't count.
             logger.warning(
-                "tracker-table UPDATE failed due to misconfiguration "
+                "tracker-table health check failed due to misconfiguration "
                 "(%s_uuid=%s); not counting toward failure threshold: %s",
                 self.which_cluster, cluster_uuid, exc,
             )
             return self._last_reported
 
-        return self._record_failure(f"UPDATE failed: {exc}")
+        return self._record_failure(f"health check failed: {exc}")
 
     def _record_success(self) -> HealthResult:
         self._consecutive_failures = 0
@@ -333,7 +347,7 @@ class TrackerTableCircuitBreaker:
                 return self._last_reported
             self.last_recovery_time = time.monotonic()
             logger.warning(
-                "🟢 %s UPDATE succeeded — CB recovering to HEALTHY",
+                "🟢 %s health check succeeded — CB recovering to HEALTHY",
                 self.which_cluster,
             )
         self._last_reported = HealthResult.HEALTHY
@@ -352,7 +366,7 @@ class TrackerTableCircuitBreaker:
         if self._last_reported == HealthResult.HEALTHY:
             self.last_trip_time = time.monotonic()
             logger.warning(
-                "🔴 %s UPDATE failed — CB tripping to UNHEALTHY",
+                "🔴 %s health check failed — CB tripping to UNHEALTHY",
                 self.which_cluster,
             )
         self._last_reported = HealthResult.UNHEALTHY

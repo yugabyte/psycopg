@@ -51,6 +51,42 @@ DEFAULT_CHECK_TIMEOUT_SEC = 1
 #    N > 0 → wait up to N seconds, then force-close survivors.
 DEFAULT_DRAIN_TIMEOUT_SEC = 10
 
+# YBA lag-wait phase (Amogh's flow, 2026-08-11). All zero-value / unset by
+# default; the phase is opt-in via ``yb.failover.ybaEndpoint``. When
+# unset the drain flip is immediate after the txn drain — same as
+# pre-lag-phase behaviour.
+DEFAULT_THRESHOLD_REPLICATION_LAG_MS = 0
+DEFAULT_LAG_WAIT_TIMEOUT_SEC = 30
+
+# Auto-failback toggle. When True (the default), the driver automatically
+# returns traffic to the primary once the primary CB flips back to
+# HEALTHY. When False, the driver stays on secondary even after primary
+# recovers — an operator has to trigger failback via
+# ExternalSignalCircuitBreaker (or a future force_recheck API).
+DEFAULT_AUTO_FAILBACK_ENABLED = True
+
+# Global failover time budget (Amex ask, Aug 2026). When set, derives
+# drainTimeoutSecs and lagWaitTimeoutSecs so the total post-detection
+# failover wall-clock ≤ budget. See design doc §3.7 for the semantics
+# and the 40/60 split rationale.
+#
+# The clock starts at CB detection (after ``check()`` returns UNHEALTHY)
+# and ends at the routing flip; it does NOT include
+# ``yb_servers_refresh_interval`` (detection latency), ``checkTimeoutSecs``
+# (CB check cap), or ``cooldownSecs`` (rate limit).
+_BUDGET_DRAIN_RATIO = 0.40
+_BUDGET_LAG_WAIT_RATIO = 0.60
+
+# YBAClient inner-timeout defaults. When ``globalTimeBudgetSecs`` is set,
+# these get lowered so a single blocked YBA call cannot eat the whole
+# Phase 2 window:
+#     connect_timeout_s = min(2.0, lag_wait_timeout_s * 0.25)
+#     read_timeout_s    = min(3.0, lag_wait_timeout_s * 0.35)
+DEFAULT_YBA_CONNECT_TIMEOUT_S = 2.0
+DEFAULT_YBA_READ_TIMEOUT_S = 3.0
+_BUDGET_YBA_CONNECT_RATIO = 0.25
+_BUDGET_YBA_READ_RATIO = 0.35
+
 # Conninfo keys that always come out of the string before libpq parses it.
 # `load_balance_hosts` is special-cased: libpq-recognised values stay; our
 # extension values (true/false) come out.
@@ -65,6 +101,26 @@ _PURE_YB_KEYS = frozenset({
     "yb_failover_cooldown_secs",
     "yb_failover_check_timeout_secs",
     "yb_failover_drain_timeout_secs",
+    # YBA lag-wait phase.
+    "yb_failover_yba_endpoint",
+    "yb_failover_yba_api_token",
+    "yb_failover_replication_name",
+    "yb_failover_threshold_replication_lag_ms",
+    "yb_failover_lag_wait_timeout_secs",
+    # Global failover time budget — derives drain + lag-wait when set.
+    "yb_failover_global_time_budget_secs",
+    # Auto-failback toggle (bool; default true).
+    "yb_failover_auto_failback_enabled",
+    # Failback namespace — optional overrides for the reverse (B→A)
+    # direction. See design doc §3.5.1. Fallback rules:
+    #   * replicationName: NO fallback (points to a different xCluster
+    #     config on YBA). Empty means "Phase 2 skipped on failback".
+    #   * Numeric knobs: fall back to the failover value.
+    "yb_failback_replication_name",
+    "yb_failback_drain_timeout_secs",
+    "yb_failback_lag_wait_timeout_secs",
+    "yb_failback_threshold_replication_lag_ms",
+    "yb_failback_global_time_budget_secs",
 })
 _LOAD_BALANCE_KEY = "load_balance_hosts"
 _OUR_LB_VALUES = frozenset({"true", "false"})
@@ -87,6 +143,20 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failover[._-](?:cooldownSecs|cooldown[._-]secs)"
     r"|yb[._-]failover[._-](?:checkTimeoutSecs|check[._-]timeout[._-]secs)"
     r"|yb[._-]failover[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
+    r"|yb[._-]failover[._-](?:ybaEndpoint|yba[._-]endpoint)"
+    r"|yb[._-]failover[._-](?:ybaApiToken|yba[._-]api[._-]token)"
+    r"|yb[._-]failover[._-](?:replicationName|replication[._-]name)"
+    r"|yb[._-]failover[._-](?:thresholdReplicationLagMs|threshold[._-]replication[._-]lag[._-]ms)"
+    r"|yb[._-]failover[._-](?:lagWaitTimeoutSecs|lag[._-]wait[._-]timeout[._-]secs)"
+    r"|yb[._-]failover[._-](?:globalTimeBudgetSecs|global[._-]time[._-]budget[._-]secs)"
+    r"|yb[._-]failover[._-](?:autoFailbackEnabled|auto[._-]failback[._-]enabled)"
+    # Failback namespace — same knob names as yb.failover.* but under
+    # the yb.failback.* prefix; each is an optional per-direction override.
+    r"|yb[._-]failback[._-](?:replicationName|replication[._-]name)"
+    r"|yb[._-]failback[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
+    r"|yb[._-]failback[._-](?:lagWaitTimeoutSecs|lag[._-]wait[._-]timeout[._-]secs)"
+    r"|yb[._-]failback[._-](?:thresholdReplicationLagMs|threshold[._-]replication[._-]lag[._-]ms)"
+    r"|yb[._-]failback[._-](?:globalTimeBudgetSecs|global[._-]time[._-]budget[._-]secs)"
     r"))\s*=\s*"
     # Value: bare token (no whitespace), or single-quoted, or double-quoted.
     # libpq's wire format technically supports backslash escapes inside quotes;
@@ -108,10 +178,23 @@ _CAMEL_BOUNDARY_RE = re.compile(r"([a-z])([A-Z])")
 # the kwarg as ``**{"yb_failover_secondaryclusterhosts": ...}``. This table
 # folds those single-token forms back to the canonical snake_case name.
 _FAILOVER_KEY_ALIASES: dict[str, str] = {
-    "yb_failover_secondaryclusterhosts":     "yb_failover_secondary_cluster_hosts",
-    "yb_failover_cooldownsecs":              "yb_failover_cooldown_secs",
-    "yb_failover_checktimeoutsecs":          "yb_failover_check_timeout_secs",
-    "yb_failover_draintimeoutsecs":          "yb_failover_drain_timeout_secs",
+    "yb_failover_secondaryclusterhosts":         "yb_failover_secondary_cluster_hosts",
+    "yb_failover_cooldownsecs":                  "yb_failover_cooldown_secs",
+    "yb_failover_checktimeoutsecs":              "yb_failover_check_timeout_secs",
+    "yb_failover_draintimeoutsecs":              "yb_failover_drain_timeout_secs",
+    "yb_failover_ybaendpoint":                   "yb_failover_yba_endpoint",
+    "yb_failover_ybaapitoken":                   "yb_failover_yba_api_token",
+    "yb_failover_replicationname":               "yb_failover_replication_name",
+    "yb_failover_thresholdreplicationlagms":     "yb_failover_threshold_replication_lag_ms",
+    "yb_failover_lagwaittimeoutsecs":            "yb_failover_lag_wait_timeout_secs",
+    "yb_failover_globaltimebudgetsecs":          "yb_failover_global_time_budget_secs",
+    "yb_failover_autofailbackenabled":           "yb_failover_auto_failback_enabled",
+    # Failback namespace.
+    "yb_failback_replicationname":               "yb_failback_replication_name",
+    "yb_failback_draintimeoutsecs":              "yb_failback_drain_timeout_secs",
+    "yb_failback_lagwaittimeoutsecs":            "yb_failback_lag_wait_timeout_secs",
+    "yb_failback_thresholdreplicationlagms":     "yb_failback_threshold_replication_lag_ms",
+    "yb_failback_globaltimebudgetsecs":          "yb_failback_global_time_budget_secs",
 }
 
 
@@ -164,6 +247,71 @@ class YBParams:
     #    0 → force-close immediately; no drain window.
     #    N > 0 → wait up to N seconds, then force-close survivors.
     drain_timeout_s: int = DEFAULT_DRAIN_TIMEOUT_SEC
+
+    # YBA lag-wait phase parameters (Amogh's flow, 2026-08-11).
+    # ``yba_endpoint`` alone opts in: when set, the driver polls YBA every
+    # 1s after the txn drain and waits for replication lag to converge to
+    # ``threshold_replication_lag_ms`` before flipping routing. The phase
+    # exits early on wait-timeout or 3 consecutive YBA-unreachable polls.
+    #
+    # The user provides the human-readable ``replication_name`` (as shown
+    # in YBA's DR page); the driver resolves it to ``customerUUID`` and
+    # ``xClusterConfigUUID`` at bootstrap and caches them on the group.
+    yba_endpoint: str = ""
+    yba_api_token: str = ""
+    replication_name: str = ""
+    threshold_replication_lag_ms: int = DEFAULT_THRESHOLD_REPLICATION_LAG_MS
+    lag_wait_timeout_s: int = DEFAULT_LAG_WAIT_TIMEOUT_SEC
+
+    # Global failover time budget (Amex ask, design doc §3.7). When set,
+    # ``drain_timeout_s`` and ``lag_wait_timeout_s`` are derived from it
+    # (40/60 split) unless the user set them explicitly. If both budget
+    # and phase knobs are user-set, the parser validates that the sum
+    # ≤ budget and raises ``ValueError`` otherwise.
+    # ``None`` means "no budget — use existing behaviour, fully back-compat".
+    global_time_budget_secs: int | None = None
+
+    # YBAClient inner-request timeouts. Not user-facing DSN params;
+    # written by the parser either to the ``DEFAULT_YBA_*`` constants
+    # (no budget) or to smaller values derived from
+    # ``lag_wait_timeout_s`` (budget set). Passed by the registry to
+    # ``YBAClient(...)`` at wire time so a single blocked YBA call
+    # cannot eat the whole Phase 2 window at small budgets.
+    yba_connect_timeout_s: float = DEFAULT_YBA_CONNECT_TIMEOUT_S
+    yba_read_timeout_s: float = DEFAULT_YBA_READ_TIMEOUT_S
+
+    # Auto-failback toggle. When True (default), the driver returns
+    # traffic to the primary automatically once the primary CB flips
+    # back to HEALTHY. When False, the driver stays on secondary even
+    # after primary recovers — operator must trigger failback manually
+    # (write to the ExternalSignalCircuitBreaker's signal table).
+    auto_failback_enabled: bool = DEFAULT_AUTO_FAILBACK_ENABLED
+
+    # Failback overrides (design doc §3.5.1). Each is populated at
+    # parse time with either the operator's ``yb.failback.<knob>`` value
+    # (when set) or the corresponding ``yb.failover.<knob>`` fallback
+    # (when the failback variant is unset). The one exception is
+    # ``failback_replication_name``: it has NO fallback since failover
+    # (A→B) and failback (B→A) use DIFFERENT xCluster configs on YBA.
+    # An empty string means "no Phase 2 on failback" (fail-open).
+    failback_replication_name: str = ""
+    failback_drain_timeout_s: int = DEFAULT_DRAIN_TIMEOUT_SEC
+    failback_lag_wait_timeout_s: int = DEFAULT_LAG_WAIT_TIMEOUT_SEC
+    failback_threshold_replication_lag_ms: int = DEFAULT_THRESHOLD_REPLICATION_LAG_MS
+    failback_global_time_budget_secs: int | None = None
+
+    @property
+    def lag_wait_enabled(self) -> bool:
+        """Lag-wait phase is opt-in: requires xCluster enabled AND all
+        three credentials/identifiers present in the DSN. The customer
+        UUID and xCluster config UUID are NOT in this check — they're
+        resolved at bootstrap from ``replication_name``."""
+        return (
+            self.xcluster_enabled
+            and bool(self.yba_endpoint)
+            and bool(self.yba_api_token)
+            and bool(self.replication_name)
+        )
 
     @property
     def xcluster_enabled(self) -> bool:
@@ -292,13 +440,207 @@ def extract_yb_params(
         )),
         1,
     )
+    # Global failover time budget (§3.7). Parsed first because drain and
+    # lag-wait derivation depend on it. ``None`` = unset = existing behaviour.
+    global_time_budget_secs: int | None = None
+    if (budget_raw := raw.get("yb_failover_global_time_budget_secs")) is not None:
+        global_time_budget_secs = int(budget_raw)
+        if global_time_budget_secs <= 0:
+            raise ValueError(
+                "yb.failover.globalTimeBudgetSecs must be a positive integer, "
+                f"got {global_time_budget_secs}"
+            )
+
+    # Track whether the user explicitly set the phase knobs. Distinguishes
+    # "user set 10 which happens to be the default" from "user didn't set;
+    # use default". Only relevant when a budget is present.
+    drain_user_set = "yb_failover_drain_timeout_secs" in raw
+    lag_wait_user_set = "yb_failover_lag_wait_timeout_secs" in raw
+
     # Drain timeout. Sentinels (-1, 0) are meaningful — do NOT clamp them
     # to a positive floor. Anything < -1 collapses to -1 (wait forever).
-    drain_timeout_raw = int(raw.get(
-        "yb_failover_drain_timeout_secs", DEFAULT_DRAIN_TIMEOUT_SEC,
-    ))
-    if drain_timeout_raw < -1:
-        drain_timeout_raw = -1
+    if global_time_budget_secs is not None and not drain_user_set:
+        # Derive from budget (40% of total).
+        drain_timeout_raw = round(global_time_budget_secs * _BUDGET_DRAIN_RATIO)
+    else:
+        drain_timeout_raw = int(raw.get(
+            "yb_failover_drain_timeout_secs", DEFAULT_DRAIN_TIMEOUT_SEC,
+        ))
+        if drain_timeout_raw < -1:
+            drain_timeout_raw = -1
+
+    # YBA lag-wait phase. Strings pass through untouched; numeric knobs
+    # get one-sided lo-clamps to keep pathological values benign.
+    yba_endpoint = raw.get("yb_failover_yba_endpoint", "").strip()
+    yba_api_token = raw.get("yb_failover_yba_api_token", "").strip()
+    replication_name = raw.get("yb_failover_replication_name", "").strip()
+    threshold_replication_lag_ms = _clamp_lo(
+        int(raw.get(
+            "yb_failover_threshold_replication_lag_ms",
+            DEFAULT_THRESHOLD_REPLICATION_LAG_MS,
+        )),
+        0,
+    )
+    if global_time_budget_secs is not None and not lag_wait_user_set:
+        # Derive from budget (60% of total).
+        lag_wait_timeout = _clamp_lo(
+            round(global_time_budget_secs * _BUDGET_LAG_WAIT_RATIO), 0,
+        )
+    else:
+        lag_wait_timeout = _clamp_lo(
+            int(raw.get(
+                "yb_failover_lag_wait_timeout_secs",
+                DEFAULT_LAG_WAIT_TIMEOUT_SEC,
+            )),
+            0,
+        )
+
+    # When a budget is set, each phase knob has an implicit share of the
+    # budget (drain: 40%, lag_wait: 60%). If the user explicitly sets a
+    # knob above its share, the ratio-derivation of the other knob will
+    # push the sum over the budget — reject at bootstrap. Sentinels
+    # (-1, 0) on drain are "wait forever" / "kill immediately", not
+    # wall-clock time, so they don't count against the budget.
+    if global_time_budget_secs is not None:
+        drain_for_budget = max(0, drain_timeout_raw)
+        effective_sum = drain_for_budget + lag_wait_timeout
+        if effective_sum > global_time_budget_secs:
+            drain_share = round(global_time_budget_secs * _BUDGET_DRAIN_RATIO)
+            lag_wait_share = round(global_time_budget_secs * _BUDGET_LAG_WAIT_RATIO)
+            raise ValueError(
+                f"yb.failover.globalTimeBudgetSecs={global_time_budget_secs}s "
+                f"exceeded — effective phase timeouts sum to {effective_sum}s "
+                f"(drain={drain_timeout_raw}s, lag_wait={lag_wait_timeout}s). "
+                f"Under this budget the ratio-derived shares are "
+                f"drain={drain_share}s (40%) and lag_wait={lag_wait_share}s "
+                "(60%); a phase knob above its share leaves no room for the "
+                "other. Reduce a phase timeout or raise globalTimeBudgetSecs."
+            )
+
+    # Auto-failback toggle. Default true (backward-compatible). Accepts
+    # any of the standard bool forms; anything else raises ValueError.
+    auto_failback_raw = raw.get("yb_failover_auto_failback_enabled")
+    if auto_failback_raw is None:
+        auto_failback_enabled = DEFAULT_AUTO_FAILBACK_ENABLED
+    else:
+        low = auto_failback_raw.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            auto_failback_enabled = True
+        elif low in ("false", "0", "no", "off"):
+            auto_failback_enabled = False
+        else:
+            raise ValueError(
+                "yb.failover.autoFailbackEnabled must be a boolean "
+                f"(true/false), got {auto_failback_raw!r}"
+            )
+
+    # ==================== Failback (reverse-direction overrides) =====
+    # All of these are optional overrides. When absent, the failback
+    # side of the drain reuses the failover value — except
+    # ``failback_replication_name``, which has no fallback (points to
+    # a different xCluster config on YBA).
+    failback_replication_name = raw.get(
+        "yb_failback_replication_name", ""
+    ).strip()
+    failback_budget_raw = raw.get("yb_failback_global_time_budget_secs")
+    failback_global_time_budget_secs: int | None
+    if failback_budget_raw is not None:
+        failback_global_time_budget_secs = int(failback_budget_raw)
+        if failback_global_time_budget_secs <= 0:
+            raise ValueError(
+                "yb.failback.globalTimeBudgetSecs must be positive, "
+                f"got {failback_global_time_budget_secs}"
+            )
+    else:
+        # Fall back to the failover budget (may itself be None).
+        failback_global_time_budget_secs = global_time_budget_secs
+
+    failback_drain_user_set = "yb_failback_drain_timeout_secs" in raw
+    failback_lag_wait_user_set = "yb_failback_lag_wait_timeout_secs" in raw
+
+    if failback_drain_user_set:
+        failback_drain_timeout_s = int(raw["yb_failback_drain_timeout_secs"])
+        if failback_drain_timeout_s < -1:
+            failback_drain_timeout_s = -1
+    elif failback_global_time_budget_secs is not None and (
+        failback_budget_raw is not None
+        or "yb_failback_lag_wait_timeout_secs" not in raw
+    ):
+        # If failback has its own budget (or inherits the failover budget
+        # with no lag_wait override), derive drain from the budget's 40%
+        # share. If a failback-specific lag_wait is set alongside the
+        # failover budget, still derive drain from the ratio — the
+        # over-budget check below catches inconsistencies.
+        failback_drain_timeout_s = round(
+            failback_global_time_budget_secs * _BUDGET_DRAIN_RATIO,
+        )
+    else:
+        # No budget, no explicit failback drain → inherit failover value.
+        failback_drain_timeout_s = drain_timeout_raw
+
+    if failback_lag_wait_user_set:
+        failback_lag_wait_timeout_s = _clamp_lo(
+            int(raw["yb_failback_lag_wait_timeout_secs"]), 0,
+        )
+    elif failback_global_time_budget_secs is not None and (
+        failback_budget_raw is not None
+        or "yb_failback_drain_timeout_secs" not in raw
+    ):
+        failback_lag_wait_timeout_s = _clamp_lo(
+            round(failback_global_time_budget_secs * _BUDGET_LAG_WAIT_RATIO),
+            0,
+        )
+    else:
+        failback_lag_wait_timeout_s = lag_wait_timeout
+
+    # Validate the failback sum against its budget (same rule as
+    # failover): drain sentinel (-1, 0) doesn't count as wall-clock.
+    if failback_global_time_budget_secs is not None and (
+        failback_drain_user_set or failback_lag_wait_user_set
+        or failback_budget_raw is not None
+    ):
+        fb_drain_for_budget = max(0, failback_drain_timeout_s)
+        fb_sum = fb_drain_for_budget + failback_lag_wait_timeout_s
+        if fb_sum > failback_global_time_budget_secs:
+            fb_drain_share = round(
+                failback_global_time_budget_secs * _BUDGET_DRAIN_RATIO,
+            )
+            fb_lag_share = round(
+                failback_global_time_budget_secs * _BUDGET_LAG_WAIT_RATIO,
+            )
+            raise ValueError(
+                f"yb.failback.globalTimeBudgetSecs="
+                f"{failback_global_time_budget_secs}s exceeded — effective "
+                f"phase timeouts sum to {fb_sum}s "
+                f"(drain={failback_drain_timeout_s}s, "
+                f"lag_wait={failback_lag_wait_timeout_s}s). "
+                f"Under this budget the ratio-derived shares are "
+                f"drain={fb_drain_share}s (40%) and lag_wait="
+                f"{fb_lag_share}s (60%); reduce a phase timeout or "
+                "raise the failback budget."
+            )
+
+    if (fb_thresh_raw := raw.get(
+        "yb_failback_threshold_replication_lag_ms",
+    )) is not None:
+        failback_threshold_replication_lag_ms = _clamp_lo(int(fb_thresh_raw), 0)
+    else:
+        failback_threshold_replication_lag_ms = threshold_replication_lag_ms
+
+    # YBA client inner timeouts. Scale down when a budget is set so a
+    # single blocked YBA call cannot eat the whole Phase 2 window.
+    if global_time_budget_secs is not None:
+        yba_connect_timeout_s = min(
+            DEFAULT_YBA_CONNECT_TIMEOUT_S,
+            lag_wait_timeout * _BUDGET_YBA_CONNECT_RATIO,
+        )
+        yba_read_timeout_s = min(
+            DEFAULT_YBA_READ_TIMEOUT_S,
+            lag_wait_timeout * _BUDGET_YBA_READ_RATIO,
+        )
+    else:
+        yba_connect_timeout_s = DEFAULT_YBA_CONNECT_TIMEOUT_S
+        yba_read_timeout_s = DEFAULT_YBA_READ_TIMEOUT_S
 
     return (
         YBParams(
@@ -310,6 +652,22 @@ def extract_yb_params(
             cooldown_s=cooldown,
             check_timeout_s=check_timeout,
             drain_timeout_s=drain_timeout_raw,
+            yba_endpoint=yba_endpoint,
+            yba_api_token=yba_api_token,
+            replication_name=replication_name,
+            threshold_replication_lag_ms=threshold_replication_lag_ms,
+            lag_wait_timeout_s=lag_wait_timeout,
+            global_time_budget_secs=global_time_budget_secs,
+            yba_connect_timeout_s=yba_connect_timeout_s,
+            yba_read_timeout_s=yba_read_timeout_s,
+            auto_failback_enabled=auto_failback_enabled,
+            failback_replication_name=failback_replication_name,
+            failback_drain_timeout_s=failback_drain_timeout_s,
+            failback_lag_wait_timeout_s=failback_lag_wait_timeout_s,
+            failback_threshold_replication_lag_ms=(
+                failback_threshold_replication_lag_ms
+            ),
+            failback_global_time_budget_secs=failback_global_time_budget_secs,
         ),
         cleaned_conninfo,
         cleaned_kwargs,
