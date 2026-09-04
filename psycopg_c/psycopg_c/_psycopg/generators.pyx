@@ -275,7 +275,7 @@ def pipeline_communicate(
     cdef int status
     cdef int cready
     cdef libpq.PGresult *pgres
-    cdef list res = []
+    cdef list res
     cdef list results = []
     cdef pq.PGresult r
 
@@ -300,7 +300,7 @@ def pipeline_communicate(
 
             _consume_notifies(pgconn)
 
-            res: list[PGresult] = []
+            res = []
             while True:
                 with nogil:
                     ibres = libpq.PQisBusy(pgconn_ptr)
