@@ -93,6 +93,144 @@ or pin to a specific version (``3.3.4.1`` is the first GA release). The fork
 cannot coexist with upstream ``psycopg`` in the same environment — both
 install into ``site-packages/psycopg/``.
 
+xCluster failover
+~~~~~~~~~~~~~~~~~
+
+The driver can be configured with a secondary YugabyteDB cluster to fail
+over to when the primary becomes unusable. Opt-in is gated on BOTH
+``load_balance_hosts=true`` AND a non-empty
+``yb.failover.secondaryClusterHosts`` — when those conditions hold, the
+driver eagerly bootstraps both clusters, starts one background probe
+thread per cluster, and routes new connections through whichever cluster
+the dual-CB state machine picks. ``psycopg-pool``'s ``check=`` callback
+evicts stale connections on failover via the bundled ``xcluster_check``
+helper.
+
+Architecture at a glance:
+
+* Two ``CircuitBreaker`` instances per ``FailoverGroup`` — one per
+  cluster. Each is polled independently by its own probe thread.
+* State machine: primary HEALTHY → serve primary; primary UNHEALTHY +
+  secondary HEALTHY → serve secondary; both UNHEALTHY → raise
+  ``NoViableClusterError``.
+* On a routing transition, the driver runs a **barrier-with-timeout
+  drain**: new connects are paused, in-flight transactions on the
+  outgoing cluster get up to ``drainTimeoutSecs`` to commit or abort,
+  survivors are force-closed at the deadline, then dispatch resumes
+  against the new active cluster.
+
+Configuration (libpq conninfo keys; ``.``, ``_``, and ``-`` are all
+accepted as separators between tokens):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 15 47
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``yb.failover.secondaryClusterHosts``
+     - (empty)
+     - Comma-separated secondary-cluster host list. One host is enough —
+       the rest of the cluster is discovered via ``yb_servers()``.
+       Setting this is the opt-in trigger for xCluster failover.
+   * - ``yb.failover.cooldownSecs``
+     - ``1500``
+     - Minimum interval between status transitions in either direction
+       on a single CB. Prevents rapid ping-pong when a cluster flaps.
+   * - ``yb.failover.checkTimeoutSecs``
+     - ``max(1, refresh/2)``
+     - Wall-clock cap on each ``CircuitBreaker.check()`` call. Ticks
+       that exceed the cap are abandoned; the previous status is
+       preserved. Prevents a blocking custom CB from stalling failover.
+   * - ``yb.failover.drainTimeoutSecs``
+     - ``10``
+     - Barrier-with-timeout drain behaviour. Sentinel values:
+       ``-1`` = wait indefinitely, never force-close;
+       ``0`` = force-close in-flight transactions immediately;
+       ``N > 0`` = wait up to N seconds then force-close survivors.
+
+Example (application):
+
+.. code-block:: python
+
+    import psycopg
+
+    conn = psycopg.connect(
+        "host=primary1,primary2,primary3 port=5433 user=yugabyte dbname=yugabyte "
+        "load_balance_hosts=true "
+        "yb.failover.secondaryClusterHosts=secondary1,secondary2,secondary3 "
+        "yb.failover.drainTimeoutSecs=10 "
+        # Recommended: bound in-flight queries to the drain window (see below):
+        "options='-c statement_timeout=10000'"
+    )
+
+With ``psycopg-pool``:
+
+.. code-block:: python
+
+    from psycopg.yb.pool import xcluster_check
+    from psycopg_pool import ConnectionPool
+
+    pool = ConnectionPool(
+        "host=primary1,primary2,primary3 load_balance_hosts=true "
+        "yb.failover.secondaryClusterHosts=secondary1,secondary2,secondary3 "
+        "yb.failover.drainTimeoutSecs=10 options='-c statement_timeout=10000'",
+        check=xcluster_check,
+        min_size=4, max_size=20,
+    )
+
+Pluggable circuit breaker
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Health signals enter the driver through a ``CircuitBreaker`` object —
+any class with ``check(group) -> HealthResult`` satisfies the contract.
+**The driver ships no default.** After bootstrap you MUST attach an
+implementation to BOTH ``group.primary_circuit_breaker`` and
+``group.secondary_circuit_breaker`` before opening any connection —
+``psycopg.connect(...)`` raises ``MissingCircuitBreakerError``
+otherwise.
+
+.. code-block:: python
+
+    from psycopg.yb import bootstrap_failover_group
+    from demo.samples.tracker_table_cb import TrackerTableCircuitBreaker
+
+    group = bootstrap_failover_group(dsn)
+    group.primary_circuit_breaker   = TrackerTableCircuitBreaker(which_cluster="primary")
+    group.secondary_circuit_breaker = TrackerTableCircuitBreaker(which_cluster="secondary")
+
+Reference implementations under ``demo/samples/``:
+``TrackerTableCircuitBreaker`` (periodic UPDATE probe), and
+``ExternalSignalCircuitBreaker`` (operator-controlled — reads
+``target_status`` from a well-known ``yb_failover_signals`` table).
+The driver ships ``AlwaysHealthyCircuitBreaker`` in
+``psycopg.yb.circuit_breaker`` as a documented inert example (tests
+only — not suitable for production).
+
+Server ``statement_timeout`` coordination
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+YugabyteDB does not cancel a running query when its client socket
+closes (see `yugabyte-db#28983
+<https://github.com/yugabyte/yugabyte-db/issues/28983>`_ and
+`#29379 <https://github.com/yugabyte/yugabyte-db/issues/29379>`_). For
+the drain's force-close to actually stop server-side execution, the
+server-side ``statement_timeout`` must be no larger than the drain
+window. The driver does **not** modify ``statement_timeout``; it reads
+the GUC once at bootstrap and emits a WARNING at ``psycopg.yb`` if it's
+unbounded (``0``) or larger than ``drainTimeoutSecs``. Set it at the
+DSN (``options='-c statement_timeout=<ms>'``) or role level.
+
+Per-process semantics
+^^^^^^^^^^^^^^^^^^^^^
+
+Each Python process maintains its own ``ClusterRegistry`` and therefore
+its own xCluster status flags. In a multi-worker deployment (gunicorn,
+``ProcessPoolExecutor``, Celery), workers independently observe failures
+and independently decide to fail over. Brief divergence during the
+detection window is expected and accepted for v1 (see design doc §11).
+
 Logging
 ~~~~~~~
 
