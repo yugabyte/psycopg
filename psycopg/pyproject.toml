@@ -58,7 +58,7 @@ email = "support@yugabyte.com"
 Homepage = "https://www.yugabyte.com/"
 Documentation = "https://docs.yugabyte.com/preview/drivers-orms/python/"
 "Upstream psycopg" = "https://psycopg.org/"
-Code = "https://github.com/yugabyte/psycopg-yugabytedb"
+Code = "https://github.com/yugabyte/psycopg"
 
 [project.readme]
 file = "README.rst"
