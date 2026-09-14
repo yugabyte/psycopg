@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import time
 import threading
+import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
@@ -107,6 +108,225 @@ class ClusterState:
     control_async: "AsyncConnection | None" = None
     bootstrap_conninfo: str = ""
     bootstrap_kwargs: dict = field(default_factory=dict)
+    # Weakref set of direct-connect conns opened against this cluster
+    # (Phase D — see design doc §3.1). Populated by the dispatcher on
+    # every successful ``psycopg.connect(dsn)``; pool-borrowed conns are
+    # NOT added here because the pool already holds strong references.
+    # The drain walk (Phase E) reads this set to find in-flight
+    # transactions on the outgoing cluster.
+    tracked_conns: "weakref.WeakSet" = field(default_factory=weakref.WeakSet)
+
+
+@dataclass
+class FailoverGroup:
+    """A primary + secondary cluster pair for xCluster failover.
+
+    See docs/xcluster_failover_design.html §3–§4 (design doc v2) for the
+    full design. Each cluster has its own circuit breaker + status flag;
+    the dispatcher reads both via ``state.active_cluster(group)`` on every
+    connect to pick the target cluster.
+
+    Per-cluster health state — written under ``lock``. The probe thread
+    writes via each CB's ``check()``; test code can flip directly via
+    ``force_primary_status`` / ``force_secondary_status``:
+
+      * ``primary_status`` / ``secondary_status`` — HEALTHY or UNHEALTHY
+      * ``primary_last_transition_time`` / ``secondary_last_transition_time``
+        — wall-clock (monotonic) of the last transition. ``0.0`` at
+        construction so a newly-spawned process can transition on its very
+        first probe tick — no "fresh-app starvation" window.
+      * ``primary_circuit_breaker`` / ``secondary_circuit_breaker`` — the
+        CB instances. The driver does NOT install a default; both slots
+        are ``None`` at bootstrap. Applications MUST attach an
+        implementation to each slot before opening connections — the
+        dispatcher raises ``MissingCircuitBreakerError`` otherwise. See
+        ``demo/samples/`` for reference CBs.
+
+    ``cooldown_s`` applies symmetrically to both — the probe consults
+    ``can_transition_primary`` / ``can_transition_secondary`` before writing
+    a status change.
+
+    ``primary_probe`` / ``secondary_probe`` are the per-cluster
+    ``HealthProbe`` daemons. Each polls its own cluster and refreshes the
+    topology on the same connection. Lifecycle is managed by
+    ``ClusterRegistry`` — created at bootstrap, stopped by ``clear()``.
+    """
+
+    primary: ClusterState
+    secondary: ClusterState
+    lock: threading.Lock
+    # Per-cluster status. See class docstring.
+    primary_status: "HealthResult"
+    secondary_status: "HealthResult"
+    primary_last_transition_time: float = 0.0
+    secondary_last_transition_time: float = 0.0
+    cooldown_s: int = 1500
+    # Per-cluster probes. Type kept loose to avoid a circular import on
+    # health_probe.HealthProbe.
+    primary_probe: "object | None" = None
+    secondary_probe: "object | None" = None
+    # The per-cluster CircuitBreaker instances. The driver does NOT install
+    # a default — applications MUST attach implementations after calling
+    # bootstrap_failover_group and before any psycopg.connect() traffic.
+    # The dispatcher raises MissingCircuitBreakerError if either slot is
+    # still None at connect time. See demo/samples/ for reference CBs.
+    primary_circuit_breaker: "object | None" = None
+    secondary_circuit_breaker: "object | None" = None
+    # Dispatch pause flag (Phase D — see design doc §3). When True, new
+    # connection opens block on ``dispatch_paused_condition`` until the
+    # drain sequence flips it back to False. Existing conns are NOT
+    # affected — only new opens gate on this. Written under ``lock``.
+    dispatch_paused: bool = False
+    # Condition bound to ``lock`` for pause/resume notify. Constructed in
+    # ``__post_init__`` so it wraps whatever lock was passed in (or
+    # created by default).
+    dispatch_paused_condition: "threading.Condition | None" = field(
+        default=None, repr=False,
+    )
+
+    # YBA lag-wait phase (Amogh's flow, 2026-08-11). ``yba_client`` is set
+    # by bootstrap when ``yba_endpoint`` + ``yba_api_token`` +
+    # ``replication_name`` are configured in the DSN; ``None`` means the
+    # lag-wait phase is disabled and the drain flip proceeds immediately
+    # after the txn drain.
+    #
+    # ``yba_customer_uuid`` and ``xcluster_config_uuid`` are figured out
+    # once at bootstrap by the driver — the user does NOT supply them —
+    # and are read on every Phase-2 poll. All fields stay stable for the
+    # group's lifetime; no ``lock`` required for reads.
+    #
+    # Empirically (2026-08-20 against portal.dev): YBA's /metrics only
+    # needs xClusterConfigUuid to identify the lag stream. We do NOT
+    # cache nodePrefix — it's redundant and its per-side lookup was the
+    # main reason we needed the YBA-side universe UUID at bootstrap
+    # (which doesn't necessarily match yb_servers().universe_uuid).
+    yba_client: "object | None" = None
+    yba_customer_uuid: str = ""
+    xcluster_config_uuid: str = ""
+    threshold_replication_lag_ms: int = 0
+    lag_wait_timeout_s: int = 30
+
+    # Failback-direction (B→A) Phase 2 config (design doc §3.5.1).
+    # Populated at bootstrap only when the operator set
+    # ``yb.failback.replicationName`` — resolved to a distinct xCluster
+    # config UUID via the same /universes walk used for the A→B side.
+    # An empty ``failback_xcluster_config_uuid`` means "Phase 2 skipped
+    # on failback" (fail-open) — same behaviour as YBA being unreachable.
+    failback_xcluster_config_uuid: str = ""
+    failback_threshold_replication_lag_ms: int = 0
+    failback_lag_wait_timeout_s: int = 30
+
+    # Auto-failback toggle (see design doc §3.5.1 / §7.3). When False,
+    # the driver stays on secondary even after the primary CB reports
+    # HEALTHY. Failback requires operator action (e.g. writing UNHEALTHY
+    # then HEALTHY to an ExternalSignalCircuitBreaker's signal table
+    # from the operator's side). Default True preserves v1 behaviour.
+    auto_failback_enabled: bool = True
+
+    # Per-stage timestamps (design doc §3.8). All ``time.monotonic()``
+    # floats. Zero means "never fired". Written under ``self.lock`` at
+    # the stage boundary; safe to read without the lock (float writes
+    # are atomic on CPython). Custom CBs (e.g. a debounced secondary CB
+    # that reads ``last_failover_complete_ts`` before returning HEALTHY
+    # to avoid an immediate failback) rely on these.
+    last_cb_trip_ts: float = 0.0
+    last_failover_start_ts: float = 0.0
+    last_phase1_complete_ts: float = 0.0
+    last_phase2_complete_ts: float = 0.0
+    last_failover_complete_ts: float = 0.0
+    last_failback_complete_ts: float = 0.0
+
+    def __post_init__(self) -> None:
+        # Bind the condition to `lock` — so wait/notify releases and re-
+        # acquires the same lock the rest of the group's state changes
+        # under. Skip if the caller already provided one (rare — some
+        # tests may want to inject a mock).
+        if self.dispatch_paused_condition is None:
+            self.dispatch_paused_condition = threading.Condition(self.lock)
+
+    def pause_dispatch(self) -> None:
+        """Set ``dispatch_paused = True``. Called from the drain sequence
+        (Phase E) at the start of a failover. Every ``group.lock``-held
+        write must set-and-notify together, so we expose this as a
+        method rather than relying on callers to remember the notify."""
+        with self.lock:
+            self.dispatch_paused = True
+
+    def resume_dispatch(self) -> None:
+        """Set ``dispatch_paused = False`` and notify all waiters. Called
+        from the drain sequence when the barrier releases."""
+        with self.lock:
+            self.dispatch_paused = False
+            assert self.dispatch_paused_condition is not None
+            self.dispatch_paused_condition.notify_all()
+
+    def wait_for_first_check(self, timeout_s: "float | None" = None) -> bool:
+        """Block until each attached CB has completed its first
+        ``check()`` — either as a natural probe tick or via an explicit
+        synchronous call here.
+
+        Design doc §4.6: prevents the race where an app opens
+        connections after ``bootstrap_failover_group()`` returns but
+        before the probe has had any actual data about the clusters.
+        Call this AFTER attaching CBs and BEFORE opening application
+        connections.
+
+        Bounded by ``check_timeout_s`` per CB (already enforced inside
+        each probe's ``_tick_check``). If ``timeout_s`` is provided,
+        this call gives up after that many seconds and returns ``False``
+        (individual probes may still complete afterwards). Returns
+        ``True`` when both first checks have fired.
+
+        Idempotent — calling twice with both first-checks already
+        complete returns immediately."""
+        probes = [
+            p for p in (self.primary_probe, self.secondary_probe)
+            if p is not None
+        ]
+        if not probes:
+            return True   # no probes wired yet — nothing to wait on
+        # Force a synchronous first tick on each probe that hasn't
+        # ticked yet. Probes with an already-complete first tick skip
+        # this internally (idempotent).
+        import time as _time
+        deadline = None if timeout_s is None else _time.monotonic() + timeout_s
+        for p in probes:
+            # `run_first_check_synchronously` returns after the tick
+            # completes OR the probe's own check_timeout_s cap fires.
+            p.run_first_check_synchronously()
+            if deadline is not None and _time.monotonic() >= deadline:
+                return all(p.first_check_complete for p in probes)
+        return True
+
+    def force_primary_status(self, status: "HealthResult") -> None:
+        """TEST HOOK. Manually set ``primary_status``.
+
+        In production, this is set only by the probe thread running the
+        primary CB's ``check()``. Integration tests use this to drive
+        failover deterministically without spinning up a real cluster.
+        """
+        now = time.monotonic()
+        with self.lock:
+            self.primary_status = status
+            self.primary_last_transition_time = now
+
+    def force_secondary_status(self, status: "HealthResult") -> None:
+        """TEST HOOK. Manually set ``secondary_status``. Symmetric with
+        :meth:`force_primary_status`."""
+        now = time.monotonic()
+        with self.lock:
+            self.secondary_status = status
+            self.secondary_last_transition_time = now
+
+    def can_transition_primary(self, now: float) -> bool:
+        """Return True iff the cool-down window has elapsed since the last
+        primary transition. ``primary_last_transition_time = 0.0`` at
+        construction → always True on first call."""
+        return (now - self.primary_last_transition_time) >= self.cooldown_s
+
+    def can_transition_secondary(self, now: float) -> bool:
+        """Symmetric with :meth:`can_transition_primary` for secondary."""
+        return (now - self.secondary_last_transition_time) >= self.cooldown_s
 
 
 class ClusterRegistry:
@@ -120,21 +340,37 @@ class ClusterRegistry:
       * `increment` / `decrement` — per-connect bookkeeping
       * `mark_failed` — quarantine a node after connect failure
 
+    xCluster failover (when `yb_params.xcluster_enabled` is True):
+
+      * `get_or_bootstrap_failover_group` / `aget_or_bootstrap_failover_group`
+        — pair primary + secondary cluster states under one `FailoverGroup`
+      * `get_failover_group(primary_uuid)` — by primary uuid
+      * `get_failover_group_by_uuid(any_uuid)` — searches both primary AND
+        secondary uuids (used by `xcluster_check` pool callback)
+      * `reset_failover_group(primary_uuid)` — operator failback API:
+        flips status back to HEALTHY immediately
+      * `get_failover_status(primary_uuid)` — read current status + last
+        transition timestamp
+
     Test hooks (mirroring pgjdbc-yb's `LoadBalanceService.getLoad/clear`):
 
       * `get_load(uuid, host)` — read current count without mutating
-      * `clear()` — drop all state (closes sync control conns best-effort)
+      * `clear()` — drop all state (closes sync control conns best-effort,
+        stops all probe threads)
     """
 
     _instance: ClassVar["ClusterRegistry | None"] = None
     _instance_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self) -> None:
-        # Protects the two maps (their identity, not their values' identity).
+        # Protects the three maps (their identity, not their values' identity).
         # Per-cluster ClusterState.lock protects each cluster's nodes dict.
+        # Per-group FailoverGroup.lock protects each group's status flag.
         self._lock = threading.Lock()
         self._clusters: dict[str, ClusterState] = {}
         self._key_to_uuid: dict[ClusterKey, str] = {}
+        # xCluster failover: keyed by PRIMARY uuid (one group per primary cluster).
+        self._failover_groups: dict[str, "FailoverGroup"] = {}
 
     @classmethod
     def instance(cls) -> "ClusterRegistry":
@@ -295,6 +531,388 @@ class ClusterRegistry:
                 logger.log(TRACE, "  discovered node: %s", n)
             return state
 
+    # ------------------------------------------------------------------ xCluster failover
+    #
+    # `get_or_bootstrap_failover_group` (and its async sibling) is the entry
+    # point the dispatcher calls when `yb_params.xcluster_enabled` is True.
+    # The pattern:
+    #   1. Bootstrap the primary (re-uses `get_or_bootstrap` — cached on
+    #      repeat calls with the same ClusterKey).
+    #   2. Check `_failover_groups[primary.uuid]` — return if already present.
+    #   3. Bootstrap the secondary using the same kwargs but with the host
+    #      list overridden to `yb_params.secondary_cluster_hosts`. The
+    #      secondary becomes its own ClusterState in `_clusters` under its
+    #      own uuid.
+    #   4. Construct the `FailoverGroup` and install it (race-checked).
+    #   5. Start the `HealthProbe` thread on the group.
+
+    def _make_secondary_kwargs(
+        self, kwargs: dict[str, object], secondary_hosts: list[str]
+    ) -> dict[str, object]:
+        """Return a copy of `kwargs` with `host` replaced by the secondary
+        cluster's host list. All other params (port, user, dbname,
+        ssl-related, topology, refresh interval, ...) carry over verbatim —
+        spec §5 says existing smart-driver params apply to both clusters."""
+        sec_kwargs = dict(kwargs)
+        sec_kwargs["host"] = ",".join(secondary_hosts)
+        return sec_kwargs
+
+    def _wire_yba_lag_phase(self, group: "FailoverGroup", yb_params) -> None:
+        """Bootstrap-time YBA client setup. Called once per FailoverGroup
+        after construction, before probes start.
+
+        Steps (per Amogh's 2026-08-11 spec, revised 2026-08-20):
+          1. Instantiate ``YBAClient`` with the DSN's endpoint + token.
+          2. Fetch ``customerUUID`` via ``/session_info`` → cache on group.
+          3. Resolve ``replicationName`` → ``xClusterConfigUUID`` by
+             walking every universe's ``sourceXClusterConfigs`` → cache
+             on group.
+
+        Only two YBA identifiers ever leave the bootstrap: customerUUID
+        and xClusterConfigUUID. YBA's /metrics endpoint doesn't need a
+        node_prefix when the config UUID is set, so we skip the two
+        /universes/{uuid} calls that were previously needed. This also
+        means we don't need the YBA-side universeUUID at all — which
+        avoided a real portability problem (YBA's universeUUID doesn't
+        necessarily match yb_servers().universe_uuid).
+
+        Best-effort: any failure (YBA unreachable, bad token, unknown
+        replication name) is logged at WARNING and leaves
+        ``group.yba_client`` as ``None``. The lag-wait phase in
+        ``drain.py`` treats a ``None`` client as "feature disabled" and
+        proceeds with the immediate flip after the txn drain. This
+        means a broken YBA never blocks failover.
+        """
+        if not yb_params.lag_wait_enabled:
+            return
+
+        from .yba_client import YBAClient, YBAClientError
+
+        # Stash the immutable knobs first — even if the initial YBA
+        # probe fails, they're preserved so the drain code can log
+        # them consistently.
+        group.threshold_replication_lag_ms = yb_params.threshold_replication_lag_ms
+        group.lag_wait_timeout_s = yb_params.lag_wait_timeout_s
+        # Failback-direction knobs. `failback_xcluster_config_uuid` is
+        # populated below only if the operator set
+        # yb.failback.replicationName.
+        group.failback_threshold_replication_lag_ms = (
+            yb_params.failback_threshold_replication_lag_ms
+        )
+        group.failback_lag_wait_timeout_s = yb_params.failback_lag_wait_timeout_s
+
+        try:
+            client = YBAClient(
+                endpoint=yb_params.yba_endpoint,
+                api_token=yb_params.yba_api_token,
+                connect_timeout_s=yb_params.yba_connect_timeout_s,
+                read_timeout_s=yb_params.yba_read_timeout_s,
+            )
+            # 1. Customer UUID. Cached inside the client too, but we
+            #    surface it on the group so operators can see it in
+            #    diagnostics without poking at the client.
+            group.yba_customer_uuid = client.get_session_info()
+
+            # 2. Resolve replication_name → xClusterConfigUUID by
+            #    walking all universes' sourceXClusterConfigs. One
+            #    /universes call + one /xcluster_configs/{uuid} per
+            #    candidate.
+            group.xcluster_config_uuid = client.resolve_xcluster_config_uuid(
+                yb_params.replication_name,
+            )
+
+            # 3. If the operator configured a failback (B→A) replication
+            #    name, resolve it to a second xCluster config UUID.
+            #    Best-effort: a failure here leaves failback_xcluster_config_uuid
+            #    empty, which the drain treats as "no Phase 2 on failback"
+            #    (fail-open) but still allows the A→B Phase 2 to work.
+            if yb_params.failback_replication_name:
+                try:
+                    group.failback_xcluster_config_uuid = (
+                        client.resolve_xcluster_config_uuid(
+                            yb_params.failback_replication_name,
+                        )
+                    )
+                except YBAClientError as exc:
+                    logger.warning(
+                        "YBA failback Phase 2 disabled — could not resolve "
+                        "yb.failback.replicationName=%r: %s. Failover (A→B) "
+                        "Phase 2 still active; failback (B→A) will skip "
+                        "Phase 2 (fail-open).",
+                        yb_params.failback_replication_name, exc,
+                    )
+        except YBAClientError as exc:
+            logger.warning(
+                "YBA lag phase disabled — bootstrap probe failed: %s. "
+                "Failover drain will flip routing immediately after the "
+                "txn drain; no replication-lag wait.",
+                exc,
+            )
+            return
+        except Exception:
+            logger.warning(
+                "YBA lag phase disabled — unexpected error during bootstrap probe. "
+                "Failover drain will flip routing immediately after the txn drain.",
+                exc_info=True,
+            )
+            return
+
+        group.yba_client = client
+        logger.info(
+            "YBA lag phase enabled: endpoint=%s, replication_name=%s, "
+            "customer_uuid=%s, xcluster_config_uuid=%s, "
+            "threshold=%dms, wait_timeout=%ds",
+            yb_params.yba_endpoint,
+            yb_params.replication_name,
+            group.yba_customer_uuid,
+            group.xcluster_config_uuid,
+            yb_params.threshold_replication_lag_ms,
+            yb_params.lag_wait_timeout_s,
+        )
+
+    def get_or_bootstrap_failover_group(
+        self,
+        yb_params,                                  # YBParams; lazy-typed to dodge cycle
+        conninfo: str,
+        kwargs: dict[str, object],
+    ) -> "FailoverGroup":
+        """Sync bootstrap of a primary + secondary `FailoverGroup`. Idempotent
+        on primary uuid. Spec §5 / design §3."""
+        from .health import HealthResult            # late import — health.py imports FailoverGroup forward-ref
+
+        # 1. Bootstrap primary (cached on repeats).
+        primary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, kwargs)
+        )
+        primary = self.get_or_bootstrap(primary_key, conninfo, kwargs)
+
+        # 2. Already paired?
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+        if existing is not None:
+            logger.debug(
+                "failover group cache hit: primary_uuid=%s", primary.uuid
+            )
+            return existing
+
+        # 3. Bootstrap secondary.
+        sec_kwargs = self._make_secondary_kwargs(
+            kwargs, yb_params.secondary_cluster_hosts
+        )
+        secondary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, sec_kwargs)
+        )
+        secondary = self.get_or_bootstrap(secondary_key, conninfo, sec_kwargs)
+
+        # 4. Install (race-checked).
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+            if existing is not None:
+                logger.debug(
+                    "failover group race lost; discarding our pairing for "
+                    "primary_uuid=%s", primary.uuid,
+                )
+                return existing
+            # Both CB slots start empty. The application MUST attach
+            # implementations after this call returns and before any
+            # psycopg.connect() traffic. The dispatcher raises
+            # MissingCircuitBreakerError if either slot is still None at
+            # connect time. See demo/samples/ for reference CBs.
+            group = FailoverGroup(
+                primary=primary,
+                secondary=secondary,
+                lock=threading.Lock(),
+                primary_status=HealthResult.HEALTHY,
+                secondary_status=HealthResult.HEALTHY,
+                cooldown_s=yb_params.cooldown_s,
+                primary_circuit_breaker=None,
+                secondary_circuit_breaker=None,
+                auto_failback_enabled=yb_params.auto_failback_enabled,
+            )
+            self._failover_groups[primary.uuid] = group
+
+        logger.info(
+            "failover group bootstrapped: primary_uuid=%s, secondary_uuid=%s, "
+            "secondary_hosts=%s, cooldown_s=%d",
+            primary.uuid, secondary.uuid,
+            ",".join(yb_params.secondary_cluster_hosts),
+            yb_params.cooldown_s,
+        )
+
+        # 5. YBA lag phase — best-effort. Silently disables if unreachable.
+        self._wire_yba_lag_phase(group, yb_params)
+
+        # 6. Start the probe thread (Phase 4 wiring).
+        self._start_probe(group, yb_params.refresh_interval_s, yb_params.check_timeout_s, yb_params.drain_timeout_s)
+        return group
+
+    async def aget_or_bootstrap_failover_group(
+        self,
+        yb_params,
+        conninfo: str,
+        kwargs: dict[str, object],
+    ) -> "FailoverGroup":
+        """Async sibling. Same shape, awaits the async primary + secondary
+        bootstraps. The probe thread itself is sync regardless of caller
+        (see design doc §10)."""
+        from .health import HealthResult
+
+        primary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, kwargs)
+        )
+        primary = await self.aget_or_bootstrap(primary_key, conninfo, kwargs)
+
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+        if existing is not None:
+            logger.debug(
+                "failover group cache hit (async): primary_uuid=%s", primary.uuid
+            )
+            return existing
+
+        sec_kwargs = self._make_secondary_kwargs(
+            kwargs, yb_params.secondary_cluster_hosts
+        )
+        secondary_key = ClusterKey.from_params(
+            self._param_dict_for_key(conninfo, sec_kwargs)
+        )
+        secondary = await self.aget_or_bootstrap(
+            secondary_key, conninfo, sec_kwargs
+        )
+
+        with self._lock:
+            existing = self._failover_groups.get(primary.uuid)
+            if existing is not None:
+                logger.debug(
+                    "failover group race lost (async); discarding our pairing "
+                    "for primary_uuid=%s", primary.uuid,
+                )
+                return existing
+            # Both CB slots start empty. The application MUST attach
+            # implementations after this call returns and before any
+            # psycopg.connect() traffic. The dispatcher raises
+            # MissingCircuitBreakerError if either slot is still None at
+            # connect time. See demo/samples/ for reference CBs.
+            group = FailoverGroup(
+                primary=primary,
+                secondary=secondary,
+                lock=threading.Lock(),
+                primary_status=HealthResult.HEALTHY,
+                secondary_status=HealthResult.HEALTHY,
+                cooldown_s=yb_params.cooldown_s,
+                primary_circuit_breaker=None,
+                secondary_circuit_breaker=None,
+                auto_failback_enabled=yb_params.auto_failback_enabled,
+            )
+            self._failover_groups[primary.uuid] = group
+
+        logger.info(
+            "failover group bootstrapped (async): primary_uuid=%s, "
+            "secondary_uuid=%s, secondary_hosts=%s, cooldown_s=%d",
+            primary.uuid, secondary.uuid,
+            ",".join(yb_params.secondary_cluster_hosts),
+            yb_params.cooldown_s,
+        )
+
+        self._wire_yba_lag_phase(group, yb_params)
+        self._start_probe(group, yb_params.refresh_interval_s, yb_params.check_timeout_s, yb_params.drain_timeout_s)
+        return group
+
+    def _param_dict_for_key(
+        self, conninfo: str, kwargs: dict[str, object]
+    ) -> dict[str, object]:
+        """Build the dict ClusterKey wants for hashing. Mirrors the way the
+        dispatcher constructs ClusterKey before calling `get_or_bootstrap`
+        — late import of `conninfo_to_dict` to avoid pulling psycopg's
+        full conninfo module at registry import time."""
+        from ..conninfo import conninfo_to_dict
+        return conninfo_to_dict(conninfo, **kwargs)
+
+    def _start_probe(
+        self,
+        group: "FailoverGroup",
+        interval_s: int,
+        check_timeout_s: float = 1.0,
+        drain_timeout_s: int = 10,
+    ) -> None:
+        """Spin up one daemon ``HealthProbe`` per cluster (Phase B — see
+        design doc §4.1 "topology refresh rides on the same thread").
+        Each probe polls its cluster's CB with a wall-clock cap of
+        ``check_timeout_s`` and refreshes ``yb_servers()`` on the same
+        tick. When a transition fires the probe invokes
+        ``drain.trigger_drain`` with ``drain_timeout_s`` (Phase E).
+        Idempotent — safe to call twice."""
+        from .health_probe import HealthProbe       # late import; cycle-safe
+        if group.primary_probe is None:
+            p = HealthProbe(
+                group, interval_s,
+                which_cluster="primary",
+                check_timeout_s=check_timeout_s,
+                drain_timeout_s=drain_timeout_s,
+            )
+            group.primary_probe = p
+            p.start()
+        if group.secondary_probe is None:
+            s = HealthProbe(
+                group, interval_s,
+                which_cluster="secondary",
+                check_timeout_s=check_timeout_s,
+                drain_timeout_s=drain_timeout_s,
+            )
+            group.secondary_probe = s
+            s.start()
+
+    def get_failover_group(self, primary_uuid: str) -> "FailoverGroup | None":
+        """Lookup by primary uuid. Returns None if no group exists for it."""
+        with self._lock:
+            return self._failover_groups.get(primary_uuid)
+
+    def get_failover_group_by_uuid(
+        self, any_uuid: str
+    ) -> "FailoverGroup | None":
+        """Lookup by EITHER primary or secondary uuid. The pool's
+        `xcluster_check` (Phase 6) calls this on a conn whose `_yb_uuid`
+        could be either side of the pair."""
+        with self._lock:
+            for group in self._failover_groups.values():
+                if group.primary.uuid == any_uuid or group.secondary.uuid == any_uuid:
+                    return group
+            return None
+
+    def reset_failover_group(self, primary_uuid: str) -> bool:
+        """Operator failback API. Flips BOTH primary and secondary status
+        back to HEALTHY immediately. Returns True if a group existed and
+        was reset, False otherwise. Equivalent of JDBC's JMX failback
+        operation (design doc §8)."""
+        from .health import HealthResult
+        group = self.get_failover_group(primary_uuid)
+        if group is None:
+            return False
+        group.force_primary_status(HealthResult.HEALTHY)
+        group.force_secondary_status(HealthResult.HEALTHY)
+        logger.info(
+            "failover group reset to HEALTHY by operator: primary_uuid=%s",
+            primary_uuid,
+        )
+        return True
+
+    def get_failover_status(
+        self, primary_uuid: str
+    ) -> "tuple[HealthResult, HealthResult, float, float] | None":
+        """Read current ``(primary_status, secondary_status,
+        primary_last_transition_time, secondary_last_transition_time)``
+        without mutating. Returns None if no group exists for the uuid."""
+        group = self.get_failover_group(primary_uuid)
+        if group is None:
+            return None
+        with group.lock:
+            return (
+                group.primary_status,
+                group.secondary_status,
+                group.primary_last_transition_time,
+                group.secondary_last_transition_time,
+            )
+
     # ------------------------------------------------------------------ refresh
 
     def refresh_if_stale(self, state: ClusterState, interval_s: int) -> None:
@@ -407,16 +1025,44 @@ class ClusterRegistry:
         """
         with state.lock:
             ctrl = state.control_sync
-        if ctrl is not None:
+        # The cached conn might be broken — e.g. the postmaster crashed
+        # mid-flight after a quorum loss — in which case `closed` is True
+        # but the slot still holds the dead object. Treat that as "no
+        # usable conn" and fall through to the reopen path. Without this
+        # check the caller would receive the broken conn forever and the
+        # circuit breaker would never see recovery.
+        if ctrl is not None and not ctrl.closed:
             return ctrl
+        if ctrl is not None and ctrl.closed:
+            with state.lock:
+                if state.control_sync is ctrl:
+                    state.control_sync = None
         if not state.bootstrap_kwargs and not state.bootstrap_conninfo:
             return None
         with state.lock:
             candidates = [n for n in state.nodes.values() if not n.is_down]
+            # All-marked-down is usually stale state, not ground truth:
+            # a quorum-loss cascade marks every node within seconds; the
+            # next refresh would clear them but refresh can't run without
+            # a control conn → deadlock. Break it by retrying every node;
+            # the connect itself authoritatively reports which are up.
+            #
+            # The policy uses a TTL window to gradually re-eligible
+            # marked-down nodes, but `_ensure_control_sync` is the
+            # bootstrap-everything-else primitive and can't afford to wait
+            # for the TTL to expire — without a control conn, no refresh,
+            # so the TTL never matters.
+            if not candidates:
+                candidates = list(state.nodes.values())
+                logger.info(
+                    "control conn re-open: every node marked is_down for "
+                    "uuid=%s; retrying all %d to break the deadlock",
+                    state.uuid, len(candidates),
+                )
 
         from ..connection import Connection
         logger.debug(
-            "control conn re-open: trying %d non-down candidate(s) for uuid=%s",
+            "control conn re-open: trying %d candidate(s) for uuid=%s",
             len(candidates), state.uuid,
         )
         for node in candidates:
@@ -460,12 +1106,29 @@ class ClusterRegistry:
     ) -> "AsyncConnection | None":
         with state.lock:
             ctrl = state.control_async
-        if ctrl is not None:
+        # Mirror the sync sibling: a broken cached conn (postmaster crash,
+        # network drop) must NOT be returned — it would poison every
+        # subsequent caller indefinitely. Detect via `closed` and fall
+        # through to the reopen path.
+        if ctrl is not None and not ctrl.closed:
             return ctrl
+        if ctrl is not None and ctrl.closed:
+            with state.lock:
+                if state.control_async is ctrl:
+                    state.control_async = None
         if not state.bootstrap_kwargs and not state.bootstrap_conninfo:
             return None
         with state.lock:
             candidates = [n for n in state.nodes.values() if not n.is_down]
+            # See sync sibling: all-marked-down is usually stale; the
+            # connect itself is the authoritative liveness signal.
+            if not candidates:
+                candidates = list(state.nodes.values())
+                logger.info(
+                    "control conn re-open (async): every node marked "
+                    "is_down for uuid=%s; retrying all %d to break the "
+                    "deadlock", state.uuid, len(candidates),
+                )
 
         from ..connection_async import AsyncConnection
         logger.debug(
@@ -515,12 +1178,28 @@ class ClusterRegistry:
     def _merge_new_nodes(
         self, state: ClusterState, new_nodes: list[NodeInfo]
     ) -> None:
-        """Replace state.nodes with the freshly-discovered list, preserving counters.
+        """Reconcile state.nodes with the freshly-discovered list.
 
         Called only on the success path of `refresh_if_stale`, so this is
         the "we just refreshed" moment. Clear `force_refresh` here — any
         flag set during the refresh itself (e.g. `mark_failed` triggered by
         `_ensure_control_sync` refusing a dead host) is now stale.
+
+        Reconciliation rules:
+
+        * Nodes that appear in ``new_nodes``: master considers them alive,
+          so ``is_down`` is cleared. ``connection_count`` is preserved from
+          the existing entry (we own that counter, not the master).
+        * Nodes that were previously known but are MISSING from
+          ``new_nodes``: kept in ``state.nodes`` and marked ``is_down=True``
+          (with ``is_down_since=now`` only if not already down). A transient
+          ``yb_servers()`` response missing a tserver that is still
+          re-registering with the master should NOT cause us to forget the
+          host entirely — the next refresh either restores it or confirms
+          it's gone. Wholesale-dropping makes the dispatcher pick from a
+          shrunk subset for the entire next refresh interval, which
+          empirically manifests as "all conns go to a 2-host subset of a
+          3-host cluster" right after failback.
         """
         with state.lock:
             old_hosts = set(state.nodes.keys())
@@ -531,14 +1210,27 @@ class ClusterRegistry:
             for n in new_nodes:
                 if (existing := state.nodes.get(n.host)) is not None:
                     n.connection_count = existing.connection_count
-                    n.is_down = existing.is_down
-                    n.is_down_since = existing.is_down_since
+                # `is_down`/`is_down_since` deliberately NOT preserved here.
+                # The master returning this host in `yb_servers()` is the
+                # canonical alive signal; trusting it over a stale local
+                # flag avoids a 5-second TTL stall every time a node
+                # transitions down→up.
                 new_dict[n.host] = n
+            # Carry forward nodes that vanished from this refresh — they
+            # might be transient (still re-registering after restart).
+            now = time.monotonic()
+            for host in removed:
+                stale = state.nodes[host]
+                if not stale.is_down:
+                    stale.is_down = True
+                    stale.is_down_since = now
+                new_dict[host] = stale
             state.nodes = new_dict
             state.force_refresh = False
         if added or removed:
             logger.info(
-                "topology change observed for uuid=%s: added=%s removed=%s",
+                "topology change observed for uuid=%s: added=%s removed=%s "
+                "(removed kept as is_down=True until next refresh)",
                 state.uuid, sorted(added) or "—", sorted(removed) or "—",
             )
 
@@ -614,8 +1306,36 @@ class ClusterRegistry:
             ni = state.nodes.get(host)
             return ni.connection_count if ni is not None else 0
 
+    def _drain_failover_groups(self) -> "list[FailoverGroup]":
+        """Pop all failover groups and stop their probe threads. Returns the
+        popped groups so callers can do any further cleanup (currently none
+        needed beyond the probe-stop). Called from `clear()` / `aclear()`
+        with `self._lock` held by the caller."""
+        groups = list(self._failover_groups.values())
+        self._failover_groups.clear()
+        return groups
+
+    def _stop_probes_best_effort(
+        self, groups: "list[FailoverGroup]"
+    ) -> None:
+        """Stop both per-cluster probes on each group. Runs OUTSIDE
+        ``self._lock`` — joining a thread while holding a class-level
+        lock would deadlock if the probe ever re-enters the registry."""
+        for group in groups:
+            for probe in (group.primary_probe, group.secondary_probe):
+                if probe is None:
+                    continue
+                try:
+                    probe.stop()
+                except Exception:
+                    logger.warning(
+                        "probe stop failed during clear(); ignoring",
+                        exc_info=True,
+                    )
+
     def clear(self) -> None:
-        """Drop all state. Best-effort closes any control connections held.
+        """Drop all state. Best-effort closes any control connections held
+        and stops all xCluster probe threads.
 
         Async control connections are closed by force-finishing the underlying
         libpq handle directly (bypassing the async wrapper) — this lets us
@@ -627,6 +1347,9 @@ class ClusterRegistry:
             clusters = list(self._clusters.values())
             self._clusters.clear()
             self._key_to_uuid.clear()
+            groups = self._drain_failover_groups()
+        # Probes stopped OUTSIDE the registry lock (see _stop_probes_best_effort).
+        self._stop_probes_best_effort(groups)
         for state in clusters:
             if state.control_sync is not None:
                 try:
@@ -651,6 +1374,8 @@ class ClusterRegistry:
             clusters = list(self._clusters.values())
             self._clusters.clear()
             self._key_to_uuid.clear()
+            groups = self._drain_failover_groups()
+        self._stop_probes_best_effort(groups)
         for state in clusters:
             if state.control_sync is not None:
                 try:

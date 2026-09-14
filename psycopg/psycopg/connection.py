@@ -78,6 +78,11 @@ class Connection(BaseConnection[Row]):
     # `if self._yb_uuid` guard in `close` correctly skips decrement.
     _yb_uuid: str | None = None
     _yb_host: str | None = None
+    # xCluster tagging. "primary" / "secondary" when the conn was routed via a
+    # FailoverGroup; None for the single-cluster smart-driver path and for
+    # pass-through. Used by `psycopg.yb.pool.xcluster_check` to decide whether
+    # to evict pool-managed conns on failover.
+    _yb_cluster: str | None = None
 
     def __init__(
         self,
@@ -131,17 +136,70 @@ class Connection(BaseConnection[Row]):
 
         # --- Smart-driver path ---
         yb_logger.debug(
-            "smart driver enabled (topology_keys=%s, refresh_interval=%ds, ttl=%ds)",
+            "smart driver enabled (topology_keys=%s, refresh_interval=%ds, ttl=%ds, xcluster=%s)",
             yb_params.topology_keys or "—",
             yb_params.refresh_interval_s,
             yb_params.failed_host_reconnect_delay_s,
+            yb_params.xcluster_enabled,
         )
         registry = ClusterRegistry.instance()
-        # ClusterKey wants a dict; parse the cleaned conninfo once for it.
-        pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
-        key = ClusterKey.from_params(pg_dict)
-        state = registry.get_or_bootstrap(key, cleaned_conninfo, cleaned_kwargs)
-        registry.refresh_if_stale(state, yb_params.refresh_interval_s)
+
+        # xCluster path — bootstrap a FailoverGroup and pick the active
+        # cluster from the dual-CB state machine (see psycopg.yb.state).
+        # Falls through to the single-cluster path when xcluster_enabled
+        # is False (the common case).
+        active_cluster: str | None = None
+        failover_group = None
+        if yb_params.xcluster_enabled:  # late import; cycle-safe
+            from .yb import MissingCircuitBreakerError, NoViableClusterError
+            from .yb.state import active_cluster as _active_cluster
+            from .yb.state import wait_for_dispatch as _wait_for_dispatch
+
+            failover_group = registry.get_or_bootstrap_failover_group(
+                yb_params, cleaned_conninfo, cleaned_kwargs
+            )
+            # Fail fast — the driver ships without a default CB. The app
+            # must attach both slots via bootstrap_failover_group + explicit
+            # assignment before any connect. Better to raise here than to
+            # silently route based on a status flag no CB is writing to.
+            if (
+                failover_group.primary_circuit_breaker is None
+                or failover_group.secondary_circuit_breaker is None
+            ):
+                raise MissingCircuitBreakerError(
+                    "Configuration error: 'yb.failover.secondaryClusterHosts' requires circuit breaker class to be configured. Exiting."
+                )
+            # Barrier: if a drain sequence has paused dispatch, block here
+            # until it releases. No timeout in the direct-connect path —
+            # the drain is bounded by drainTimeoutSecs, so the wait is
+            # inherently short.
+            _wait_for_dispatch(failover_group)
+            which = _active_cluster(failover_group)
+            if which is None:
+                raise NoViableClusterError(
+                    f"xCluster: both primary and secondary clusters report UNHEALTHY — no viable target for new connections (primary_uuid={failover_group.primary.uuid})"
+                )
+            if which == "secondary":
+                state = failover_group.secondary
+            else:
+                state = failover_group.primary
+            active_cluster = which
+            yb_logger.debug(
+                "xcluster active cluster: %s (primary_uuid=%s)",
+                active_cluster,
+                failover_group.primary.uuid,
+            )
+        else:
+            # xCluster deployments have per-cluster probe threads that
+            # refresh yb_servers() on each tick (design doc §4.1). The
+            # lazy on-demand refresh path is skipped here — the probe
+            # cadence is authoritative for topology in xCluster mode.
+            # ClusterKey wants a dict; parse the cleaned conninfo once for it.
+            pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
+            key = ClusterKey.from_params(pg_dict)
+            state = registry.get_or_bootstrap(key, cleaned_conninfo, cleaned_kwargs)
+            # Single-cluster path has no probe thread; keep the lazy refresh.
+            registry.refresh_if_stale(state, yb_params.refresh_interval_s)
         policy = build_policy(yb_params)
 
         attempted: set[str] = set()
@@ -207,10 +265,22 @@ class Connection(BaseConnection[Row]):
 
             conn._yb_uuid = state.uuid
             conn._yb_host = node.host
+            # `active_cluster` is "primary"/"secondary" iff we routed via a
+            # FailoverGroup; None for the single-cluster smart-driver path.
+            conn._yb_cluster = active_cluster
+            # Direct-connect weakref tracking (Phase D). Only wire this
+            # in the xCluster path — the drain sequence walks
+            # `state.tracked_conns` on the outgoing cluster to find
+            # in-flight transactions. Pool-borrowed conns are NOT added
+            # here because the pool already holds strong references
+            # (design doc §3.1).
+            if failover_group is not None:
+                state.tracked_conns.add(conn)
             yb_logger.debug(
-                "smart-driver connect succeeded: host=%s, uuid=%s",
+                "smart-driver connect succeeded: host=%s, uuid=%s, cluster=%s",
                 node.host,
                 state.uuid,
+                active_cluster or "(single-cluster)",
             )
             return conn
 

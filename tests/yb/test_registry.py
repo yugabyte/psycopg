@@ -375,9 +375,52 @@ def test_ensure_control_sync_returns_none_when_all_nodes_refuse(
     assert state.control_sync is None
 
 
-def test_ensure_control_sync_returns_none_when_all_nodes_down(fresh_registry):
+def test_ensure_control_sync_retries_all_when_every_node_marked_down(
+    fresh_registry, monkeypatch
+):
+    """All nodes marked is_down doesn't deadlock control-conn reopen.
+
+    A quorum-loss cascade marks every node within seconds; without this
+    behavior, refresh can't run (needs a control conn), and the control
+    conn won't reopen (zero candidates pass the is_down filter), so the
+    driver stays blind forever. The fix: retry ALL nodes when none pass
+    the filter — the connect itself is the authoritative liveness signal.
+    """
     state = _state_with_bootstrap(fresh_registry, ["h1", "h2"], down={"h1", "h2"})
-    # No live candidates; never invokes _connect_plain.
+    attempted: list[str] = []
+
+    def fake_connect(conninfo, **kwargs):
+        attempted.append(kwargs["host"])
+        return _FakeConn(kwargs["host"])
+
+    from psycopg.connection import Connection
+    monkeypatch.setattr(
+        Connection, "_connect_plain",
+        classmethod(lambda cls, *a, **k: fake_connect(*a, **k)),
+    )
+
+    ctrl = fresh_registry._ensure_control_sync(state)
+    assert ctrl is not None, "must break the all-down deadlock by retrying"
+    # At least one host was attempted (the first one to accept won).
+    assert attempted, "must have actually attempted a connect"
+    assert ctrl.host in {"h1", "h2"}
+
+
+def test_ensure_control_sync_returns_none_when_all_nodes_down_and_refused(
+    fresh_registry, monkeypatch
+):
+    """The deadlock-recovery path still returns None if every retry refuses —
+    we tried, the cluster is genuinely all-dead, no conn to return."""
+    state = _state_with_bootstrap(fresh_registry, ["h1", "h2"], down={"h1", "h2"})
+
+    from psycopg.connection import Connection
+    def fake_connect(*a, **k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(
+        Connection, "_connect_plain",
+        classmethod(lambda cls, *a, **k: fake_connect(*a, **k)),
+    )
+
     assert fresh_registry._ensure_control_sync(state) is None
 
 
@@ -489,3 +532,126 @@ def test_refresh_if_stale_keeps_force_refresh_when_all_nodes_refuse(
     # retry IMMEDIATELY, not wait another full interval.
     assert state.force_refresh is True
     assert state.control_sync is None
+
+
+# --------------------------------------------------------------------- _merge_new_nodes
+
+
+def _make_node(host: str, **kwargs) -> NodeInfo:
+    return NodeInfo(
+        host=host, public_ip=None, port=5433,
+        placement=Placement("aws", "r", "z"),
+        node_type="primary", **kwargs,
+    )
+
+
+def test_merge_preserves_connection_count_for_existing_nodes(fresh_registry):
+    """Reconcile must carry forward the per-host conn counter we own —
+    yb_servers() doesn't know about pending dispatcher reservations."""
+    state = _install_state(fresh_registry, ["h1", "h2"])
+    state.nodes["h1"].connection_count = 5
+    state.nodes["h2"].connection_count = 3
+
+    new_nodes = [_make_node("h1"), _make_node("h2")]
+    fresh_registry._merge_new_nodes(state, new_nodes)
+
+    assert state.nodes["h1"].connection_count == 5
+    assert state.nodes["h2"].connection_count == 3
+
+
+def test_merge_clears_is_down_when_node_reappears_in_refresh(fresh_registry):
+    """A node previously marked down that shows up in the refresh result
+    must have its is_down cleared. The master returning it in
+    yb_servers() is the canonical alive signal — trusting it avoids a
+    5-second TTL stall every time a node transitions down → up.
+    """
+    state = _install_state(fresh_registry, ["h1", "h2"])
+    state.nodes["h2"].is_down = True
+    state.nodes["h2"].is_down_since = time.monotonic() - 1
+    state.nodes["h2"].connection_count = 4
+
+    new_nodes = [_make_node("h1"), _make_node("h2")]
+    fresh_registry._merge_new_nodes(state, new_nodes)
+
+    assert state.nodes["h2"].is_down is False
+    assert state.nodes["h2"].is_down_since == 0.0
+    # connection_count is independent of is_down — carries forward.
+    assert state.nodes["h2"].connection_count == 4
+
+
+def test_merge_keeps_node_missing_from_refresh_as_marked_down(fresh_registry):
+    """A node that was previously known but is missing from the new
+    refresh result MUST be kept in state.nodes (marked is_down=True),
+    not dropped. yb_servers() can transiently omit a tserver that is
+    still re-registering with the master after a restart; wholesale-
+    dropping the host means the dispatcher picks from a 2-host subset
+    for the entire next refresh interval. This is the bug the
+    `test_smart_driver_xcluster_cb.py` distribution check uncovered."""
+    state = _install_state(fresh_registry, ["h1", "h2", "h3"])
+    state.nodes["h2"].connection_count = 7
+    # All three healthy initially.
+    for host in state.nodes:
+        assert state.nodes[host].is_down is False
+
+    # Refresh only returns h1 and h3 (h2 transiently missing).
+    new_nodes = [_make_node("h1"), _make_node("h3")]
+    before = time.monotonic()
+    fresh_registry._merge_new_nodes(state, new_nodes)
+    after = time.monotonic()
+
+    # h2 is still present in state.nodes (not dropped) and marked down.
+    assert "h2" in state.nodes, "missing-from-refresh node must be retained"
+    assert state.nodes["h2"].is_down is True
+    assert before <= state.nodes["h2"].is_down_since <= after
+    # connection_count preserved — close()-side decrements still need it.
+    assert state.nodes["h2"].connection_count == 7
+    # h1 and h3 are healthy (defaults).
+    assert state.nodes["h1"].is_down is False
+    assert state.nodes["h3"].is_down is False
+
+
+def test_merge_does_not_refresh_is_down_since_for_already_down_missing_node(
+    fresh_registry,
+):
+    """If a node was ALREADY marked down before this refresh, and is
+    again missing from the refresh result, ``is_down_since`` should NOT
+    be bumped to ``now`` — the policy's TTL would never expire, and the
+    node would stay quarantined indefinitely while genuinely up."""
+    state = _install_state(fresh_registry, ["h1", "h2"])
+    original_down_since = time.monotonic() - 10.0
+    state.nodes["h2"].is_down = True
+    state.nodes["h2"].is_down_since = original_down_since
+
+    new_nodes = [_make_node("h1")]  # h2 still missing
+    fresh_registry._merge_new_nodes(state, new_nodes)
+
+    assert state.nodes["h2"].is_down is True
+    assert state.nodes["h2"].is_down_since == original_down_since, (
+        "already-down node's timestamp must not be bumped on subsequent "
+        "missing-from-refresh observations — that would defeat the TTL"
+    )
+
+
+def test_merge_handles_new_host_appearing(fresh_registry):
+    """A host that was NOT previously known but appears in the refresh
+    is added with default state (count=0, is_down=False)."""
+    state = _install_state(fresh_registry, ["h1", "h2"])
+
+    new_nodes = [_make_node("h1"), _make_node("h2"), _make_node("h3")]
+    fresh_registry._merge_new_nodes(state, new_nodes)
+
+    assert "h3" in state.nodes
+    assert state.nodes["h3"].is_down is False
+    assert state.nodes["h3"].connection_count == 0
+
+
+def test_merge_clears_force_refresh(fresh_registry):
+    """A successful refresh clears the `force_refresh` flag — any
+    in-flight mark_failed flips set during the failed refresh are now
+    stale (we have a fresh authoritative topology)."""
+    state = _install_state(fresh_registry, ["h1"])
+    state.force_refresh = True
+
+    fresh_registry._merge_new_nodes(state, [_make_node("h1")])
+
+    assert state.force_refresh is False
