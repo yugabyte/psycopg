@@ -11,13 +11,23 @@ It composes:
      ``outgoing.tracked_conns`` (weakref-backed) and count conns with
      ``conn.info.transaction_status`` not in ``(IDLE, UNKNOWN)`` — those
      are "in a transaction" and cannot be safely severed.
-  3. **Force-close survivors at the deadline.** If ``drain_timeout_s`` is
-     positive and elapses with in-flight conns still open, ``conn.close()``
-     each. The application sees ``psycopg.OperationalError`` and treats
-     it like any transient disconnect. Sentinels:
+  3. **Force-close survivors at the deadline (parallel with hard-fd escape
+     hatch).** If ``drain_timeout_s`` is positive and elapses with
+     in-flight conns still open, fire ``conn.close()`` on every survivor
+     concurrently via a thread pool, bounded by
+     ``_KILL_AT_TIMEOUT_BUDGET_S`` (default 2 s). Any conn whose
+     ``close()`` hasn't returned within the budget gets its socket fd
+     hard-closed via ``os.close`` as an escape hatch — a stuck TCP
+     ``send()`` in libpq's ``PQfinish`` could otherwise block for
+     ``tcp_retries2`` (~15 min on Linux, worse with TCP keepalive
+     disabled), which would wedge the drain past its own deadline.
+     Bounds total drain wall-clock at
+     ``drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S`` regardless of TCP
+     state. The application sees ``psycopg.OperationalError`` and
+     treats it like any transient disconnect. Sentinels:
        * ``-1`` — wait indefinitely; never force-close.
        * ``0`` — force-close immediately; no drain window.
-       * ``N > 0`` — poll for N seconds, then force-close.
+       * ``N > 0`` — poll for N seconds, then parallel-close survivors.
   4. **Apply the status change and resume dispatch.** Under
      ``group.lock``, write the per-cluster status field + transition
      timestamp, then set ``dispatch_paused = False`` and notify all
@@ -37,7 +47,9 @@ See design doc §3.2 for the pseudocode.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import os
 import time
 import weakref
 from typing import TYPE_CHECKING
@@ -48,6 +60,29 @@ if TYPE_CHECKING:
     from .registry import ClusterState, FailoverGroup
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock budget for the parallel force-close phase — separate from
+# drainTimeoutSecs (which is the grace window for natural drain).
+# Rationale: libpq's PQfinish calls send() to push a Terminate byte
+# before closing the socket. On a wedged TCP session (peer unresponsive
+# or partitioned, keepalive disabled) that send() can block until the
+# OS's tcp_retries2 gives up — ~15 min on Linux default. A serial
+# for-loop of c.close() would therefore hang drain past its own
+# deadline. This budget bounds the parallel close phase; anything still
+# stuck at the end gets its fd hard-closed via os.close.
+_KILL_AT_TIMEOUT_BUDGET_S = 2.0
+
+
+def _safe_close(c) -> "Exception | None":
+    """Call ``c.close()``; return the exception if it raises, else
+    ``None``. Isolates a raising close so it doesn't blow up the
+    executor's worker thread — the caller tracks per-conn outcomes
+    and logs each individually."""
+    try:
+        c.close()
+        return None
+    except Exception as exc:
+        return exc
 
 # Transaction-status values that count as "in flight" (not drained). See
 # psycopg.pq.TransactionStatus:
@@ -288,37 +323,117 @@ def _drain_and_apply(
         # 4. Kill at timeout (step 3 in design doc §3). Force-close
         # any conns still in-flight at the deadline. Only reached with
         # a finite deadline; the -1 branch loops until in_txn is empty.
+        #
+        # Concurrency: fire close() on every survivor in parallel via
+        # a bounded thread pool. A serial for-loop of c.close() blocks
+        # on the FIRST hung TCP session for ~tcp_retries2 (up to ~15
+        # min on Linux, worse with keepalive=0), which would wedge
+        # drain past its own deadline. For any close() that doesn't
+        # return within _KILL_AT_TIMEOUT_BUDGET_S, escape via raw
+        # os.close on the socket fd — the libpq send() may still be
+        # blocked upstream, but from the driver's perspective the conn
+        # is disowned and drain proceeds. Bounds total wall-clock at
+        # drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S regardless of
+        # TCP state.
         if survivors:
             logger.warning(
                 "xCluster drain-wait deadline (%ss elapsed) — "
-                "force-closing %d survivor(s) on %s",
+                "force-closing %d survivor(s) on %s "
+                "(parallel, budget=%ss)",
                 drain_timeout_s, len(survivors), outgoing.uuid,
+                _KILL_AT_TIMEOUT_BUDGET_S,
             )
-        # One INFO per conn so operators can trace exactly which
-        # sessions got forced.
-        for c in survivors:
-            try:
-                # Snapshot addressable identity before close() nulls state.
+            # Snapshot fds BEFORE close() nulls the pgconn state —
+            # we need them for the hard-fd escape hatch.
+            snapshot = []
+            for c in survivors:
                 try:
-                    conn_id = f"conn=fd{c.pgconn.socket}"
+                    fd = c.pgconn.socket
+                    conn_id = f"conn=fd{fd}"
                 except Exception:
-                    conn_id = f"conn={id(c):x}"
-                c.close()
-                logger.info(
-                    "kill-at-timeout: %s force-closed (was in-flight on %s)",
-                    conn_id, outgoing.uuid,
+                    fd, conn_id = None, f"conn={id(c):x}"
+                snapshot.append((c, fd, conn_id))
+
+            hung = 0
+            # NB: intentionally NOT using `with ThreadPoolExecutor()` —
+            # its __exit__ calls shutdown(wait=True), which would block
+            # on hung workers and re-introduce the very problem we're
+            # solving. Manual instantiation + explicit shutdown(wait=
+            # False) in finally lets a stuck close() worker remain
+            # detached in the background; the driver-side conn is
+            # already disowned via os.close of its fd (see below), so
+            # the hang has no downstream effect. When the OS eventually
+            # gives up on the wedged send() (tcp_retries2), the worker
+            # unwinds naturally.
+            ex = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(survivors), 32),
+                thread_name_prefix="yb-kill",
+            )
+            try:
+                fut_by_conn = {
+                    ex.submit(_safe_close, c): (c, fd, conn_id)
+                    for c, fd, conn_id in snapshot
+                }
+                concurrent.futures.wait(
+                    list(fut_by_conn),
+                    timeout=_KILL_AT_TIMEOUT_BUDGET_S,
                 )
-            except Exception:
-                logger.log(
-                    5,   # TRACE
-                    "drain: close() raised on %r",
-                    c, exc_info=True,
-                )
-        if survivors:
+                for fut, (c, fd, conn_id) in fut_by_conn.items():
+                    if fut.done():
+                        exc = fut.result()
+                        if exc is None:
+                            logger.info(
+                                "kill-at-timeout: %s force-closed "
+                                "(was in-flight on %s)",
+                                conn_id, outgoing.uuid,
+                            )
+                        else:
+                            logger.log(
+                                5,   # TRACE
+                                "drain: close() raised on %s: %r",
+                                conn_id, exc,
+                            )
+                    else:
+                        # close() hung past the budget. Hard-close the
+                        # fd directly — releases the driver's grip
+                        # even though libpq's PQfinish send() may
+                        # still be blocked in the worker thread. The
+                        # OS closes the socket immediately; libpq's
+                        # blocked send() will error out when the peer
+                        # (or the closed local half) becomes evident.
+                        hung += 1
+                        if fd is not None:
+                            try:
+                                os.close(fd)
+                                logger.warning(
+                                    "kill-at-timeout: %s hard-fd-closed "
+                                    "(close() hung past %ss budget on %s)",
+                                    conn_id, _KILL_AT_TIMEOUT_BUDGET_S,
+                                    outgoing.uuid,
+                                )
+                            except OSError:
+                                # Either close() completed racily and
+                                # already released the fd, or the fd
+                                # was invalid to begin with. Nothing
+                                # more to do.
+                                pass
+                        else:
+                            logger.warning(
+                                "kill-at-timeout: %s close() hung and no "
+                                "fd available for hard-close (on %s)",
+                                conn_id, outgoing.uuid,
+                            )
+            finally:
+                # wait=False: never block on hung workers. Any still-
+                # running _safe_close call keeps executing after we
+                # return — its future is abandoned and it eventually
+                # unwinds when the OS releases the wedged send().
+                ex.shutdown(wait=False)
+
             logger.warning(
                 "kill-at-timeout complete on %s: %d force-closed "
-                "(primary_uuid=%s)",
-                outgoing.uuid, len(survivors), group.primary.uuid,
+                "(%d needed hard-fd escape hatch, primary_uuid=%s)",
+                outgoing.uuid, len(survivors), hung, group.primary.uuid,
             )
 
         # Phase 1 complete — record the boundary and log the outcome so
