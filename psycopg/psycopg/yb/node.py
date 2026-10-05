@@ -56,3 +56,9 @@ class NodeInfo:
     connection_count: int = 0
     is_down: bool = False
     is_down_since: float = 0.0  # time.monotonic() at failure
+    # Consecutive refreshes in which `yb_servers()` did not list this host.
+    # 0 while the host is listed; incremented on each refresh that omits it.
+    # The merge drops the host after `_MAX_ABSENCE_TICKS` consecutive misses
+    # (see `_merge_new_nodes` in registry.py) so a decommissioned node stops
+    # getting picked. A fresh-connect retry resets this to 0.
+    absent_refresh_count: int = 0
