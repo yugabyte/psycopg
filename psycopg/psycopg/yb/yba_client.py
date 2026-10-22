@@ -373,21 +373,50 @@ class YBAClient:
         xcluster_config_uuid: str,
         lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
     ) -> float | None:
-        """Return the current max committed replication lag for the given
-        xCluster config, in milliseconds. ``None`` means the metric
-        returned no usable data (config not reporting, or all traces
-        were the caught-up sentinel).
+        """Backward-compatible wrapper around :meth:`get_committed_lag_sample`
+        that returns only the lag value. ``None`` means "no trace at
+        all"; the all-caught-up case returns ``0.0`` (not ``None``).
+        Prefer the sample variant when the caller cares about
+        staleness (DB-24483)."""
+        sample = self.get_committed_lag_sample(xcluster_config_uuid, lookback_s)
+        return None if sample is None else sample[0]
 
-        Empirically confirmed against portal.dev (2026-08-20):
-        ``xClusterConfigUuid`` alone is sufficient — YBA does not need
-        ``nodePrefix`` when the config UUID is present. This lets us
-        skip the two ``/universes/{uuid}`` bootstrap calls that were
-        needed to resolve node prefixes.
+    def get_committed_lag_sample(
+        self,
+        xcluster_config_uuid: str,
+        lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
+    ) -> "tuple[float | None, float | None] | None":
+        """Return ``(lag_ms, sample_epoch_s)`` for the given xCluster
+        config: the max committed replication lag in milliseconds, and
+        the epoch seconds timestamp YBA stamped on the sample.
 
-        Raises :class:`YBAClientError` on transport / auth / parse failures.
-        The failover poll loop translates that into "one unreachable poll"
-        and moves on — three consecutive unreachables trigger the graceful
-        degradation path.
+          * ``lag_ms`` is always a float when a sample is returned.
+            All-caught-up / all-sentinel traces collapse to ``0.0``
+            with the newest matching sample's timestamp.
+          * ``sample_epoch_s`` may be ``None`` individually when YBA
+            returned no ``x`` axis in the trace (shouldn't happen in
+            practice but we handle it). Caller logs sample age as
+            unknown in that case.
+
+        The whole result is ``None`` when YBA returned no matching
+        trace at all (config not reporting / error block / malformed
+        payload). Caller distinguishes "no data at all" (None) from
+        "fully caught up" (``(0.0, ts)``). agent-K PR #15:392.
+
+        DB-24483: Shubham observed that YBA's default step (coarse,
+        derived from the 300 s window) could return a sample up to
+        ~30 s old. We now pass ``step=10`` explicitly so Prometheus
+        returns a point per 10 s — the newest sample is at most one
+        scrape old. The step doesn't change how fast Prometheus
+        actually scrapes the tservers; it only changes the resolution
+        YBA returns to us. The sample timestamp is surfaced here so
+        the Phase 2 lag-wait loop can log staleness and operators can
+        reason about which snapshot their failover trusted.
+
+        Raises :class:`YBAClientError` on transport / auth / parse
+        failures. The failover poll loop translates that into "one
+        unreachable poll" and moves on — three consecutive
+        unreachables trigger the graceful degradation path.
         """
         cid = self.get_session_info()
         end_ts = int(time.time())
@@ -398,9 +427,14 @@ class YBAClient:
             "end": str(end_ts),
             "metrics": ["tserver_async_replication_lag_micros"],
             "xClusterConfigUuid": xcluster_config_uuid,
+            # DB-24483: pin the step at 10 s so YBA returns one point
+            # per scrape interval instead of a coarse interpolation
+            # over the 300 s lookback window. Any value ≥ 1 s is
+            # accepted by YBA's /metrics endpoint.
+            "step": "10",
         }
         resp = self._request("POST", f"/customers/{cid}/metrics", body=body)
-        return _extract_committed_lag_ms(resp)
+        return _extract_committed_lag_sample(resp)
 
 
 # ------------------------------------------------------------------- helpers
@@ -414,17 +448,32 @@ def _normalize_url(url: str) -> str:
     return url.rstrip("/")
 
 
-def _latest_y_value(trace: dict) -> float | None:
-    """Return the last y-value in a Prometheus trace, or None if empty /
-    malformed. Bill's script does the same — using last() gives the most
-    recent datapoint in the metric window."""
+def _latest_xy(trace: dict) -> "tuple[float | None, float | None]":
+    """Return ``(y_value, x_timestamp_s)`` for the last point in a
+    Prometheus trace. DB-24483: callers that want to detect stale lag
+    samples need the timestamp alongside the value.
+
+    YBA returns ``x`` as a list of epoch milliseconds (strings). We
+    convert to seconds for consistency with ``time.time()``. Either
+    element may be ``None`` independently (e.g. ``y`` present but
+    malformed ``x``).
+    """
     y_values = trace.get("y") or []
-    if not y_values:
-        return None
-    try:
-        return float(y_values[-1])
-    except (TypeError, ValueError):
-        return None
+    x_values = trace.get("x") or []
+    y_out: float | None = None
+    x_out: float | None = None
+    if y_values:
+        try:
+            y_out = float(y_values[-1])
+        except (TypeError, ValueError):
+            pass
+    if x_values:
+        try:
+            # YBA sends epoch milliseconds as strings; normalise to seconds.
+            x_out = float(x_values[-1]) / 1000.0
+        except (TypeError, ValueError):
+            pass
+    return y_out, x_out
 
 
 def _max_lag_from_traces(
@@ -436,26 +485,47 @@ def _max_lag_from_traces(
       * ``0.0`` — all matching traces were at or below the caught-up ceiling
       * positive float — max ms across matching traces
     """
-    latest_values: list[float] = []
+    result = _max_lag_sample_from_traces(traces, name_hints)
+    return None if result is None else result[0]
+
+
+def _max_lag_sample_from_traces(
+    traces: list, name_hints: Iterable[str] = _COMMITTED_LAG_TRACE_NAMES,
+) -> "tuple[float | None, float | None] | None":
+    """Like :func:`_max_lag_from_traces` but also returns the sample
+    timestamp (DB-24483). Picks the x-timestamp of the trace whose
+    y-value won the max. For the all-caught-up case (returns 0.0),
+    returns the max sample timestamp across matching traces, so
+    callers see the newest "we checked" moment.
+    """
+    pairs: list[tuple[float, float | None]] = []
     for trace in traces:
         name = (trace.get("name") or trace.get("metricName") or "").strip()
         if name_hints and not any(hint in name for hint in name_hints):
             continue
-        v = _latest_y_value(trace)
-        if v is None:
+        y, x = _latest_xy(trace)
+        if y is None:
             continue
-        if v >= _NOT_REPORTED_THRESHOLD_MS or v < 0:
+        if y >= _NOT_REPORTED_THRESHOLD_MS or y < 0:
             # YBA "not reported" sentinel — skip this trace.
             continue
-        latest_values.append(v)
+        pairs.append((y, x))
 
-    if not latest_values:
+    if not pairs:
         return None
 
-    meaningful = [v for v in latest_values if v > _CAUGHT_UP_LAG_MS]
+    meaningful = [(y, x) for (y, x) in pairs if y > _CAUGHT_UP_LAG_MS]
     if meaningful:
-        return max(meaningful)
-    return 0.0
+        y, x = max(meaningful, key=lambda p: p[0])
+        return (y, x)
+    # All caught-up: return 0.0 and the newest sample timestamp among
+    # the matching traces (callers want "when did we last check?").
+    newest_ts = None
+    for _, x in pairs:
+        if x is None:
+            continue
+        newest_ts = x if newest_ts is None else max(newest_ts, x)
+    return (0.0, newest_ts)
 
 
 def _extract_committed_lag_ms(response: Any) -> float | None:
@@ -465,6 +535,16 @@ def _extract_committed_lag_ms(response: Any) -> float | None:
         {"tserver_async_replication_lag_micros":
             {"data": [{"name": "Committed Lag", "y": ["8.4", ...]}, ...]}}
     """
+    result = _extract_committed_lag_sample(response)
+    return None if result is None else result[0]
+
+
+def _extract_committed_lag_sample(
+    response: Any,
+) -> "tuple[float | None, float | None] | None":
+    """DB-24483 companion of :func:`_extract_committed_lag_ms` that
+    also returns the sample timestamp YBA stamped on the winning
+    trace. See :func:`_max_lag_sample_from_traces` for return shape."""
     if not isinstance(response, dict):
         return None
     block = response.get("tserver_async_replication_lag_micros")
@@ -475,4 +555,4 @@ def _extract_committed_lag_ms(response: Any) -> float | None:
     data = block.get("data")
     if not isinstance(data, list):
         return None
-    return _max_lag_from_traces(data)
+    return _max_lag_sample_from_traces(data)
