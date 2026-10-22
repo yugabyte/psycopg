@@ -169,10 +169,18 @@ class Connection(BaseConnection[Row]):
                 raise MissingCircuitBreakerError(
                     "Configuration error: 'yb.failover.secondaryClusterHosts' requires circuit breaker class to be configured. Exiting."
                 )
-            # Barrier: if a drain sequence has paused dispatch, block here
-            # until it releases. No timeout in the direct-connect path —
-            # the drain is bounded by drainTimeoutSecs, so the wait is
-            # inherently short.
+            # Barrier: if a drain sequence has paused dispatch, yield to
+            # the event loop here until it releases (DB-24838 part 1).
+            # No timeout in the direct-connect path — the wait is
+            # bounded by Phase 1 drain + Phase 2 lag wait. With
+            # drainTimeoutSecs=-1 the Phase 1 bound comes from the
+            # longest in-flight txn plus one drain-poll tick (H7
+            # DB-25012); with a finite drainTimeoutSecs the bound is
+            # drainTimeoutSecs itself. Must be the async variant: the
+            # sync one would block the event-loop OS thread for the
+            # entire drain window, stalling every other coroutine
+            # (handlers, timers, pool timeouts) alongside — DB-24838
+            # observed a 129.93 s stall on one failback.
             _wait_for_dispatch(failover_group)
             which = _active_cluster(failover_group)
             if which is None:

@@ -195,10 +195,18 @@ class FailoverGroup:
     dispatch_paused: bool = False
     # Condition bound to ``lock`` for pause/resume notify. Constructed in
     # ``__post_init__`` so it wraps whatever lock was passed in (or
-    # created by default).
+    # created by default). Used by sync ``wait_for_dispatch`` callers.
     dispatch_paused_condition: "threading.Condition | None" = field(
         default=None, repr=False,
     )
+    # Per-waiter async-event list for ``wait_for_dispatch_async``
+    # (DB-24838 part 1). The sync Condition would block an asyncio
+    # event-loop OS thread for the whole drain window; the async
+    # variant registers a per-call ``(loop, asyncio.Event)`` tuple
+    # here, and ``resume_dispatch`` fans out from the probe thread via
+    # ``loop.call_soon_threadsafe`` so each event loop stays
+    # responsive during the drain. Written under ``lock``.
+    async_dispatch_waiters: "list" = field(default_factory=list, repr=False)
 
     # YBA lag-wait phase (Amogh's flow, 2026-08-11). ``yba_client`` is set
     # by bootstrap when ``yba_endpoint`` + ``yba_api_token`` +
@@ -277,11 +285,32 @@ class FailoverGroup:
 
     def resume_dispatch(self) -> None:
         """Set ``dispatch_paused = False`` and notify all waiters. Called
-        from the drain sequence when the barrier releases."""
+        from the drain sequence when the barrier releases.
+
+        Fans out to both the sync ``threading.Condition`` (for the sync
+        connect path's ``wait_for_dispatch``) AND to every registered
+        async waiter's ``asyncio.Event`` via ``call_soon_threadsafe``
+        (DB-24838 part 1 — for ``wait_for_dispatch_async`` callers,
+        which run on arbitrary event loops in possibly different OS
+        threads). Each async loop is addressed on its own thread so no
+        loop is held hostage by the probe thread's resume call.
+        """
         with self.lock:
             self.dispatch_paused = False
             assert self.dispatch_paused_condition is not None
             self.dispatch_paused_condition.notify_all()
+            # Snapshot + clear async waiters under the lock so a new
+            # waiter arriving concurrently doesn't miss the resume.
+            waiters = list(self.async_dispatch_waiters)
+            self.async_dispatch_waiters.clear()
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                # Event loop was closed (app shut down between pause
+                # and resume). The waiter's coroutine will see this
+                # as a cancelled/stuck wait; nothing we can do here.
+                pass
 
     def wait_for_first_check(self, timeout_s: "float | None" = None) -> bool:
         """Block until each attached CB has completed its first
