@@ -170,10 +170,13 @@ def test_no_drain_when_transition_is_none_to_secondary(fake_state):
 def test_primary_flip_drains_primary_and_flips_dispatch(fake_state):
     """primary HEALTHY → UNHEALTHY, secondary HEALTHY → routing changes
     primary → secondary. The barrier fires: dispatch_paused during the
-    drain, and primary's idle conns are counted (nothing to close),
+    drain, every tracked conn on primary (in-flight AND idle) is
+    closed at the flip boundary (DB-24801 — IDLE is a transient state
+    between commits, so leaving an idle direct conn alive post-flip
+    lets it commit on the outgoing universe on its next cursor call),
     then dispatch resumes."""
     group = _make_group(fake_state)
-    # An IDLE conn on primary — counts as drained already.
+    # An IDLE conn on primary — closed at the flip boundary per DB-24801.
     idle_conn = _FakeConn(TransactionStatus.IDLE)
     group.primary.tracked_conns.add(idle_conn)
 
@@ -209,7 +212,7 @@ def test_primary_flip_drains_primary_and_flips_dispatch(fake_state):
     assert group.primary_status == HealthResult.UNHEALTHY
     assert group.secondary_status == HealthResult.HEALTHY
     assert group.dispatch_paused is False, "should resume after drain"
-    assert idle_conn.closed is False   # IDLE counts as drained; not force-closed
+    assert idle_conn.closed is True   # DB-24801 fix: closed at flip boundary
     # Barrier semantics: pause fired exactly once, resume fired exactly
     # once. Removes the race condition the old sampler-based assertion
     # had.
@@ -265,9 +268,12 @@ def test_drain_timeout_positive_waits_then_kills(fake_state):
     assert 0.9 < elapsed < 1.8, f"expected ~1s drain, took {elapsed:.2f}s"
 
 
-def test_drain_timeout_negative_one_never_kills(fake_state):
-    """drain_timeout_s = -1 → wait indefinitely; if the conn transitions
-    to IDLE naturally, drain ends cleanly with no force-close."""
+def test_drain_timeout_negative_one_waits_then_closes_idle_at_flip(fake_state):
+    """drain_timeout_s = -1 → wait indefinitely for in-flight to drain;
+    never force-close in-flight (that's what the -1 sentinel promises).
+    But once in-flight is empty, close the conn at the flip boundary
+    anyway (DB-24801 — leaving the now-idle conn alive would let it
+    commit on the outgoing universe on its next cursor call)."""
     group = _make_group(fake_state)
     conn = _FakeConn(TransactionStatus.INTRANS)
     group.primary.tracked_conns.add(conn)
@@ -291,7 +297,11 @@ def test_drain_timeout_negative_one_never_kills(fake_state):
     elapsed = time.monotonic() - t0
     t.join(timeout=1.0)
 
-    assert conn.closed is False, "drain_timeout=-1 must never force-close"
+    # DB-24801: idle survivors are closed at the flip boundary even
+    # with -1, because the dual-write risk is independent of the
+    # drain-timeout sentinel. The -1 promise is "never force-close
+    # IN-FLIGHT", which we honour by waiting until it goes idle first.
+    assert conn.closed is True
     assert 0.15 < elapsed < 1.5, f"expected ~0.2s wait, got {elapsed:.2f}s"
     assert group.primary_status == HealthResult.UNHEALTHY
 
@@ -325,7 +335,8 @@ def test_drain_completes_before_deadline_when_conns_drain_naturally(
     assert 0.1 < elapsed < 1.5, (
         f"drain should end when conn goes idle, took {elapsed:.2f}s"
     )
-    assert conn.closed is False   # committed cleanly; not force-closed
+    assert conn.closed is True   # DB-24801 fix: closed at flip boundary
+                                  # even though the txn drained naturally
 
 
 # ============================================================
