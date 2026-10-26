@@ -20,6 +20,7 @@ adaptations for Python:
 from __future__ import annotations
 
 import logging
+import os
 import time
 import threading
 import weakref
@@ -38,6 +39,139 @@ logger = logging.getLogger(__name__)
 # gone at the fastest xCluster probe cadence — both well past a graceful
 # tserver restart.
 _MAX_ABSENCE_TICKS = 3
+
+
+# ------------------------------------------------------------------- fork safety
+#
+# DB-25060: pre-fork servers (gunicorn --preload, Celery prefork, multiprocessing
+# with 'fork' start) are the dominant Python production deployment. If the app
+# calls bootstrap_failover_group BEFORE forking (which gunicorn --preload does
+# by design), the child inherits:
+#
+#   * The parent's ClusterRegistry singleton snapshot — including the
+#     FailoverGroup objects with their CB attachments.
+#   * BUT: only the forking thread survives. Probe threads are gone.
+#   * BUT: threading primitives (Lock, Condition, Event) hold inherited state
+#     that doesn't apply here. A lock the parent held at fork is now a
+#     locked-but-ownerless lock in the child → deadlock on first use.
+#   * BUT: control-connection sockets are shared with the parent. Writes race.
+#
+# Without a hook, the child never follows a failover: it has no probe thread
+# running, so routing stays at the status flag it had at fork time; its
+# dispatch_paused is its own copy, so the parent's drain never gates its
+# connects; and its socket writes stomp on the parent's.
+#
+# Fix: register a `after_in_child` hook that rebuilds the fork-unsafe state in
+# every FailoverGroup and restarts the probe threads in the child.
+#
+# We register ONCE, lazily, when the first probe starts — so test suites that
+# never bootstrap a failover group don't incur the hook at all. On platforms
+# where os.register_at_fork isn't available (Windows), registration no-ops.
+
+_FORK_HOOK_REGISTERED = False
+_FORK_HOOK_LOCK = threading.Lock()
+
+
+def _register_fork_hook_once() -> None:
+    """Register `_after_fork_in_child` with `os.register_at_fork`, exactly
+    once per process. Called from `_start_probe` so test runs that never
+    construct a FailoverGroup don't register anything."""
+    global _FORK_HOOK_REGISTERED
+    if _FORK_HOOK_REGISTERED:
+        return
+    with _FORK_HOOK_LOCK:
+        if _FORK_HOOK_REGISTERED:
+            return
+        try:
+            os.register_at_fork(after_in_child=_after_fork_in_child)
+            _FORK_HOOK_REGISTERED = True
+            logger.debug("xcluster fork-safety hook registered (DB-25060)")
+        except (AttributeError, OSError):
+            # Windows / embedded Python without fork support — nothing
+            # to do.
+            _FORK_HOOK_REGISTERED = True
+
+
+def _after_fork_in_child() -> None:
+    """Called in the child process after `os.fork()`. Rebuilds the state
+    inside every FailoverGroup that doesn't survive fork, then restarts
+    the probe threads.
+
+    Design doc §DB-25060:
+      * KEEP: CB attachments (app installed them on the parent; CBs are
+        typically stateless config objects or carry their own fork-safe
+        state).
+      * KEEP: primary_status / secondary_status — reflect what the probe
+        last observed; child continues routing on that until its own
+        probe reconfirms. (If parent flipped to secondary before fork,
+        child should also start on secondary, not reset to primary.)
+      * REBUILD: group.lock, dispatch_paused_condition, async_dispatch_waiters
+        — threading primitives aren't fork-safe.
+      * REBUILD: per-cluster lock, tracked_conns — fork-copied.
+      * DROP:    control_sync / control_async — fork-shared sockets, child
+                 must open fresh ones.
+      * DROP:    primary_probe / secondary_probe references — the threads
+                 are gone, _start_probe will create fresh ones.
+      * DROP:    yba_client's persistent HTTP conn (same reason as control
+                 conns).
+      * RESET:   dispatch_paused — child doesn't inherit parent's drain.
+      * RESET:   last_transition_time — child can transition on first tick.
+    """
+    inst = ClusterRegistry._instance
+    if inst is None:
+        return
+    # Registry-level lock: fork-unsafe.
+    inst._lock = threading.Lock()
+    # agent-K PR #16:127. Don't wholesale-drop `_clusters` / `_key_to_uuid`
+    # — the group's primary/secondary ClusterState objects are the ones
+    # the dispatcher routes through, so orphaning them means the next
+    # connect bootstraps a NEW ClusterState for the same uuid; the group
+    # cache then returns the OLD group whose per-host counters live on
+    # the OLD state (which is no longer in `_clusters`), so decrement /
+    # mark_failed by uuid never finds it. Keep the entries for states
+    # that belong to a live group; drop the ones that don't.
+    group_state_ids = set()
+    for grp in inst._failover_groups.values():
+        for st in (grp.primary, grp.secondary):
+            if st is not None:
+                group_state_ids.add(id(st))
+    inst._clusters = {
+        uuid: st for uuid, st in inst._clusters.items()
+        if id(st) in group_state_ids
+    }
+    inst._key_to_uuid = {
+        key: uuid for key, uuid in inst._key_to_uuid.items()
+        if uuid in inst._clusters
+    }
+    # Fix up every failover group in place.
+    groups = list(inst._failover_groups.values())
+    for group in groups:
+        try:
+            group._reset_for_child()
+        except Exception:
+            # Defensive: if a group's reset raises for whatever reason,
+            # don't blow up the whole fork hook. The group may be in a
+            # broken state but at least other groups still get fixed.
+            logger.warning(
+                "xcluster fork reset failed for group primary_uuid=%s",
+                getattr(getattr(group, "primary", None), "uuid", "?"),
+                exc_info=True,
+            )
+    # Restart probes using the stashed per-group params.
+    for group in groups:
+        try:
+            inst._start_probe(
+                group,
+                group._probe_interval_s,
+                group._probe_check_timeout_s,
+                group._probe_drain_timeout_s,
+            )
+        except Exception:
+            logger.warning(
+                "xcluster probe restart failed for group primary_uuid=%s",
+                getattr(getattr(group, "primary", None), "uuid", "?"),
+                exc_info=True,
+            )
 
 
 def _safe_host(conn) -> str:
@@ -181,6 +315,12 @@ class FailoverGroup:
     # health_probe.HealthProbe.
     primary_probe: "object | None" = None
     secondary_probe: "object | None" = None
+    # Probe-construction params stashed at bootstrap so the fork-safety
+    # hook (DB-25060) can rebuild probes in the child process without
+    # re-reading YBParams. Set by ``ClusterRegistry._start_probe``.
+    _probe_interval_s: int = 5
+    _probe_check_timeout_s: float = 1.0
+    _probe_drain_timeout_s: int = 10
     # The per-cluster CircuitBreaker instances. The driver does NOT install
     # a default — applications MUST attach implementations after calling
     # bootstrap_failover_group and before any psycopg.connect() traffic.
@@ -375,6 +515,81 @@ class FailoverGroup:
         with self.lock:
             self.secondary_status = status
             self.secondary_last_transition_time = now
+
+    def _reset_for_child(self) -> None:
+        """DB-25060 fork-safety reset. Called in-child from
+        ``_after_fork_in_child``.
+
+        Rebuilds every piece of state that doesn't survive ``os.fork()``:
+
+          * threading.Lock + Condition (parent's hold-state is nonsense in
+            the child, so a locked lock in the parent at fork time becomes
+            a locked-but-ownerless lock in the child → deadlock)
+          * dispatch_paused flag (child doesn't inherit parent's drain)
+          * tracked_conns (parent's conns, not ours)
+          * control_sync / control_async (fork-shared sockets)
+          * primary_probe / secondary_probe references (threads are gone)
+          * YBAClient's persistent HTTP connection (fork-shared socket)
+
+        Preserves what should survive:
+
+          * CB attachments
+          * primary_status / secondary_status (routing continuity — if the
+            parent had failed over to secondary, child should start on
+            secondary too, not reset to primary and wait for its first probe
+            tick to re-discover the fact)
+          * yb_params-derived config (cooldown, auto_failback, thresholds,
+            YBA endpoint URL)
+          * ``_probe_*_s`` stash so the restart in ``_after_fork_in_child``
+            can rebuild probes with the original params
+        """
+        # Registry-level primitives
+        self.lock = threading.Lock()
+        self.dispatch_paused_condition = threading.Condition(self.lock)
+        self.dispatch_paused = False
+        self.async_dispatch_waiters = []
+        # agent-K PR #16:515. KEEP the parent's cool-down timestamps.
+        # ``time.monotonic()`` is shared across fork on the same host,
+        # so the parent's windows are directly comparable in the child.
+        # Zeroing them lets the child flip back immediately after a
+        # parent-initiated failover; the parent (and other workers)
+        # stay on the new side for the remainder of the cooldown,
+        # producing exactly the split-brain this ticket is about.
+        # Null out probe references — the threads are gone; the registry's
+        # fork hook will restart them.
+        self.primary_probe = None
+        self.secondary_probe = None
+        # Per-cluster: fresh lock, dropped sockets, dropped WeakSet.
+        for state in (self.primary, self.secondary):
+            state.lock = threading.Lock()
+            state.tracked_conns = weakref.WeakSet()
+            # DROP (don't close) — closing would FIN the socket that is
+            # still shared with the parent. Null out the references and
+            # let the parent own its own copies.
+            state.control_sync = None
+            state.control_async = None
+            state.force_refresh = True   # next tick re-reads yb_servers()
+        # YBAClient: drop its persistent HTTP connection AND rebuild
+        # ``_lock``. The fork may have landed with the lock held — a
+        # Phase-2 lag poll on the parent takes the lock for the whole
+        # HTTP round-trip (yba_client.py:_request), and
+        # HealthAndLagCircuitBreaker.check acquires it on every
+        # unhealthy tick. A locked-but-ownerless lock in the child
+        # wedges every subsequent ``get_committed_lag_sample`` call
+        # forever: drain blocks → ``resume_dispatch`` never runs →
+        # new child connects hang in ``wait_for_dispatch``. Dropping
+        # ``_conn`` alone is not enough — the lock itself must be
+        # replaced. Agent-K PR #16:537. We do NOT close() the client:
+        # that would FIN the parent's shared socket.
+        if self.yba_client is not None:
+            try:
+                self.yba_client._conn = None    # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                self.yba_client._lock = threading.Lock()  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
     def can_transition_primary(self, now: float) -> bool:
         """Return True iff the cool-down window has elapsed since the last
@@ -901,6 +1116,12 @@ class ClusterRegistry:
         ``drain.trigger_drain`` with ``drain_timeout_s`` (Phase E).
         Idempotent — safe to call twice."""
         from .health_probe import HealthProbe       # late import; cycle-safe
+        # Stash the construction params so the fork-safety hook
+        # (DB-25060) can rebuild probes in the child without replaying
+        # YBParams.
+        group._probe_interval_s = interval_s
+        group._probe_check_timeout_s = check_timeout_s
+        group._probe_drain_timeout_s = drain_timeout_s
         if group.primary_probe is None:
             p = HealthProbe(
                 group, interval_s,
@@ -919,6 +1140,9 @@ class ClusterRegistry:
             )
             group.secondary_probe = s
             s.start()
+        # Register the fork-safety hook (idempotent via a module-level
+        # flag; see `_register_fork_hook_once`).
+        _register_fork_hook_once()
 
     def get_failover_group(self, primary_uuid: str) -> "FailoverGroup | None":
         """Lookup by primary uuid. Returns None if no group exists for it."""
