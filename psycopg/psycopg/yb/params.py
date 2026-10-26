@@ -111,6 +111,12 @@ _PURE_YB_KEYS = frozenset({
     "yb_failover_global_time_budget_secs",
     # Auto-failback toggle (bool; default true).
     "yb_failover_auto_failback_enabled",
+    # Phase 2 timeout policy (DB-corruption fix). Values: 'fail' (default)
+    # or 'proceed'. On 'fail', when Phase 2 times out before lag converges
+    # the drain stays on the current side (does NOT flip to a known-stale
+    # target). On 'proceed', the pre-fix behavior is preserved: flip
+    # anyway and accept the data-consistency risk.
+    "yb_failover_on_phase2_timeout",
     # Failback namespace — optional overrides for the reverse (B→A)
     # direction. See design doc §3.5.1. Fallback rules:
     #   * replicationName: NO fallback (points to a different xCluster
@@ -150,6 +156,12 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failover[._-](?:lagWaitTimeoutSecs|lag[._-]wait[._-]timeout[._-]secs)"
     r"|yb[._-]failover[._-](?:globalTimeBudgetSecs|global[._-]time[._-]budget[._-]secs)"
     r"|yb[._-]failover[._-](?:autoFailbackEnabled|auto[._-]failback[._-]enabled)"
+    # agent-K PR #18:119 — ``onPhase2Timeout`` was missing from the key
+    # splitter regex, so a DSN containing it bled through to libpq
+    # unchanged. Every connect then failed with "invalid connection
+    # option 'yb.failover.onphase2timeout'" and the knob was silently
+    # ignored. Fix: list it alongside the other failover keys.
+    r"|yb[._-]failover[._-](?:onPhase2Timeout|on[._-]phase2[._-]timeout)"
     # Failback namespace — same knob names as yb.failover.* but under
     # the yb.failback.* prefix; each is an optional per-direction override.
     r"|yb[._-]failback[._-](?:replicationName|replication[._-]name)"
@@ -198,6 +210,7 @@ _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failover_lagwaittimeoutsecs":            "yb_failover_lag_wait_timeout_secs",
     "yb_failover_globaltimebudgetsecs":          "yb_failover_global_time_budget_secs",
     "yb_failover_autofailbackenabled":           "yb_failover_auto_failback_enabled",
+    "yb_failover_onphase2timeout":               "yb_failover_on_phase2_timeout",
     # Failback namespace.
     "yb_failback_replicationname":               "yb_failback_replication_name",
     "yb_failback_draintimeoutsecs":              "yb_failback_drain_timeout_secs",
@@ -305,6 +318,20 @@ class YBParams:
     # after primary recovers — operator must trigger failback manually
     # (write to the ExternalSignalCircuitBreaker's signal table).
     auto_failback_enabled: bool = DEFAULT_AUTO_FAILBACK_ENABLED
+
+    # Phase 2 timeout policy — determines what happens when the YBA lag
+    # wait exceeds ``lag_wait_timeout_s`` without converging.
+    #
+    # ``"fail"`` (default): the drain does NOT flip routing. Dispatch
+    #     unpauses, status stays on the current side, a WARNING is
+    #     logged, and the probe thread will try again on its next tick.
+    #     Protects against DB corruption from flipping to a target that
+    #     is known to be behind.
+    #
+    # ``"proceed"``: the pre-fix behavior — flip anyway and accept the
+    #     data-consistency risk. Operators who want aggressive failover
+    #     under lag-source outages can opt in.
+    on_phase2_timeout: str = "fail"
 
     # Failback overrides (design doc §3.5.1). Each is populated at
     # parse time with either the operator's ``yb.failback.<knob>`` value
@@ -565,6 +592,21 @@ def extract_yb_params(
         else:
             auto_failback_enabled = DEFAULT_AUTO_FAILBACK_ENABLED
 
+    # Phase 2 timeout policy. 'fail' (default) means do not flip when
+    # lag doesn't converge; 'proceed' preserves pre-fix behavior.
+    on_phase2_timeout_raw = raw.get("yb_failover_on_phase2_timeout")
+    if on_phase2_timeout_raw is None:
+        on_phase2_timeout = "fail"
+    else:
+        low = on_phase2_timeout_raw.strip().lower()
+        if low in ("fail", "proceed"):
+            on_phase2_timeout = low
+        else:
+            raise ValueError(
+                "yb.failover.onPhase2Timeout must be 'fail' or 'proceed', "
+                f"got {on_phase2_timeout_raw!r}"
+            )
+
     # ==================== Failback (reverse-direction overrides) =====
     # All of these are optional overrides. When absent, the failback
     # side of the drain reuses the failover value — except
@@ -709,6 +751,7 @@ def extract_yb_params(
             yba_connect_timeout_s=yba_connect_timeout_s,
             yba_read_timeout_s=yba_read_timeout_s,
             auto_failback_enabled=auto_failback_enabled,
+            on_phase2_timeout=on_phase2_timeout,
             failback_replication_name=failback_replication_name,
             failback_drain_timeout_s=failback_drain_timeout_s,
             failback_lag_wait_timeout_s=failback_lag_wait_timeout_s,
