@@ -66,6 +66,7 @@ import time
 import weakref
 from typing import TYPE_CHECKING
 
+from . import TRACE
 from .health import HealthResult
 
 if TYPE_CHECKING:
@@ -102,14 +103,15 @@ _KILL_AT_TIMEOUT_BUDGET_S = 2.0
 
 def _release_registry_count(c) -> None:
     """Mirror what ``Connection.close`` does for the registry's per-host
-    counter. The async branch below bypasses ``AsyncConnection.close``
-    (DB-24960) and calls ``pgconn.finish()`` directly — doing so skips
-    the normal close path that calls ``ClusterRegistry.decrement``,
-    leaving the per-host ``connection_count`` permanently high after
-    every drain of async conns. The dispatcher's least-loaded policy
-    then starves that host for the rest of the process lifetime
-    (agent-K PR #13:111). Call this manually on any close path that
-    doesn't flow through ``Connection.close``.
+    counter. The async and pool branches below bypass ``Connection.close``
+    (DB-24960 and the pool's ``close_returns=True`` reroute) by calling
+    ``pgconn.finish()`` directly — doing so skips the normal close path
+    that calls ``ClusterRegistry.decrement``, leaving the per-host
+    ``connection_count`` permanently high after every drain. The
+    dispatcher's least-loaded policy then starves that host for the
+    rest of the process lifetime (agent-K PR #13:111). Call this
+    manually on any close path that doesn't flow through
+    ``Connection.close``.
     """
     uuid = getattr(c, "_yb_uuid", None)
     host = getattr(c, "_yb_host", None)
@@ -126,7 +128,37 @@ def _release_registry_count(c) -> None:
         pass
 
 
-def _safe_close(c) -> "Exception | None":
+# Budget for acquiring the per-conn lock in ``_safe_close`` before
+# escalating to the hard-fd escape hatch. Covers two separate races:
+#
+#   * On the C build, the owner thread holds ``Connection.lock``
+#     around each libpq call (cursor.py:112,127,168,324,342). Closing
+#     the conn without acquiring that lock frees libpq state while
+#     the owner is still inside ``consuming input`` → segfault,
+#     IndexError-from-inside-psycopg, or NULL conn pointer. Shubham
+#     observed all three in DB-25090 (2 / 19 drains on C, 0 / 5 pure
+#     Python in the same run).
+#   * The owner may be blocked on a network read inside libpq. The
+#     lock will stay held until the OS unblocks it. If drain times
+#     out here it falls back to the existing hard-fd escape hatch,
+#     same as a stuck ``close()``.
+#
+# 1.5 s leaves ~500 ms of the ``_KILL_AT_TIMEOUT_BUDGET_S`` budget for
+# the actual close + hard-fd escalation. For the IDLE-close path
+# (H7) the lock is almost always free and the acquire returns
+# instantly.
+_SAFE_CLOSE_LOCK_BUDGET_S = 1.5
+
+
+class _CloseLockTimeoutError(Exception):
+    """``_safe_close`` could not acquire the connection's lock within
+    ``_SAFE_CLOSE_LOCK_BUDGET_S`` — owner is inside a libpq call that
+    didn't return. Caller escalates to the hard-fd escape hatch.
+    DB-25090 (C-build thread-safety).
+    """
+
+
+def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
     """Call close on ``c``; return the exception if it raises, else
     ``None``. Isolates a raising close so it doesn't blow up the
     executor's worker thread — the caller tracks per-conn outcomes
@@ -145,6 +177,23 @@ def _safe_close(c) -> "Exception | None":
     counter manually on this path (agent-K PR #13:111) because
     ``pgconn.finish()`` doesn't walk the normal ``Connection.close``
     teardown.
+
+    Thread safety (DB-25090): sync conns ship with a ``Connection.lock``
+    that cursor operations already acquire around every libpq call
+    (``cursor.py: with self._conn.lock``). Acquire it here with a
+    bounded wait before touching libpq, so we never free pgconn state
+    while a worker thread is still inside ``consuming input`` or
+    equivalent. On the C build the race corrupts libpq → NULL conn
+    pointer, IndexError from inside psycopg, or process death. On
+    pure Python it corrupts result handling (less dramatic but still
+    an incorrect error for the worker). If the lock stays held past
+    the budget, return ``_CloseLockTimeoutError`` so the caller
+    escalates to the existing hard-fd escape hatch.
+
+    Async conns don't get this treatment: their ``.lock`` is an
+    ``asyncio.Lock`` and acquiring it from the drain thread would be
+    a cross-thread asyncio-lock call (undefined behavior). The
+    residual async finish-race is tracked separately.
     """
     try:
         # Lazy import — ``..connection_async`` pulls ``.yb.state`` which
@@ -172,7 +221,42 @@ def _safe_close(c) -> "Exception | None":
             finally:
                 _release_registry_count(c)
             return None
-        c.close()
+        # Sync branch — acquire the per-conn lock first (DB-25090).
+        # Missing lock on a mock / test shim: fall through to the
+        # direct close path (what we did pre-fix). Real Connection
+        # instances always have one.
+        lock = getattr(c, "lock", None)
+        if lock is None:
+            c.close()
+            return None
+        # Lock-acquire budget: lock_timeout_s=None means use default
+        # (_SAFE_CLOSE_LOCK_BUDGET_S); lock_timeout_s=0 means
+        # non-blocking (agent-K PR #21:146 — the idle-close path
+        # should NOT stall 1.5 s per conn whose owner is in a long
+        # libpq call like LISTEN/NOTIFY; it just skips and retries
+        # the next tick).
+        budget = (
+            lock_timeout_s
+            if lock_timeout_s is not None
+            else _SAFE_CLOSE_LOCK_BUDGET_S
+        )
+        if budget <= 0:
+            if not lock.acquire(blocking=False):
+                return _CloseLockTimeoutError(
+                    "conn.lock held and non-blocking acquire failed; "
+                    "will retry next tick"
+                )
+        else:
+            if not lock.acquire(timeout=budget):
+                return _CloseLockTimeoutError(
+                    f"could not acquire conn.lock within "
+                    f"{budget}s — owner thread is "
+                    f"inside libpq; escalate to hard-fd close (DB-25090)"
+                )
+        try:
+            c.close()
+        finally:
+            lock.release()
         return None
     except Exception as exc:
         return exc
@@ -240,9 +324,21 @@ def _close_idle_tracked_during_drain(
             # Broken conn / stale weakref / in the middle of a status
             # read race — treat as "do nothing", the next tick retries.
             continue
-        exc = _safe_close(c)
+        # agent-K PR #21:146 — use non-blocking lock acquire here.
+        # An IDLE conn whose owner is in a long libpq call (e.g.
+        # LISTEN/NOTIFY) would otherwise stall the drain poll by
+        # 1.5 s per such conn. Skip + retry next tick instead.
+        exc = _safe_close(c, lock_timeout_s=0)
         if exc is None:
             closed += 1
+        elif isinstance(exc, _CloseLockTimeoutError):
+            # Owner's holding the lock — not stuck, just long-running.
+            # Next poll will retry.
+            logger.log(
+                TRACE,
+                "drain: idle-close skipped on %s (lock held, retry next tick)",
+                outgoing_uuid,
+            )
         else:
             # Rare — _safe_close on an IDLE conn mostly just calls
             # pgconn.finish(). If it raised, log at debug (not warning)
@@ -571,6 +667,27 @@ def _drain_and_apply(
                     timeout=_KILL_AT_TIMEOUT_BUDGET_S,
                 )
                 for fut, (c, fd, conn_id) in fut_by_conn.items():
+                    needs_hard_close = False
+                    # agent-K PR #21:672 blocker. The hard-fd escape
+                    # hatch is only safe when `_closed=True` has been
+                    # set on the conn — then the driver has disowned it
+                    # and the owner thread won't touch it again. On the
+                    # hung-close branch, `_safe_close` has already set
+                    # `_closed=True` before `c.close()` started blocking.
+                    # On the lock-timeout branch (DB-25090), `_closed`
+                    # is still False and the owner is still inside
+                    # libpq holding a PGconn whose fd we are about to
+                    # free; Linux will give the next socket the lowest
+                    # free fd (likely this one), the owner's next libpq
+                    # read/write hits a different conn → cross-conn
+                    # protocol corruption. On that branch use
+                    # `shutdown(SHUT_RDWR)` instead: it unblocks the
+                    # owner's blocked read/write but keeps the fd
+                    # number reserved so no reuse race, and the
+                    # owner's eventual close() finishes teardown
+                    # cleanly (including ClusterRegistry.decrement).
+                    hard_close_mode = "close"   # vs "shutdown"
+                    hard_close_reason = ""
                     if fut.done():
                         exc = fut.result()
                         if exc is None:
@@ -593,6 +710,24 @@ def _drain_and_apply(
                                     "(was in-flight on %s)",
                                     conn_id, outgoing.uuid,
                                 )
+                        elif isinstance(exc, _CloseLockTimeoutError):
+                            # Owner thread is inside libpq and didn't
+                            # release conn.lock in time (DB-25090). The
+                            # conn is still alive on the outgoing side
+                            # from the driver's point of view, which
+                            # means the owner can still issue the next
+                            # cursor call on this socket post-flip and
+                            # dual-write. Use the shutdown-not-close
+                            # variant so we unblock the owner's libpq
+                            # call without racing fd reuse (agent-K
+                            # PR #21:672).
+                            needs_hard_close = True
+                            hard_close_mode = "shutdown"
+                            hard_close_reason = (
+                                f"lock held past "
+                                f"{_SAFE_CLOSE_LOCK_BUDGET_S}s "
+                                f"(owner inside libpq, DB-25090)"
+                            )
                         else:
                             logger.log(
                                 5,   # TRACE
@@ -607,14 +742,67 @@ def _drain_and_apply(
                         # OS closes the socket immediately; libpq's
                         # blocked send() will error out when the peer
                         # (or the closed local half) becomes evident.
+                        needs_hard_close = True
+                        hard_close_reason = (
+                            f"close() hung past "
+                            f"{_KILL_AT_TIMEOUT_BUDGET_S}s budget"
+                        )
+                    if needs_hard_close:
                         hung += 1
                         if fd is not None:
                             try:
-                                os.close(fd)
+                                if hard_close_mode == "shutdown":
+                                    # agent-K PR #21:672 — SHUT_RDWR
+                                    # unblocks the owner's libpq read /
+                                    # write without freeing the fd
+                                    # number. Owner's eventual close()
+                                    # (triggered by the broken-socket
+                                    # error their next call sees) runs
+                                    # the full Connection.close path
+                                    # including the registry decrement.
+                                    #
+                                    # Agent-K PR #21:G4 — hold the
+                                    # socket in a local, then call
+                                    # ``detach()`` so the socket
+                                    # object's ``__del__`` does NOT
+                                    # close the fd when it is GC'd
+                                    # right after this block. The whole
+                                    # point of using ``shutdown``
+                                    # instead of ``os.close`` is to
+                                    # keep the fd number reserved so
+                                    # the owner thread's stale libpq
+                                    # read/write can't race a reused
+                                    # fd belonging to another conn;
+                                    # a GC'd socket silently defeated
+                                    # that reservation.
+                                    import socket as _socket
+                                    try:
+                                        sock = _socket.socket(fileno=fd)
+                                        try:
+                                            sock.shutdown(_socket.SHUT_RDWR)
+                                        finally:
+                                            # Releases ownership of the
+                                            # fd back to the kernel's
+                                            # ``close`` boundary (the
+                                            # owner thread will do it);
+                                            # the socket's ``__del__``
+                                            # becomes a no-op.
+                                            sock.detach()
+                                    except OSError:
+                                        # fd already gone / not a socket
+                                        pass
+                                else:
+                                    os.close(fd)
                                 logger.warning(
-                                    "kill-at-timeout: %s hard-fd-closed "
-                                    "(close() hung past %ss budget on %s)",
-                                    conn_id, _KILL_AT_TIMEOUT_BUDGET_S,
+                                    "kill-at-timeout: %s %s "
+                                    "(%s on %s)",
+                                    conn_id,
+                                    (
+                                        "hard-fd-shutdown"
+                                        if hard_close_mode == "shutdown"
+                                        else "hard-fd-closed"
+                                    ),
+                                    hard_close_reason,
                                     outgoing.uuid,
                                 )
                             except OSError:
@@ -625,9 +813,9 @@ def _drain_and_apply(
                                 pass
                         else:
                             logger.warning(
-                                "kill-at-timeout: %s close() hung and no "
-                                "fd available for hard-close (on %s)",
-                                conn_id, outgoing.uuid,
+                                "kill-at-timeout: %s needs hard-close but "
+                                "no fd available (%s on %s)",
+                                conn_id, hard_close_reason, outgoing.uuid,
                             )
             finally:
                 # wait=False: never block on hung workers. Any still-
