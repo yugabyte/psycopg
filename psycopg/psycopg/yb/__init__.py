@@ -107,6 +107,31 @@ class MissingCircuitBreakerError(_OperationalError):
     """
 
 
+class ConflictingFailoverConfigError(_OperationalError):
+    """Raised by ``bootstrap_failover_group`` (and its async sibling) when
+    called a second time for the same universe pair with different
+    failover-governing knobs.
+
+    The registry dedups groups by ``universe_uuid`` — one FailoverGroup
+    per pair per process. A second explicit bootstrap with a different
+    ``drainTimeoutSecs`` (or any other failover-governing knob) silently
+    used the first bootstrap's group pre-fix (DB-25061), so the second
+    caller's settings never took effect. Rather than guess which caller
+    "wins", the registry raises and names the conflicting keys so the
+    operator can decide: either align the two DSNs or process-split them.
+
+    agent-K PR #20:1160 — this check runs ONLY from the explicit
+    ``bootstrap_failover_group`` entry point. The dispatcher's per-
+    connect path (``psycopg.connect(xcluster_dsn)``) does NOT trigger
+    the check: ordinary connects whose DSN happens to differ from the
+    bootstrap DSN (e.g. defaults filled in differently by the operator
+    across code paths) would otherwise starve a pool with raises on
+    every borrow.
+
+    Subclass of ``OperationalError``.
+    """
+
+
 # Install `logger.trace(...)` as a convenience so call sites read like the
 # other levels. We only install if no other library beat us to it, so we
 # don't clobber a third-party `trace` method that might use it differently.
@@ -167,7 +192,8 @@ def bootstrap_failover_group(conninfo: str = "", **kwargs):
             "load_balance_hosts must be true"
         )
     group = ClusterRegistry.instance().get_or_bootstrap_failover_group(
-        yb_params, cleaned_conninfo, cleaned_kwargs
+        yb_params, cleaned_conninfo, cleaned_kwargs,
+        strict_param_check=True,   # agent-K PR #20:1160
     )
     _warn_statement_timeout_sync(group, yb_params.drain_timeout_s)
     _log_pool_wiring_reminder()
@@ -192,7 +218,8 @@ async def abootstrap_failover_group(conninfo: str = "", **kwargs):
             "load_balance_hosts must be true"
         )
     group = await ClusterRegistry.instance().aget_or_bootstrap_failover_group(
-        yb_params, cleaned_conninfo, cleaned_kwargs
+        yb_params, cleaned_conninfo, cleaned_kwargs,
+        strict_param_check=True,   # agent-K PR #20:1160
     )
     await _awarn_statement_timeout_async(group, yb_params.drain_timeout_s)
     _log_pool_wiring_reminder()
@@ -383,6 +410,7 @@ __all__ = [
     "TRACE",
     "NoViableClusterError",
     "MissingCircuitBreakerError",
+    "ConflictingFailoverConfigError",
     "bootstrap_failover_group",
     "abootstrap_failover_group",
 ]
