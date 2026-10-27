@@ -185,6 +185,113 @@ def _make_placeholder_state(
     )
 
 
+# Fields of YBParams that MUST agree between two bootstrap_failover_group
+# calls on the same universe pair in one process. These are the knobs
+# that govern failover behavior and are stored on the FailoverGroup (or
+# used by its probe); if a second DSN disagrees, silently returning the
+# first DSN's group means the second caller's settings never take
+# effect (DB-25061). Non-failover knobs (yba token, log level, etc.) are
+# intentionally excluded — they can diverge without surprising the
+# second caller.
+_FAILOVER_GOVERNING_PARAMS = (
+    "secondary_cluster_hosts",
+    "drain_timeout_s",
+    "lag_wait_timeout_s",
+    "threshold_replication_lag_ms",
+    "cooldown_s",
+    "check_timeout_s",
+    "refresh_interval_s",
+    "auto_failback_enabled",
+    "on_phase2_timeout",
+    "replication_name",
+    "failback_replication_name",
+    "failback_drain_timeout_s",
+    "failback_lag_wait_timeout_s",
+    "failback_threshold_replication_lag_ms",
+    "failback_global_time_budget_secs",
+    # agent-K PR #20:212 — typo: real YBParams field is
+    # ``global_time_budget_secs``, not ``global_time_budget_s``. The old
+    # name doesn't exist on YBParams so both sides returned _MISSING and
+    # the diff always matched; the knob was silently ignored by the
+    # conflict check.
+    "global_time_budget_secs",
+    # agent-K PR #20:193 — YBA knobs govern whether Phase 2 lag wait
+    # runs at all. A first DSN without YBA creates a group where
+    # ``yba_client`` is None → Phase 2 is a no-op; a second DSN with
+    # YBA wired would silently inherit the group with no YBA client and
+    # Phase 2 would never run for its traffic. Treat them as governing.
+    "yba_endpoint",
+    "yba_api_token",
+    "yba_connect_timeout_s",
+    "yba_read_timeout_s",
+    "lag_wait_enabled",
+)
+
+
+def _diff_failover_params(existing_params, new_params) -> list[tuple[str, object, object]]:
+    """Return [(field, existing_value, new_value), ...] for each
+    failover-governing param whose value disagrees. Empty list means the
+    two YBParams agree on everything that matters for the group.
+
+    Missing attributes on either side are treated as "equal only if both
+    are missing" — defensively tolerates older stored params from
+    before new fields were added.
+    """
+    diffs: list[tuple[str, object, object]] = []
+    for field_name in _FAILOVER_GOVERNING_PARAMS:
+        a = getattr(existing_params, field_name, _MISSING)
+        b = getattr(new_params, field_name, _MISSING)
+        if a != b:
+            diffs.append((field_name, a, b))
+    return diffs
+
+
+_MISSING = object()
+
+
+def _assert_bootstrap_params_match(group: "FailoverGroup", new_params) -> None:
+    """Raise ``ConflictingFailoverConfigError`` if ``new_params`` disagrees
+    with the ``group``'s stored ``bootstrap_params`` on any failover-
+    governing knob (DB-25061).
+
+    agent-K PR #20:1160. This check runs ONLY from explicit
+    ``bootstrap_failover_group`` calls (which pass
+    ``strict_param_check=True`` down to ``get_or_bootstrap_failover_group``),
+    NOT from the dispatcher's per-connect path. A regular
+    ``psycopg.connect(dsn)`` whose DSN happens to differ from the
+    bootstrap DSN (e.g. defaults filled in differently) would otherwise
+    starve the pool with ``ConflictingFailoverConfigError`` on every
+    borrow. The connect path trusts whatever the operator wired via
+    bootstrap; only the explicit second-bootstrap case is a config
+    conflict worth raising.
+
+    No-op if the existing group has no stored
+    params (older bootstraps from a shim without this field, or a direct
+    FailoverGroup(...) construction in a test).
+
+    Called on every cache-hit path in get/aget_or_bootstrap_failover_group
+    — including the race-lost path at the end — so a conflicting second
+    bootstrap can't slip through either the fast or slow path.
+    """
+    if group.bootstrap_params is None:
+        return
+    diffs = _diff_failover_params(group.bootstrap_params, new_params)
+    if not diffs:
+        return
+    from . import ConflictingFailoverConfigError
+    detail = "; ".join(
+        f"{name}: existing={existing!r} new={incoming!r}"
+        for name, existing, incoming in diffs
+    )
+    raise ConflictingFailoverConfigError(
+        f"xCluster failover group for primary_uuid={group.primary.uuid} "
+        f"already exists in this process with different failover "
+        f"settings. The second bootstrap_failover_group call cannot use "
+        f"its own values because the group is shared; align the two "
+        f"DSNs or process-split them. Conflicting keys: {detail}"
+    )
+
+
 def _is_placeholder_uuid(uuid: str) -> bool:
     """True iff the ClusterState was placeholder-constructed (and should
     be promoted to real state on the next successful probe tick)."""
@@ -521,6 +628,15 @@ class FailoverGroup:
     # scrape this to detect degraded failover; custom CBs can read it
     # to rate-limit their trip signaling.
     last_phase2_timeout_ts: float = 0.0
+
+    # The YBParams that created this group — stored so a second
+    # ``bootstrap_failover_group`` call for the same universe can be
+    # checked for conflicting failover-governing knobs rather than
+    # silently returning the first caller's group (DB-25061). Typed
+    # loose to dodge the YBParams import cycle. ``repr=False`` so
+    # ``repr(group)`` doesn't leak ``yba_api_token`` or other secrets
+    # the YBParams dataclass may hold (agent-K PR #20:589).
+    bootstrap_params: "object | None" = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # Bind the condition to `lock` — so wait/notify releases and re-
@@ -1101,6 +1217,7 @@ class ClusterRegistry:
         yb_params,                                  # YBParams; lazy-typed to dodge cycle
         conninfo: str,
         kwargs: dict[str, object],
+        strict_param_check: bool = False,
     ) -> "FailoverGroup":
         """Sync bootstrap of a primary + secondary `FailoverGroup`. Idempotent
         on primary uuid. Spec §5 / design §3.
@@ -1111,6 +1228,15 @@ class ClusterRegistry:
         thread's next tick will reconnect and promote it to the real
         ClusterState. If BOTH sides are unreachable the call raises — the
         feature exists to survive outages, not to come up with no cluster.
+
+        ``strict_param_check`` (agent-K PR #20:1160): when True (set by
+        the explicit ``bootstrap_failover_group`` entry point), a
+        cache-hit runs ``_assert_bootstrap_params_match`` and raises
+        ``ConflictingFailoverConfigError`` on any failover-governing
+        knob disagreement. When False (the dispatcher's per-connect
+        path), the check is skipped — ordinary connects whose DSN
+        happens to differ from the bootstrap DSN would otherwise
+        starve the pool with raises on every borrow.
         """
         from .health import HealthResult            # late import — health.py imports FailoverGroup forward-ref
 
@@ -1147,6 +1273,8 @@ class ClusterRegistry:
             with self._lock:
                 existing = self._failover_groups.get(primary.uuid)
             if existing is not None:
+                if strict_param_check:
+                    _assert_bootstrap_params_match(existing, yb_params)
                 logger.debug(
                     "failover group cache hit: primary_uuid=%s", primary.uuid
                 )
@@ -1232,6 +1360,8 @@ class ClusterRegistry:
         with self._lock:
             existing = self._failover_groups.get(primary.uuid)
             if existing is not None:
+                if strict_param_check:
+                    _assert_bootstrap_params_match(existing, yb_params)
                 logger.debug(
                     "failover group race lost; discarding our pairing for "
                     "primary_uuid=%s", primary.uuid,
@@ -1253,6 +1383,7 @@ class ClusterRegistry:
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,
                 on_phase2_timeout=yb_params.on_phase2_timeout,
+                bootstrap_params=yb_params,
             )
             self._failover_groups[primary.uuid] = group
 
@@ -1277,11 +1408,14 @@ class ClusterRegistry:
         yb_params,
         conninfo: str,
         kwargs: dict[str, object],
+        strict_param_check: bool = False,
     ) -> "FailoverGroup":
         """Async sibling. Same shape, awaits the async primary + secondary
         bootstraps. The probe thread itself is sync regardless of caller
         (see design doc §10). Partial-outage tolerance mirrors the sync
-        path (see `get_or_bootstrap_failover_group`)."""
+        path (see `get_or_bootstrap_failover_group`). ``strict_param_check``
+        gates the DB-25061 config-conflict assertion on cache hits
+        (agent-K PR #20:1160) — see sync sibling for rationale."""
         from .health import HealthResult
 
         primary_key = ClusterKey.from_params(
@@ -1314,6 +1448,8 @@ class ClusterRegistry:
             with self._lock:
                 existing = self._failover_groups.get(primary.uuid)
             if existing is not None:
+                if strict_param_check:
+                    _assert_bootstrap_params_match(existing, yb_params)
                 logger.debug(
                     "failover group cache hit (async): primary_uuid=%s",
                     primary.uuid,
@@ -1390,6 +1526,8 @@ class ClusterRegistry:
         with self._lock:
             existing = self._failover_groups.get(primary.uuid)
             if existing is not None:
+                if strict_param_check:
+                    _assert_bootstrap_params_match(existing, yb_params)
                 logger.debug(
                     "failover group race lost (async); discarding our pairing "
                     "for primary_uuid=%s", primary.uuid,
@@ -1411,6 +1549,7 @@ class ClusterRegistry:
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,
                 on_phase2_timeout=yb_params.on_phase2_timeout,
+                bootstrap_params=yb_params,
             )
             self._failover_groups[primary.uuid] = group
 
