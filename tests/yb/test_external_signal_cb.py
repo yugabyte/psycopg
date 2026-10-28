@@ -207,22 +207,24 @@ def test_unrecognised_status_returns_healthy_and_warns(caplog):
 
 
 def test_missing_table_creates_it_and_returns_healthy():
-    """First check: CREATE succeeds, SELECT raises UndefinedTable.
+    """First check: CREATE+ALTER succeed, SELECT raises UndefinedTable.
     Handler creates the table and returns HEALTHY. Next tick works."""
     # Sequence:
     #   1. CREATE (succeeds) — via _setup_table
-    #   2. SELECT (raises UndefinedTable) — table dropped between setup and select
-    #   3. Handler recovers: rollback, mark table setup pending, re-run _setup_table
+    #   2. ALTER (succeeds) — sets the which_cluster default
+    #   3. SELECT (raises UndefinedTable) — table dropped between setup and select
+    #   4. Handler recovers: rollback, mark table setup pending, re-run _setup_table
     conn = _Conn(next_row=None)
 
-    # Set the exception to fire on the SELECT (second execute).
-    # We do this by patching execute directly to track which call it is.
+    # Set the exception to fire on the SELECT, which now lands at call #3
+    # because _setup_table emits CREATE + ALTER before SELECT.
     original_execute = _Cursor.execute
-    call_count = {"n": 0}
 
     def sequenced_execute(self, sql, *args, **kw):
-        call_count["n"] += 1
-        if call_count["n"] == 2 and sql.startswith("SELECT"):
+        if sql.startswith("SELECT") and not getattr(
+            sequenced_execute, "_select_tripped", False
+        ):
+            sequenced_execute._select_tripped = True
             raise _undefined_table_exc()
         original_execute(self, sql, *args, **kw)
 
