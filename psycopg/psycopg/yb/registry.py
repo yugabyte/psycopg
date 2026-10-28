@@ -209,6 +209,14 @@ _FAILOVER_GOVERNING_PARAMS = (
     "failback_lag_wait_timeout_s",
     "failback_threshold_replication_lag_ms",
     "failback_global_time_budget_secs",
+    # DB-24483 — Phase 2 freshness + liveness gate knobs. A second DSN
+    # with a different freshness floor would silently inherit the first
+    # DSN's group and never apply its own gate, so treat them as
+    # governing (same pattern as the other Phase 2 params above).
+    "lag_freshness_s",
+    "lag_confirmation_samples",
+    "failback_lag_freshness_s",
+    "failback_lag_confirmation_samples",
     # agent-K PR #20:212 — typo: real YBParams field is
     # ``global_time_budget_secs``, not ``global_time_budget_s``. The old
     # name doesn't exist on YBParams so both sides returned _MISSING and
@@ -581,6 +589,14 @@ class FailoverGroup:
     xcluster_config_uuid: str = ""
     threshold_replication_lag_ms: int = 0
     lag_wait_timeout_s: int = 30
+    # DB-24483 — Phase 2 freshness + liveness gate knobs. See
+    # params.py for semantics. ``barrier_ts`` is the wall-clock
+    # ``time.time()`` stamp at the moment ``pause_dispatch`` fires; the
+    # drain's lag loop uses it to compare each YBA ``sample_ts`` and
+    # reject samples that cannot reflect post-barrier replication.
+    lag_freshness_s: int = 25
+    lag_confirmation_samples: int = 2
+    barrier_ts: float = 0.0
 
     # Failback-direction (B→A) Phase 2 config (design doc §3.5.1).
     # Populated at bootstrap only when the operator set
@@ -591,6 +607,9 @@ class FailoverGroup:
     failback_xcluster_config_uuid: str = ""
     failback_threshold_replication_lag_ms: int = 0
     failback_lag_wait_timeout_s: int = 30
+    # DB-24483 — same gates in the failback direction.
+    failback_lag_freshness_s: int = 25
+    failback_lag_confirmation_samples: int = 2
 
     # Auto-failback toggle (see design doc §3.5.1 / §7.3). When False,
     # the driver stays on secondary even after the primary CB reports
@@ -651,10 +670,18 @@ class FailoverGroup:
         """Set ``dispatch_paused = True``. Called from the drain sequence
         (Phase E) at the start of a failover. Every ``group.lock``-held
         write must set-and-notify together, so we expose this as a
-        method rather than relying on callers to remember the notify."""
+        method rather than relying on callers to remember the notify.
+
+        DB-24483: stamp ``barrier_ts`` under the same lock so Phase 2's
+        freshness gate can compare YBA sample timestamps against the
+        exact moment the barrier was armed. ``time.time()`` (wall-clock)
+        matches YBA's Prometheus timestamp units; ``time.monotonic``
+        would need a conversion on every poll.
+        """
         with self.lock:
             self.dispatch_paused = True
             self.barrier_generation += 1
+            self.barrier_ts = time.time()
 
     def resume_dispatch(self) -> None:
         """Set ``dispatch_paused = False`` and notify all waiters. Called
@@ -781,6 +808,14 @@ class FailoverGroup:
         self.dispatch_paused_condition = threading.Condition(self.lock)
         self.dispatch_paused = False
         self.async_dispatch_waiters = []
+        # DB-24483 — zero the barrier so the child's first drain stamps
+        # its own `time.time()` rather than reusing the parent's. The
+        # parent's monotonic-domain cooldown stamps survive fork (same
+        # host), but barrier_ts is wall-clock and compared only against
+        # YBA sample timestamps from the same wall-clock domain, so
+        # zeroing it is safe and avoids false "stale" readings if the
+        # child ever ran Phase 2 before pause_dispatch re-stamped.
+        self.barrier_ts = 0.0
         # agent-K PR #16:515. KEEP the parent's cool-down timestamps.
         # ``time.monotonic()`` is shared across fork on the same host,
         # so the parent's windows are directly comparable in the child.
@@ -1136,6 +1171,10 @@ class ClusterRegistry:
         # them consistently.
         group.threshold_replication_lag_ms = yb_params.threshold_replication_lag_ms
         group.lag_wait_timeout_s = yb_params.lag_wait_timeout_s
+        # DB-24483 — Phase 2 freshness + liveness gates. Mirrored on the
+        # group so the drain loop reads them without a YBParams import.
+        group.lag_freshness_s = yb_params.lag_freshness_s
+        group.lag_confirmation_samples = yb_params.lag_confirmation_samples
         # Failback-direction knobs. `failback_xcluster_config_uuid` is
         # populated below only if the operator set
         # yb.failback.replicationName.
@@ -1143,6 +1182,10 @@ class ClusterRegistry:
             yb_params.failback_threshold_replication_lag_ms
         )
         group.failback_lag_wait_timeout_s = yb_params.failback_lag_wait_timeout_s
+        group.failback_lag_freshness_s = yb_params.failback_lag_freshness_s
+        group.failback_lag_confirmation_samples = (
+            yb_params.failback_lag_confirmation_samples
+        )
 
         try:
             client = YBAClient(
@@ -1251,10 +1294,12 @@ class ClusterRegistry:
         with self._bootstrap_lock_for(primary_key):
             return self._do_bootstrap_failover_group(
                 yb_params, conninfo, kwargs, primary_key, HealthResult,
+                strict_param_check=strict_param_check,
             )
 
     def _do_bootstrap_failover_group(
         self, yb_params, conninfo, kwargs, primary_key, HealthResult,
+        strict_param_check: bool = False,
     ) -> "FailoverGroup":
         # 1. Try primary — tolerate failure.
         primary: "ClusterState | None" = None
@@ -1427,10 +1472,12 @@ class ClusterRegistry:
         async with self._async_bootstrap_lock_for(primary_key):  # type: ignore[attr-defined]
             return await self._ado_bootstrap_failover_group(
                 yb_params, conninfo, kwargs, primary_key, HealthResult,
+                strict_param_check=strict_param_check,
             )
 
     async def _ado_bootstrap_failover_group(
         self, yb_params, conninfo, kwargs, primary_key, HealthResult,
+        strict_param_check: bool = False,
     ) -> "FailoverGroup":
         primary: "ClusterState | None" = None
         primary_exc: "Exception | None" = None

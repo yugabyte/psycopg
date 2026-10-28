@@ -95,6 +95,11 @@ def _make_group_with_yba(
     threshold_ms: int = 0,
     lag_wait_timeout_s: int = 5,
     with_yba_client: bool = True,
+    # DB-24483: these tests predate the freshness + liveness gates and
+    # exercise the pre-fix single-sample convergence. Opt out by
+    # default; test_drain_db24483_freshness_gate.py covers the gate.
+    lag_freshness_s: int = 0,
+    lag_confirmation_samples: int = 1,
 ) -> tuple[FailoverGroup, _FakeYBAClient]:
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
@@ -108,6 +113,10 @@ def _make_group_with_yba(
         xcluster_config_uuid="xcc-abcd",
         threshold_replication_lag_ms=threshold_ms,
         lag_wait_timeout_s=lag_wait_timeout_s,
+        lag_freshness_s=lag_freshness_s,
+        lag_confirmation_samples=lag_confirmation_samples,
+        failback_lag_freshness_s=lag_freshness_s,
+        failback_lag_confirmation_samples=lag_confirmation_samples,
     )
     return group, client
 
@@ -151,9 +160,14 @@ def test_lag_wait_converges_after_multiple_polls(fake_state):
 # ------------------------------------------------------- exit condition: timeout
 
 def test_lag_wait_timeout_when_never_converges_fail_policy(fake_state):
-    """DB-corruption fix: `onPhase2Timeout=fail` (default) aborts the
-    flip when the lag wait times out. Status stays HEALTHY, dispatch
-    unpauses, and `last_phase2_timeout_ts` is set."""
+    """`onPhase2Timeout=fail` (default) aborts the flip ONLY for failback
+    direction — for failover direction (which this test exercises, via
+    `trigger_drain('primary', UNHEALTHY)`), the current side was just
+    marked UNHEALTHY so staying on it is worse than flipping to a lagged
+    target. Phase 2 proceeds with the flip and status transitions to
+    UNHEALTHY. See drain.py:1082-1114 (h6 G3 amendment) and the
+    corresponding failback-direction coverage in
+    tests/yb/test_drain_db24483_freshness_gate.py."""
     group, client = _make_group_with_yba(
         fake_state,
         yba_responses=[500.0],   # sticky high value
@@ -168,17 +182,14 @@ def test_lag_wait_timeout_when_never_converges_fail_policy(fake_state):
 
     assert 1.5 <= elapsed <= 3.5
     assert len(client.calls) >= 2
-    # Status does NOT flip — we don't commit the app to a known-stale target.
-    assert group.primary_status == HealthResult.HEALTHY, (
-        "under on_phase2_timeout=fail (default), status must stay on the "
-        "current side when Phase 2 times out — DB-corruption fix"
-    )
-    assert group.last_phase2_timeout_ts > 0, (
-        "last_phase2_timeout_ts should be stamped so operators + CBs can "
-        "observe degraded failover"
+    # Failover-direction + fail-policy proceeds with the flip (unlike
+    # failback, which aborts). Status reflects the CB's UNHEALTHY verdict.
+    assert group.primary_status == HealthResult.UNHEALTHY, (
+        "for direction=failover, fail-policy still proceeds — the current "
+        "side was marked UNHEALTHY so staying on it is worse than flipping"
     )
     assert group.dispatch_paused is False, (
-        "dispatch must unpause even on abort — app shouldn't hang"
+        "dispatch must unpause after the flip — app shouldn't hang"
     )
 
 
@@ -356,6 +367,11 @@ def _make_group_with_failback_yba(
     failback_threshold_ms: int = 0,
     failback_timeout_s: int = 5,
     failback_config_uuid: str = "xcc-b2a",
+    # DB-24483: default both sides to pre-fix single-sample semantics so
+    # existing tests keep testing the direction/UUID selection they were
+    # written for; the gate itself has dedicated tests.
+    lag_freshness_s: int = 0,
+    lag_confirmation_samples: int = 1,
 ) -> tuple[FailoverGroup, _FakeYBAClient]:
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
@@ -372,6 +388,10 @@ def _make_group_with_failback_yba(
         failback_xcluster_config_uuid=failback_config_uuid,
         failback_threshold_replication_lag_ms=failback_threshold_ms,
         failback_lag_wait_timeout_s=failback_timeout_s,
+        lag_freshness_s=lag_freshness_s,
+        lag_confirmation_samples=lag_confirmation_samples,
+        failback_lag_freshness_s=lag_freshness_s,
+        failback_lag_confirmation_samples=lag_confirmation_samples,
     )
     return group, client
 
