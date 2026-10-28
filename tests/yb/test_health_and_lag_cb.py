@@ -5,7 +5,7 @@ Verifies the decision table from the module docstring:
 
   * health HEALTHY                          → HEALTHY
   * health UNHEALTHY + lag ≤ threshold      → UNHEALTHY (trip)
-  * health UNHEALTHY + lag >  threshold     → HEALTHY   (hold)
+  * health UNHEALTHY + lag >  threshold     → previous verdict (hold)
   * health UNHEALTHY + YBAClientError       → UNHEALTHY (fail-open)
   * health UNHEALTHY + client=None          → UNHEALTHY (fail-open)
   * health UNHEALTHY + no config UUID       → UNHEALTHY (fail-open)
@@ -137,7 +137,7 @@ def test_health_unhealthy_and_lag_at_threshold_trips():
 
 
 def test_health_unhealthy_but_lag_above_threshold_holds():
-    """Health bad + target still behind → hold HEALTHY (no trip)."""
+    """Health bad + target still behind, no prior trip → hold HEALTHY."""
     yba = _StubYBAClient(responses=[500.0])
     cb = HealthAndLagCircuitBreaker(
         which_cluster="primary",
@@ -147,6 +147,63 @@ def test_health_unhealthy_but_lag_above_threshold_holds():
         xcluster_config_uuid="xcc-a2b",
     )
     group = _fake_group(yba_client=yba, xcluster_config_uuid="xcc-a2b")
+    assert cb.check(group) is HealthResult.HEALTHY
+    assert cb.last_trip_time == 0.0
+
+
+def test_db25154_hold_after_trip_stays_unhealthy():
+    """DB-25154 regression: once the CB has tripped UNHEALTHY, a
+    subsequent "lag > threshold" tick must preserve UNHEALTHY, not flip
+    the verdict back to HEALTHY. Returning HEALTHY looks like recovery
+    to the driver and triggers a failback onto a primary the health
+    probe is still flagging as bad.
+    """
+    probe = _StubHealthProbe(HealthResult.UNHEALTHY)
+    yba = _StubYBAClient(responses=[0.0, 24500.0, 54700.0])
+    cb = HealthAndLagCircuitBreaker(
+        which_cluster="primary",
+        threshold_lag_ms=0,
+        health_probe=probe,
+        yba_client=yba,
+        xcluster_config_uuid="xcc-a2b",
+    )
+    group = _fake_group(yba_client=yba, xcluster_config_uuid="xcc-a2b")
+
+    # Tick 1: lag=0 ≤ threshold → real trip to UNHEALTHY.
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    assert cb.last_trip_time > 0.0
+    first_trip = cb.last_trip_time
+
+    # Tick 2: operator-declared-unhealthy primary with lag now above
+    # threshold (paused replication). Pre-DB-25154 code returned HEALTHY
+    # here. Must now return UNHEALTHY (preserving the earlier verdict).
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    # No fresh trip — last_trip_time is unchanged.
+    assert cb.last_trip_time == first_trip
+
+    # Tick 3: lag climbs further; still a hold, still UNHEALTHY.
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    assert cb.last_recovery_time == 0.0
+
+
+def test_db25154_hold_from_healthy_still_returns_healthy():
+    """Converse case: a hold triggered BEFORE any trip must still return
+    HEALTHY — the DB-25154 fix preserves the previous verdict, and the
+    previous verdict for a freshly-constructed CB is HEALTHY. This is
+    the pre-trip behaviour the sample was designed to give (hold until
+    standby catches up, trip only when it does).
+    """
+    probe = _StubHealthProbe(HealthResult.UNHEALTHY)
+    yba = _StubYBAClient(responses=[500.0, 500.0])
+    cb = HealthAndLagCircuitBreaker(
+        which_cluster="primary",
+        threshold_lag_ms=100,
+        health_probe=probe,
+        yba_client=yba,
+        xcluster_config_uuid="xcc-a2b",
+    )
+    group = _fake_group(yba_client=yba, xcluster_config_uuid="xcc-a2b")
+    assert cb.check(group) is HealthResult.HEALTHY
     assert cb.check(group) is HealthResult.HEALTHY
     assert cb.last_trip_time == 0.0
 
