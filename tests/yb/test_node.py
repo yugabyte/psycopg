@@ -80,6 +80,7 @@ def test_nodeinfo_defaults():
     assert n.connection_count == 0
     assert n.is_down is False
     assert n.is_down_since == 0.0
+    assert n.absent_refresh_count == 0
 
 
 def test_nodeinfo_node_type_string():

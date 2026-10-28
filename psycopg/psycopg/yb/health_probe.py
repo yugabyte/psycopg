@@ -205,10 +205,19 @@ class HealthProbe:
             self._tick_refresh_topology()
 
     # ---------- CB check
-    def _tick_check(self) -> None:
+    def _tick_check(self, apply_verdict: bool = True) -> None:
         """Call the CB with a wall-clock cap of ``check_timeout_s`` and
-        apply the result. Isolated so any exception is contained — the
-        refresh step still runs.
+        (optionally) apply the result. Isolated so any exception is
+        contained — the refresh step still runs.
+
+        ``apply_verdict=False`` runs the CB and marks the first check
+        complete WITHOUT calling ``_maybe_apply`` (so no ``trigger_drain``
+        fires). This is the bootstrap-time path exercised by
+        ``run_first_check_synchronously`` — the goal there is to seed the
+        gate for the first connect, not to fire a full drain on the
+        caller's thread while they're still inside
+        ``bootstrap_failover_group`` (agent-K PR #10:284). The next
+        natural daemon tick will apply the verdict normally.
 
         Enforcement: submit to the persistent single-worker executor and
         wait via ``future.result(timeout=)``. If the check exceeds the
@@ -261,7 +270,27 @@ class HealthProbe:
                 return
             self._pending_future = None
             try:
-                self._maybe_apply(result)
+                if apply_verdict:
+                    self._maybe_apply(result)
+                else:
+                    # Bootstrap-time path (agent-K PR #10:284): don't
+                    # fire a drain inside wait_for_first_check — the
+                    # caller is still inside bootstrap_failover_group
+                    # and trigger_drain's Phase 2 lag wait would
+                    # dwarf wait_for_first_check's own timeout. Mirror
+                    # ``_maybe_apply``'s "same status, no-op" fast path
+                    # here: when the verdict matches the current
+                    # status (the common bootstrap case) nothing was
+                    # going to fire anyway, so stashing the result for
+                    # the next daemon tick is correct. When they
+                    # differ, the daemon's natural first tick (interval
+                    # later) will apply the verdict normally.
+                    logger.debug(
+                        "%s probe: first-check verdict %s (apply "
+                        "deferred to next daemon tick, primary_uuid=%s)",
+                        self._which, result.value,
+                        self._group.primary.uuid,
+                    )
                 # Only count a successfully applied verdict as "first
                 # check complete". agent-K PR #9:260: previously the
                 # finally fired the event on skip/timeout paths too,
@@ -301,10 +330,16 @@ class HealthProbe:
         Idempotent — a no-op if the first tick has already fired.
 
         Bounded by ``check_timeout_s`` inside ``_tick_check`` — if the
-        CB hangs, this returns anyway."""
+        CB hangs, this returns anyway. The verdict is NOT applied on
+        this path (agent-K PR #10:284): we only want to seed the gate
+        before the first connect, not fire a Phase 2 lag wait on the
+        caller's thread while they're still inside
+        ``bootstrap_failover_group``. The daemon's next natural tick
+        will apply the verdict with the normal cooldown + drain
+        semantics."""
         if self._first_check_complete.is_set():
             return
-        self._tick_check()
+        self._tick_check(apply_verdict=False)
 
     def _maybe_apply(self, result: HealthResult) -> None:
         """If ``result`` differs from the current per-cluster status AND
