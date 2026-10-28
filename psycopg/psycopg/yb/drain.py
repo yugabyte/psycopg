@@ -1039,6 +1039,12 @@ _LAG_POLL_INTERVAL_S = 1.0
 # lag confirmation and proceeds with the routing flip. Amogh's flow.
 _LAG_UNREACHABLE_STRIKES = 3
 
+# DB-24483 — Prometheus scrape interval YBA uses, matched to the YBA
+# default (reference.conf:985). Used by the liveness gate to tell
+# whether two "post-barrier" samples came from different scrapes (good)
+# or the same one (YBA's replay pathology).
+_LAG_SCRAPE_HINT_S = 10.0
+
 
 def _wait_for_replication_lag(
     group: "FailoverGroup",
@@ -1069,22 +1075,41 @@ def _wait_for_replication_lag(
         threshold_ms = float(group.failback_threshold_replication_lag_ms)
         timeout_s = group.failback_lag_wait_timeout_s
         xcluster_uuid = group.failback_xcluster_config_uuid
+        freshness_s = float(getattr(group, "failback_lag_freshness_s", 0))
+        required_samples = int(getattr(group, "failback_lag_confirmation_samples", 1))
         direction_label = "failback"
     else:
         threshold_ms = float(group.threshold_replication_lag_ms)
         timeout_s = group.lag_wait_timeout_s
         xcluster_uuid = group.xcluster_config_uuid
+        freshness_s = float(getattr(group, "lag_freshness_s", 0))
+        required_samples = int(getattr(group, "lag_confirmation_samples", 1))
         direction_label = "failover"
+
+    # DB-24483 — snapshot the barrier timestamp set by ``pause_dispatch``.
+    # Zero means "no barrier armed" — a fail-open path (shouldn't happen
+    # inside a drain, but defensive): if we have no barrier, the
+    # freshness gate degrades to "any sample is fresh" and the liveness
+    # gate still runs on sample identity.
+    barrier_ts = float(getattr(group, "barrier_ts", 0.0))
 
     logger.warning(
         "lag wait start: direction=%s outgoing=%s xcluster_config=%s "
-        "threshold=%.1fms timeout=%ds",
+        "threshold=%.1fms timeout=%ds freshness=%.1fs confirmations=%d "
+        "barrier_ts=%.3f",
         direction_label, which_cluster, xcluster_uuid, threshold_ms, timeout_s,
+        freshness_s, required_samples, barrier_ts,
     )
 
     started = time.monotonic()
     deadline = started + timeout_s
     unreachable_streak = 0
+    # DB-24483 — liveness tracking: consecutive distinct post-barrier
+    # samples at ≤ threshold.
+    confirmed_count = 0
+    # Dedupe repeated YBA replays of the same sample. Any sample_ts
+    # equal to the previous one does NOT advance the liveness count.
+    last_counted_sample_ts: float | None = None
 
     # agent-K PR #8:430: the deadline is checked only BEFORE each poll,
     # but a YBA request can take up to ~`max(connect, read)`×2 (reconnect
@@ -1255,18 +1280,88 @@ def _wait_for_replication_lag(
 
         if lag_ms is not None and lag_ms <= threshold_ms:
             elapsed = time.monotonic() - started
-            # Log sample age at convergence so a post-mortem can tell
-            # whether we trusted a fresh or stale "caught-up" reading.
-            if sample_ts is not None:
-                age_str = f", sample_age={max(0.0, time.time() - sample_ts):.1f}s"
+            # DB-24483 — freshness gate. A YBA sample whose ``sample_ts``
+            # predates the barrier (or sits in the ``barrier_ts +
+            # freshness_s`` grace window) cannot have observed writes
+            # that landed before ``pause_dispatch``. Trusting it is the
+            # exact bug that let the driver flip to a 17s-behind B.
+            # Legacy YBA clients that don't return ``sample_ts`` fall
+            # back to the pre-fix single-sample convergence — the
+            # operator opted out of the gate by not giving us the
+            # timestamp. ``freshness_s == 0`` likewise opts out.
+            if freshness_s > 0 and sample_ts is not None and barrier_ts > 0:
+                min_fresh_ts = barrier_ts + freshness_s
+                if sample_ts < min_fresh_ts:
+                    stale_by = min_fresh_ts - sample_ts
+                    logger.info(
+                        "lag wait: sample at %.3f is %.1fs older than the "
+                        "freshness floor (barrier=%.3f + %.1fs) — not "
+                        "counting (elapsed=%.1fs / %ds)",
+                        sample_ts, stale_by, barrier_ts, freshness_s,
+                        elapsed, timeout_s,
+                    )
+                    # Reset liveness: a stale sample is not a true pass.
+                    confirmed_count = 0
+                    last_counted_sample_ts = None
+                    sleep_s = min(
+                        _LAG_POLL_INTERVAL_S,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    continue
+            # DB-24483 — liveness gate. YBA replays its last sample for
+            # ~5min after the primary dies (DB-24852-adjacent). A single
+            # ``lag=0`` is not enough to tell "standby really caught up"
+            # from "same stale replay reused". Require N distinct
+            # ``sample_ts`` values at ≤ threshold before flipping.
+            if sample_ts is not None and sample_ts == last_counted_sample_ts:
+                logger.info(
+                    "lag wait: lag=%.1fms ≤ threshold but sample_ts %.3f "
+                    "unchanged since last pass — YBA replay suspected, "
+                    "not counting (confirmations=%d/%d, elapsed=%.1fs / %ds)",
+                    lag_ms, sample_ts, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
             else:
-                age_str = ""
-            logger.warning(
-                "lag wait converged in %.1fs (lag=%.1fms ≤ threshold=%.1fms"
-                "%s) — switching now",
-                elapsed, lag_ms, threshold_ms, age_str,
-            )
-            return
+                confirmed_count += 1
+                last_counted_sample_ts = sample_ts
+                logger.info(
+                    "lag wait: lag=%.1fms ≤ threshold=%.1fms counted "
+                    "(confirmations=%d/%d, elapsed=%.1fs / %ds)",
+                    lag_ms, threshold_ms, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
+                if confirmed_count >= required_samples:
+                    # Log sample age at convergence so a post-mortem
+                    # can tell whether we trusted a fresh reading.
+                    if sample_ts is not None:
+                        age_str = (
+                            f", sample_age="
+                            f"{max(0.0, time.time() - sample_ts):.1f}s"
+                        )
+                    else:
+                        age_str = ""
+                    logger.warning(
+                        "lag wait converged in %.1fs "
+                        "(lag=%.1fms ≤ threshold=%.1fms, confirmations="
+                        "%d/%d%s) — switching now",
+                        elapsed, lag_ms, threshold_ms,
+                        confirmed_count, required_samples, age_str,
+                    )
+                    return
+        else:
+            # Lag back above threshold (or we have no data this tick).
+            # Reset the liveness counter so a next convergence has to
+            # earn the full N consecutive passes.
+            if confirmed_count > 0:
+                logger.info(
+                    "lag wait: liveness reset — lag no longer ≤ threshold "
+                    "(had confirmed %d/%d)",
+                    confirmed_count, required_samples,
+                )
+            confirmed_count = 0
+            last_counted_sample_ts = None
 
         # Poll again in ~1s. If the remaining budget is smaller, sleep
         # only that much so we don't overshoot the deadline.

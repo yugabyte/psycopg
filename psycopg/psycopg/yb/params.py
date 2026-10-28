@@ -23,10 +23,13 @@ returned by `extract_yb_params` are then safe to hand to libpq.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 
 from .node import Placement
+
+logger = logging.getLogger(__name__)
 
 
 # Mirror pgjdbc-yb's clamps. See design doc §3.2.4.
@@ -56,7 +59,41 @@ DEFAULT_DRAIN_TIMEOUT_SEC = 10
 # unset the drain flip is immediate after the txn drain — same as
 # pre-lag-phase behaviour.
 DEFAULT_THRESHOLD_REPLICATION_LAG_MS = 0
+# DB-24483: with the freshness + liveness gates enabled, a planned
+# failover's wall-clock floor is `lag_freshness_s + N × scrape_hint`.
+# The pre-DB-24483 default of 30s remains the shipped default so
+# existing harness profiles that pass lagWaitTimeoutSecs=30 keep
+# working. Operators who turn the gate on (lagFreshnessSecs>0 and/or
+# lagConfirmationSamples>1) should raise this knob accordingly.
 DEFAULT_LAG_WAIT_TIMEOUT_SEC = 30
+
+# DB-24483 — freshness gate. Minimum age `sample_ts - barrier_ts` before
+# a YBA lag sample is trusted to describe post-barrier replication. The
+# tserver recomputes the lag metric every 15s (cdc_service.cc:101) and
+# YBA scrapes every 10s (reference.conf:985); the sum (25s) is the
+# wall-clock floor past which a sample is guaranteed to reflect writes
+# that landed before the barrier was armed. Setting this to 0 disables
+# the gate — the shipped default — because enabling it requires the
+# operator to raise lagWaitTimeoutSecs above the derived floor, and
+# ratcheting an existing deployment's timeout silently on upgrade would
+# break harnesses that assume the pre-DB-24483 ~30s budget. Opt in via
+# `yb.failover.lagFreshnessSecs=25` (and `yb.failback.lagFreshnessSecs=25`)
+# together with a `lagWaitTimeoutSecs` ≥ floor.
+DEFAULT_LAG_FRESHNESS_SEC = 0
+# DB-24483 — liveness gate. Number of consecutive post-barrier samples
+# at lag ≤ threshold required before the drain flips routing. YBA's
+# known pathology (DB-24852-adjacent): when the primary dies it replays
+# the last pre-death sample for its full ~5min Prometheus window; one
+# "lag=0" post-barrier reading is not enough to tell a true converged
+# standby from a replayed stale sample. Defaults to 1 (disabled); turn
+# on with `yb.failover.lagConfirmationSamples=2` once the operator has
+# budgeted the extra ~10s per confirmation sample.
+DEFAULT_LAG_CONFIRMATION_SAMPLES = 1
+# DB-24483 — Prometheus scrape interval YBA uses, used only in the
+# bootstrap floor calculation (lag_wait_timeout ≥ freshness + N × hint).
+# Not currently a DSN knob; follow YBA's reference.conf default. If YBA
+# ever exposes a per-universe override, surface it here as a knob.
+_LAG_SCRAPE_HINT_S = 10
 
 # Auto-failback toggle. When True (the default), the driver automatically
 # returns traffic to the primary once the primary CB flips back to
@@ -107,6 +144,9 @@ _PURE_YB_KEYS = frozenset({
     "yb_failover_replication_name",
     "yb_failover_threshold_replication_lag_ms",
     "yb_failover_lag_wait_timeout_secs",
+    # DB-24483 — freshness + liveness gates for Phase 2.
+    "yb_failover_lag_freshness_secs",
+    "yb_failover_lag_confirmation_samples",
     # Global failover time budget — derives drain + lag-wait when set.
     "yb_failover_global_time_budget_secs",
     # Auto-failback toggle (bool; default true).
@@ -127,6 +167,9 @@ _PURE_YB_KEYS = frozenset({
     "yb_failback_lag_wait_timeout_secs",
     "yb_failback_threshold_replication_lag_ms",
     "yb_failback_global_time_budget_secs",
+    # DB-24483 — same gates in the failback direction.
+    "yb_failback_lag_freshness_secs",
+    "yb_failback_lag_confirmation_samples",
 })
 _LOAD_BALANCE_KEY = "load_balance_hosts"
 _OUR_LB_VALUES = frozenset({"true", "false"})
@@ -154,6 +197,8 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failover[._-](?:replicationName|replication[._-]name)"
     r"|yb[._-]failover[._-](?:thresholdReplicationLagMs|threshold[._-]replication[._-]lag[._-]ms)"
     r"|yb[._-]failover[._-](?:lagWaitTimeoutSecs|lag[._-]wait[._-]timeout[._-]secs)"
+    r"|yb[._-]failover[._-](?:lagFreshnessSecs|lag[._-]freshness[._-]secs)"
+    r"|yb[._-]failover[._-](?:lagConfirmationSamples|lag[._-]confirmation[._-]samples)"
     r"|yb[._-]failover[._-](?:globalTimeBudgetSecs|global[._-]time[._-]budget[._-]secs)"
     r"|yb[._-]failover[._-](?:autoFailbackEnabled|auto[._-]failback[._-]enabled)"
     # agent-K PR #18:119 — ``onPhase2Timeout`` was missing from the key
@@ -167,6 +212,8 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failback[._-](?:replicationName|replication[._-]name)"
     r"|yb[._-]failback[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
     r"|yb[._-]failback[._-](?:lagWaitTimeoutSecs|lag[._-]wait[._-]timeout[._-]secs)"
+    r"|yb[._-]failback[._-](?:lagFreshnessSecs|lag[._-]freshness[._-]secs)"
+    r"|yb[._-]failback[._-](?:lagConfirmationSamples|lag[._-]confirmation[._-]samples)"
     r"|yb[._-]failback[._-](?:thresholdReplicationLagMs|threshold[._-]replication[._-]lag[._-]ms)"
     r"|yb[._-]failback[._-](?:globalTimeBudgetSecs|global[._-]time[._-]budget[._-]secs)"
     r"))\s*=\s*"
@@ -208,6 +255,8 @@ _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failover_replicationname":               "yb_failover_replication_name",
     "yb_failover_thresholdreplicationlagms":     "yb_failover_threshold_replication_lag_ms",
     "yb_failover_lagwaittimeoutsecs":            "yb_failover_lag_wait_timeout_secs",
+    "yb_failover_lagfreshnesssecs":              "yb_failover_lag_freshness_secs",
+    "yb_failover_lagconfirmationsamples":        "yb_failover_lag_confirmation_samples",
     "yb_failover_globaltimebudgetsecs":          "yb_failover_global_time_budget_secs",
     "yb_failover_autofailbackenabled":           "yb_failover_auto_failback_enabled",
     "yb_failover_onphase2timeout":               "yb_failover_on_phase2_timeout",
@@ -215,6 +264,8 @@ _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failback_replicationname":               "yb_failback_replication_name",
     "yb_failback_draintimeoutsecs":              "yb_failback_drain_timeout_secs",
     "yb_failback_lagwaittimeoutsecs":            "yb_failback_lag_wait_timeout_secs",
+    "yb_failback_lagfreshnesssecs":              "yb_failback_lag_freshness_secs",
+    "yb_failback_lagconfirmationsamples":        "yb_failback_lag_confirmation_samples",
     "yb_failback_thresholdreplicationlagms":     "yb_failback_threshold_replication_lag_ms",
     "yb_failback_globaltimebudgetsecs":          "yb_failback_global_time_budget_secs",
 }
@@ -294,6 +345,17 @@ class YBParams:
     replication_name: str = ""
     threshold_replication_lag_ms: int = DEFAULT_THRESHOLD_REPLICATION_LAG_MS
     lag_wait_timeout_s: int = DEFAULT_LAG_WAIT_TIMEOUT_SEC
+    # DB-24483 — freshness + liveness gates on YBA lag samples. The
+    # freshness gate requires `sample_ts > barrier_ts + lag_freshness_s`
+    # so a sample is guaranteed to describe post-barrier replication
+    # (tserver update + Prometheus scrape slack). The liveness gate
+    # requires N consecutive post-barrier samples at `lag ≤ threshold`
+    # to reject YBA's known "replay last sample for ~5 min" pathology.
+    # `lag_freshness_s=0` disables the freshness gate (restores pre-fix
+    # behaviour, accepts the data-loss risk). `lag_confirmation_samples=1`
+    # disables the liveness gate.
+    lag_freshness_s: int = DEFAULT_LAG_FRESHNESS_SEC
+    lag_confirmation_samples: int = DEFAULT_LAG_CONFIRMATION_SAMPLES
 
     # Global failover time budget (Amex ask, design doc §3.7). When set,
     # ``drain_timeout_s`` and ``lag_wait_timeout_s`` are derived from it
@@ -345,6 +407,10 @@ class YBParams:
     failback_lag_wait_timeout_s: int = DEFAULT_LAG_WAIT_TIMEOUT_SEC
     failback_threshold_replication_lag_ms: int = DEFAULT_THRESHOLD_REPLICATION_LAG_MS
     failback_global_time_budget_secs: int | None = None
+    # DB-24483 — same gates on the failback (B→A) direction. Default to
+    # the same values as the failover direction unless overridden.
+    failback_lag_freshness_s: int = DEFAULT_LAG_FRESHNESS_SEC
+    failback_lag_confirmation_samples: int = DEFAULT_LAG_CONFIRMATION_SAMPLES
 
     @property
     def lag_wait_enabled(self) -> bool:
@@ -573,6 +639,55 @@ def extract_yb_params(
                 "other. Reduce a phase timeout or raise globalTimeBudgetSecs."
             )
 
+    # DB-24483 — freshness + liveness gate knobs. Floors: freshness ≥ 0
+    # (0 disables the gate); confirmation_samples ≥ 1 (1 disables the
+    # liveness gate).
+    lag_freshness_s = _clamp_lo(
+        int(raw.get("yb_failover_lag_freshness_secs", DEFAULT_LAG_FRESHNESS_SEC)),
+        0,
+    )
+    lag_confirmation_samples = _clamp_lo(
+        int(raw.get(
+            "yb_failover_lag_confirmation_samples",
+            DEFAULT_LAG_CONFIRMATION_SAMPLES,
+        )),
+        1,
+    )
+    # Bootstrap floor: lag_wait_timeout must fit at least one liveness
+    # window on top of the freshness wait, otherwise the gate can never
+    # pass and every planned failover times out before converging.
+    # Only check when Phase 2 will actually run — xcluster enabled AND
+    # YBA credentials wired AND replication_name set. A DSN that leaves
+    # Phase 2 disabled is free to carry any lag_wait_timeout_s (the knob
+    # is inert in that case). Also skip when the user explicitly
+    # disabled the gate (lag_freshness_s=0).
+    _phase2_will_run = (
+        _xcluster_enabled_at_parse
+        and bool(yba_endpoint)
+        and bool(yba_api_token)
+        and bool(replication_name)
+    )
+    if _phase2_will_run and lag_wait_timeout > 0 and lag_freshness_s > 0:
+        needed = lag_freshness_s + (lag_confirmation_samples * _LAG_SCRAPE_HINT_S)
+        if lag_wait_timeout < needed:
+            # Downgraded to a WARNING (was ValueError). Crashing bootstrap
+            # on a timeout-below-floor is worse than letting the drain
+            # run and time out: the operator may have deliberately picked
+            # a short lag_wait to exercise the timeout path (stress-test
+            # harnesses do this), and the Phase 2 timeout + abort policy
+            # already handles the result safely. Operators who want strict
+            # rejection can treat this logger at ERROR.
+            logger.warning(
+                "yb.failover.lagWaitTimeoutSecs=%d is below the floor %ds "
+                "imposed by lagFreshnessSecs=%d + lagConfirmationSamples=%d × "
+                "scrapeIntervalSecs=%d — Phase 2 will time out on every "
+                "planned failover under this config. Raise lagWaitTimeoutSecs "
+                "to ≥%d, lower lagFreshnessSecs/lagConfirmationSamples, or "
+                "disable the gate with lagFreshnessSecs=0.",
+                lag_wait_timeout, needed, lag_freshness_s,
+                lag_confirmation_samples, _LAG_SCRAPE_HINT_S, needed,
+            )
+
     # Auto-failback toggle. Default true (backward-compatible). Accepts
     # any of the standard bool forms; anything else raises ValueError.
     auto_failback_raw = raw.get("yb_failover_auto_failback_enabled")
@@ -702,6 +817,45 @@ def extract_yb_params(
     else:
         failback_threshold_replication_lag_ms = threshold_replication_lag_ms
 
+    # DB-24483 — failback-direction freshness + liveness gate overrides.
+    # Fall back to the failover values when unset so the failback side
+    # inherits the same correctness floor.
+    if (fb_fresh_raw := raw.get("yb_failback_lag_freshness_secs")) is not None:
+        failback_lag_freshness_s = _clamp_lo(int(fb_fresh_raw), 0)
+    else:
+        failback_lag_freshness_s = lag_freshness_s
+    if (fb_conf_raw := raw.get("yb_failback_lag_confirmation_samples")) is not None:
+        failback_lag_confirmation_samples = _clamp_lo(int(fb_conf_raw), 1)
+    else:
+        failback_lag_confirmation_samples = lag_confirmation_samples
+    # Same floor check as failover, applied against the failback timeout.
+    # Failback Phase 2 only runs when the operator wired a separate
+    # yb.failback.replicationName — same gate as the drain uses.
+    _fb_phase2_will_run = _phase2_will_run and bool(failback_replication_name)
+    if (
+        _fb_phase2_will_run
+        and failback_lag_wait_timeout_s > 0
+        and failback_lag_freshness_s > 0
+    ):
+        fb_needed = (
+            failback_lag_freshness_s
+            + failback_lag_confirmation_samples * _LAG_SCRAPE_HINT_S
+        )
+        if failback_lag_wait_timeout_s < fb_needed:
+            # Downgraded to a WARNING; see the failover-side comment above
+            # for rationale.
+            logger.warning(
+                "yb.failback.lagWaitTimeoutSecs=%d is below the floor %ds "
+                "imposed by lagFreshnessSecs=%d + lagConfirmationSamples=%d × "
+                "scrapeIntervalSecs=%d — failback Phase 2 will time out on "
+                "every planned failback under this config. Raise "
+                "yb.failback.lagWaitTimeoutSecs to ≥%d, lower the failback "
+                "freshness/confirmation knobs, or disable the gate with "
+                "yb.failback.lagFreshnessSecs=0.",
+                failback_lag_wait_timeout_s, fb_needed, failback_lag_freshness_s,
+                failback_lag_confirmation_samples, _LAG_SCRAPE_HINT_S, fb_needed,
+            )
+
     # YBA client inner timeouts. Scale down when a budget is set on
     # EITHER side so a single blocked YBA call cannot eat the whole
     # Phase 2 window — on either failover OR failback. agent-K PR
@@ -748,6 +902,8 @@ def extract_yb_params(
             replication_name=replication_name,
             threshold_replication_lag_ms=threshold_replication_lag_ms,
             lag_wait_timeout_s=lag_wait_timeout,
+            lag_freshness_s=lag_freshness_s,
+            lag_confirmation_samples=lag_confirmation_samples,
             global_time_budget_secs=global_time_budget_secs,
             yba_connect_timeout_s=yba_connect_timeout_s,
             yba_read_timeout_s=yba_read_timeout_s,
@@ -760,6 +916,8 @@ def extract_yb_params(
                 failback_threshold_replication_lag_ms
             ),
             failback_global_time_budget_secs=failback_global_time_budget_secs,
+            failback_lag_freshness_s=failback_lag_freshness_s,
+            failback_lag_confirmation_samples=failback_lag_confirmation_samples,
         ),
         cleaned_conninfo,
         cleaned_kwargs,

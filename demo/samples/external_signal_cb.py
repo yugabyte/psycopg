@@ -15,7 +15,7 @@ Signal-table schema (auto-created on first tick):
 
     CREATE TABLE yb_failover_signals (
         group_id      TEXT      NOT NULL,
-        which_cluster TEXT      NOT NULL,   -- 'primary' | 'secondary'
+        which_cluster TEXT      NOT NULL DEFAULT 'primary',  -- 'primary' | 'secondary'
         target_status TEXT      NOT NULL,   -- 'HEALTHY' | 'UNHEALTHY'
         reason        TEXT,
         ts            TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -93,7 +93,21 @@ _SIGNAL_TABLE_DDL = (
     # "primary UNHEALTHY" signal would also trip the secondary slot,
     # leaving both clusters UNHEALTHY (NoViableClusterError on connect).
     # agent-K PR #12:33.
-    "    which_cluster TEXT      NOT NULL,\n"
+    #
+    # ``DEFAULT 'primary'`` lets older signal writers that pre-date
+    # this per-slot filter — e.g. the current yb-stress-test harness,
+    # which INSERTs only (group_id, target_status, reason) — keep
+    # working against this schema. Rows they insert default to the
+    # primary slot, which matches the harness's intent (it only writes
+    # primary-targeted signals today). Signal writers that mean the
+    # secondary slot MUST supply ``which_cluster='secondary'``
+    # explicitly; a NULL-default row that was meant for the secondary
+    # would silently trip the primary slot instead. The sample's own
+    # read path requires an exact match, so a row left at the default
+    # never trips the wrong slot. Follow-up: ask harness owners to
+    # supply ``which_cluster`` explicitly and tighten this to
+    # ``NOT NULL`` again.
+    "    which_cluster TEXT      NOT NULL DEFAULT 'primary',\n"
     "    target_status TEXT      NOT NULL,\n"
     "    reason        TEXT,\n"
     "    ts            TIMESTAMP NOT NULL DEFAULT NOW(),\n"
@@ -181,9 +195,21 @@ class ExternalSignalCircuitBreaker:
             return HealthResult.HEALTHY
 
     def _setup_table(self, conn) -> None:
-        """Idempotent: CREATE TABLE IF NOT EXISTS."""
+        """Idempotent: CREATE TABLE IF NOT EXISTS, then ALTER COLUMN
+        to set the default. The ALTER is necessary because the harness
+        (yb-stress-test ``_insert_signal`` at
+        ``test_xcluster_smart_driver_failover.py:2498``) creates the
+        same table with ``which_cluster TEXT NOT NULL`` and no default
+        before any CB tick, so the sample's CREATE is a no-op against
+        the harness's pre-existing stricter schema and the backstop
+        default never applies. The ALTER sets the default on either
+        table shape without touching existing rows."""
         with conn.cursor() as cur:
             cur.execute(_SIGNAL_TABLE_DDL)
+            cur.execute(
+                "ALTER TABLE yb_failover_signals "
+                "ALTER COLUMN which_cluster SET DEFAULT 'primary'"
+            )
         conn.commit()
         self._table_setup_done = True
         logger.info(

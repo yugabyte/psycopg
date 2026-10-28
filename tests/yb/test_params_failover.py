@@ -289,7 +289,7 @@ def test_yba_params_default_lag_wait_disabled():
     assert yb.yba_api_token == ""
     assert yb.replication_name == ""
     assert yb.threshold_replication_lag_ms == 0
-    assert yb.lag_wait_timeout_s == 30
+    assert yb.lag_wait_timeout_s == 30       # DEFAULT_LAG_WAIT_TIMEOUT_SEC
 
 
 def test_yba_params_full_camel_case():
@@ -321,6 +321,10 @@ def test_yba_params_snake_and_kebab_forms():
         "yb_failover_yba_api_token=t "
         "yb.failover.replication_name=repname "
         "yb-failover-threshold-replication-lag-ms=100 "
+        # DB-24483 — opt out of the freshness gate so the 15s wait fits
+        # under the floor. This test exercises key normalisation, not
+        # Phase 2 semantics.
+        "yb.failover.lag_freshness_secs=0 "
         "yb.failover.lag_wait_timeout_secs=15",
         {},
     )
