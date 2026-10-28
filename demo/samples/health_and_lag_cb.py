@@ -33,15 +33,21 @@ That is what this CB does. It composes:
 
 Decision table (per tick):
 
-  ┌────────────────────┬──────────────────┬────────────────┐
-  │  Health probe      │  Lag check       │  This CB says  │
-  ├────────────────────┼──────────────────┼────────────────┤
-  │  HEALTHY           │  (not consulted) │  HEALTHY       │
-  │  UNHEALTHY         │  lag ≤ threshold │  UNHEALTHY     │
-  │  UNHEALTHY         │  lag >  threshold│  HEALTHY (hold)│
-  │  UNHEALTHY         │  YBA unreachable │  UNHEALTHY     │
-  │  UNHEALTHY         │  no config UUID  │  UNHEALTHY     │
-  └────────────────────┴──────────────────┴────────────────┘
+  ┌────────────────────┬──────────────────┬───────────────────────┐
+  │  Health probe      │  Lag check       │  This CB says         │
+  ├────────────────────┼──────────────────┼───────────────────────┤
+  │  HEALTHY           │  (not consulted) │  HEALTHY              │
+  │  UNHEALTHY         │  lag ≤ threshold │  UNHEALTHY            │
+  │  UNHEALTHY         │  lag >  threshold│  previous verdict     │
+  │                    │                  │  (hold — see DB-25154)│
+  │  UNHEALTHY         │  YBA unreachable │  UNHEALTHY            │
+  │  UNHEALTHY         │  no config UUID  │  UNHEALTHY            │
+  └────────────────────┴──────────────────┴───────────────────────┘
+
+The hold row preserves ``_last_reported`` rather than returning
+``HEALTHY``: a HEALTHY verdict after an UNHEALTHY one is a recovery
+to the driver, which then starts the failback cool-down and drain —
+onto a primary the health probe is still saying is bad (DB-25154).
 
 The "YBA unreachable" and "no config UUID" rows fall through to
 UNHEALTHY (fail-open) so a broken control plane never wedges failover.
@@ -361,16 +367,22 @@ class HealthAndLagCircuitBreaker:
             )
             return HealthResult.UNHEALTHY
 
+        # DB-25154: hold means "do not change the verdict." Returning
+        # HEALTHY here after an earlier UNHEALTHY looks like a recovery
+        # to the driver, which then runs the cool-down + failback drain
+        # back onto a primary the health probe is still flagging. Report
+        # whatever we last told the driver — it matches _last_reported,
+        # which _record_unhealthy / _record_healthy maintain.
+        held_as = self._last_reported
         logger.info(
             "%s: health probe UNHEALTHY but lag %.1fms > threshold %dms "
-            "— holding HEALTHY (%d/%d, target not ready)",
+            "— holding %s (%d/%d, target not ready)",
             self.which_cluster, lag_ms, self.threshold_lag_ms,
+            held_as.name,
             self._hold_ticks,
             self.max_hold_ticks if self.max_hold_ticks > 0 else -1,
         )
-        # Deliberately NOT calling _record_unhealthy — this is a hold,
-        # not a trip. Keep last_reported as-is.
-        return HealthResult.HEALTHY
+        return held_as
 
     # ---------------------------------------------------------- helpers
 
