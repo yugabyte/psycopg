@@ -15,34 +15,27 @@ Signal-table schema (auto-created on first tick):
 
     CREATE TABLE yb_failover_signals (
         group_id      TEXT      NOT NULL,
-        which_cluster TEXT      NOT NULL DEFAULT 'primary',  -- 'primary' | 'secondary'
         target_status TEXT      NOT NULL,   -- 'HEALTHY' | 'UNHEALTHY'
         reason        TEXT,
         ts            TIMESTAMP NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (group_id, which_cluster, ts DESC)
+        PRIMARY KEY (group_id, ts DESC)
     );
 
-Operator triggers a failover-to-secondary by marking primary UNHEALTHY:
+Operator triggers a failover-to-secondary by marking the group UNHEALTHY:
 
-    INSERT INTO yb_failover_signals
-        (group_id, which_cluster, target_status, reason)
-    VALUES
-        ('<primary-uuid>', 'primary', 'UNHEALTHY', 'planned maintenance');
+    INSERT INTO yb_failover_signals (group_id, target_status, reason)
+    VALUES ('<primary-uuid>', 'UNHEALTHY', 'planned maintenance');
 
-Failback-to-primary is the mirror: mark secondary UNHEALTHY (so the
-dispatcher stops routing to it) and clear the primary signal, or write
-primary HEALTHY and secondary HEALTHY once both clusters recover.
+Failback is the mirror: write a HEALTHY row for the same group_id.
 
-No row for a (group_id, which_cluster) pair means "no signal for that
-slot, return HEALTHY" — the default state for fresh deployments.
+No row for a group_id means "no signal, return HEALTHY" — the default
+state for fresh deployments.
 
 Two instances per ``FailoverGroup`` (one per cluster). Each reads from
-its own cluster's ``control_sync`` connection AND filters on its own
-``which_cluster`` so a signal meant for one slot doesn't trip the
-other. Operators who want the signal to be observed by both clusters
-in a bidirectional-xCluster setup can rely on replication to carry
-the row across — the ``which_cluster`` column keeps the filter correct
-on either side.
+its own cluster's ``control_sync`` connection, which is how per-slot
+isolation is provided today. (A former ``which_cluster`` column that
+also filtered rows per slot was reverted here — see ``_SIGNAL_TABLE_DDL``
+for the rationale and the follow-up with the yb-stress-test harness.)
 
 Usage:
 
@@ -85,39 +78,29 @@ logger = logging.getLogger(__name__)
 
 
 _SIGNAL_TABLE_DDL = (
+    # `which_cluster` was added to this schema in PR-F (fd2baa34) to let
+    # the primary- and secondary-slot CBs filter independently against
+    # the same signal table. It was reverted here because the
+    # yb-stress-test harness's `_insert_signal`
+    # (test_xcluster_smart_driver_failover.py:2498) supplies only
+    # (group_id, target_status, reason) — the extra NOT NULL column
+    # fails every signal INSERT in the stress suite. Re-add it (and
+    # the matching SELECT filter) once the harness is updated to
+    # supply `which_cluster` explicitly. Per-slot isolation is still
+    # provided by each CB instance reading its own cluster's
+    # control_sync connection (see `_target_state`).
     "CREATE TABLE IF NOT EXISTS yb_failover_signals (\n"
     "    group_id      TEXT      NOT NULL,\n"
-    # Which CB slot this signal is for: 'primary' or 'secondary'. A
-    # signal written for 'primary' is read only by the primary slot's
-    # CB — otherwise both CBs would see every row and e.g. a single
-    # "primary UNHEALTHY" signal would also trip the secondary slot,
-    # leaving both clusters UNHEALTHY (NoViableClusterError on connect).
-    # agent-K PR #12:33.
-    #
-    # ``DEFAULT 'primary'`` lets older signal writers that pre-date
-    # this per-slot filter — e.g. the current yb-stress-test harness,
-    # which INSERTs only (group_id, target_status, reason) — keep
-    # working against this schema. Rows they insert default to the
-    # primary slot, which matches the harness's intent (it only writes
-    # primary-targeted signals today). Signal writers that mean the
-    # secondary slot MUST supply ``which_cluster='secondary'``
-    # explicitly; a NULL-default row that was meant for the secondary
-    # would silently trip the primary slot instead. The sample's own
-    # read path requires an exact match, so a row left at the default
-    # never trips the wrong slot. Follow-up: ask harness owners to
-    # supply ``which_cluster`` explicitly and tighten this to
-    # ``NOT NULL`` again.
-    "    which_cluster TEXT      NOT NULL DEFAULT 'primary',\n"
     "    target_status TEXT      NOT NULL,\n"
     "    reason        TEXT,\n"
     "    ts            TIMESTAMP NOT NULL DEFAULT NOW(),\n"
-    "    PRIMARY KEY (group_id, which_cluster, ts DESC)\n"
+    "    PRIMARY KEY (group_id, ts DESC)\n"
     ")"
 )
 
 _SIGNAL_SELECT_SQL = (
     "SELECT target_status FROM yb_failover_signals "
-    "WHERE group_id = %s AND which_cluster = %s "
+    "WHERE group_id = %s "
     "ORDER BY ts DESC LIMIT 1"
 )
 
@@ -171,10 +154,7 @@ class ExternalSignalCircuitBreaker:
             if not self._table_setup_done:
                 self._setup_table(conn)
             with conn.cursor() as cur:
-                cur.execute(
-                    _SIGNAL_SELECT_SQL,
-                    (group.primary.uuid, self.which_cluster),
-                )
+                cur.execute(_SIGNAL_SELECT_SQL, (group.primary.uuid,))
                 row = cur.fetchone()
             conn.commit()
         except Exception as exc:
@@ -195,21 +175,9 @@ class ExternalSignalCircuitBreaker:
             return HealthResult.HEALTHY
 
     def _setup_table(self, conn) -> None:
-        """Idempotent: CREATE TABLE IF NOT EXISTS, then ALTER COLUMN
-        to set the default. The ALTER is necessary because the harness
-        (yb-stress-test ``_insert_signal`` at
-        ``test_xcluster_smart_driver_failover.py:2498``) creates the
-        same table with ``which_cluster TEXT NOT NULL`` and no default
-        before any CB tick, so the sample's CREATE is a no-op against
-        the harness's pre-existing stricter schema and the backstop
-        default never applies. The ALTER sets the default on either
-        table shape without touching existing rows."""
+        """Idempotent: CREATE TABLE IF NOT EXISTS."""
         with conn.cursor() as cur:
             cur.execute(_SIGNAL_TABLE_DDL)
-            cur.execute(
-                "ALTER TABLE yb_failover_signals "
-                "ALTER COLUMN which_cluster SET DEFAULT 'primary'"
-            )
         conn.commit()
         self._table_setup_done = True
         logger.info(
