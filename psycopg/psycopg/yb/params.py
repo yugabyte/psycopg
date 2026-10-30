@@ -85,10 +85,12 @@ DEFAULT_LAG_FRESHNESS_SEC = 0
 # known pathology (DB-24852-adjacent): when the primary dies it replays
 # the last pre-death sample for its full ~5min Prometheus window; one
 # "lag=0" post-barrier reading is not enough to tell a true converged
-# standby from a replayed stale sample. Defaults to 1 (disabled); turn
-# on with `yb.failover.lagConfirmationSamples=2` once the operator has
-# budgeted the extra ~10s per confirmation sample.
-DEFAULT_LAG_CONFIRMATION_SAMPLES = 1
+# standby from a replayed stale sample. Defaults to 2: a second distinct
+# post-barrier sample costs at most one YBA step (~10 s). The drain only
+# enforces it when the lag wait is long enough to fit that
+# (see drain._CONFIRMATION_MIN_WAIT_S); shorter waits use one sample.
+# Set `yb.failover.lagConfirmationSamples=1` to disable.
+DEFAULT_LAG_CONFIRMATION_SAMPLES = 2
 # DB-24483 — Prometheus scrape interval YBA uses, used only in the
 # bootstrap floor calculation (lag_wait_timeout ≥ freshness + N × hint).
 # Not currently a DSN knob; follow YBA's reference.conf default. If YBA

@@ -46,6 +46,16 @@ from psycopg.yb.registry import FailoverGroup
 pytestmark = pytest.mark.yb_unit
 
 
+@pytest.fixture(autouse=True)
+def _confirmation_guard_off(request, monkeypatch):
+    """These tests drive the gate with short lag waits; the production
+    guard that drops to one confirmation below 20 s would bypass it.
+    Tests of the guard itself are marked ``keep_confirmation_guard``."""
+    if request.node.get_closest_marker("keep_confirmation_guard") is None:
+        from psycopg.yb import drain
+        monkeypatch.setattr(drain, "_CONFIRMATION_MIN_WAIT_S", 0)
+
+
 # -------------------------------------------------- controllable fake YBA
 
 class _ScriptedYBAClient:
@@ -346,7 +356,7 @@ def test_bootstrap_freshness_zero_skips_floor():
 
 
 def test_bootstrap_defaults_leave_gate_off():
-    """The shipped defaults are gate-off (freshness=0, conf=1) so an
+    """The shipped defaults keep the freshness gate off (freshness=0) so an
     upgrade cannot silently raise the Phase 2 wall-clock floor for a
     deployment that was previously running with lagWaitTimeoutSecs=30.
     Opt in by setting lagFreshnessSecs>0 and raising lagWaitTimeoutSecs
@@ -356,8 +366,10 @@ def test_bootstrap_defaults_leave_gate_off():
     assert yb.lag_wait_timeout_s == DEFAULT_LAG_WAIT_TIMEOUT_SEC
     assert yb.lag_freshness_s == DEFAULT_LAG_FRESHNESS_SEC
     assert yb.lag_confirmation_samples == DEFAULT_LAG_CONFIRMATION_SAMPLES
+    # Freshness stays off (it needs a lag wait above ~35 s); two
+    # confirmations are on by default and fit the 30 s default wait.
     assert yb.lag_freshness_s == 0
-    assert yb.lag_confirmation_samples == 1
+    assert yb.lag_confirmation_samples == 2
 
 
 def test_bootstrap_failback_floor_applies_only_when_failback_phase2_enabled():
@@ -444,3 +456,43 @@ def test_pause_dispatch_stamps_barrier_ts(fake_state):
     stamped = group.barrier_ts
     group.resume_dispatch()
     assert group.barrier_ts == stamped
+
+
+
+# ------------------------------------------------- confirmations by default
+
+def test_pre_barrier_sample_never_confirms(fake_state):
+    """phase2_claim (stress b4442bdf cycle 1): Phase 2 converged on a
+    lag=0 point collected before the barrier while B was still missing
+    batches acknowledged before it. Such a point must not count."""
+    pre = time.time() - 30.0
+    post_1 = time.time() + 10_000.0
+    post_2 = post_1 + 10.0
+    client = _ScriptedYBAClient(script=[
+        (0.0, pre), (0.0, post_1), (0.0, post_2),
+    ])
+    group = _make_group(
+        fake_state, client, lag_wait_timeout_s=10, lag_freshness_s=0,
+        lag_confirmation_samples=2,
+    )
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 3
+
+
+@pytest.mark.keep_confirmation_guard
+def test_short_lag_wait_uses_single_confirmation(fake_state):
+    """budget_3 / budget_10 derive a lag wait of 2–6 s: too short for a
+    second YBA point, so the default two confirmations drop to one."""
+    client = _ScriptedYBAClient(script=[(0.0, time.time() + 10_000.0)])
+    group = _make_group(
+        fake_state, client, lag_wait_timeout_s=6, lag_freshness_s=0,
+        lag_confirmation_samples=2,
+    )
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 1
+    assert time.monotonic() - t0 < 2.0

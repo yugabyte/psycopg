@@ -69,6 +69,10 @@ def pytest_configure(config):
         "markers",
         "perf: slow benchmark; opt-in via `pytest -m perf`",
     )
+    config.addinivalue_line(
+        "markers",
+        "keep_confirmation_guard: keep drain's short-wait confirmation guard on",
+    )
 
 
 def pytest_collection_modifyitems(items):
