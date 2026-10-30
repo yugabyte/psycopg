@@ -62,3 +62,7 @@ class NodeInfo:
     # (see `_merge_new_nodes` in registry.py) so a decommissioned node stops
     # getting picked. A fresh-connect retry resets this to 0.
     absent_refresh_count: int = 0
+    # Consecutive connect attempts that ended in a timeout (no answer, not
+    # a refusal). Reset by any successful connect. See
+    # ClusterRegistry.mark_failed(timeout=True).
+    connect_timeouts: int = 0

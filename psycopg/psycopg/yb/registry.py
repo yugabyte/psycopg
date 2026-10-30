@@ -43,6 +43,8 @@ _MAX_ABSENCE_TICKS = 3
 # Grace period before a topology refresh that lists a down host clears
 # its is_down flag. Matches the default failed_host_reconnect_delay_secs.
 _DOWN_RECOVERY_GRACE_S = 5.0
+# Consecutive connect timeouts (not refusals) before a host is quarantined.
+_CONNECT_TIMEOUT_STRIKES = 3
 
 
 # ------------------------------------------------------------------- fork safety
@@ -2202,15 +2204,41 @@ class ClusterRegistry:
 
     @staticmethod
     def _mark_up_locked(state: "ClusterState", host: str) -> None:
-        if (ni := state.nodes.get(host)) is not None and ni.is_down:
+        if (ni := state.nodes.get(host)) is None:
+            return
+        ni.connect_timeouts = 0
+        if ni.is_down:
             ni.is_down = False
             ni.is_down_since = 0.0
             logger.info("host recovered: %s (uuid=%s)", host, state.uuid)
 
-    def mark_failed(self, uuid: str, host: str) -> None:
+    def mark_failed(self, uuid: str, host: str, timeout: bool = False) -> None:
+        """Quarantine ``host`` after a failed connect.
+
+        ``timeout=True`` means the attempt got no answer (connect_timeout
+        expired) rather than a refusal. A single timeout is weak evidence
+        — a NAT that recycled a port, a SYN lost under load — and
+        quarantining on it took live nodes out of rotation (stress
+        false_quarantine). Timeouts only quarantine after
+        _CONNECT_TIMEOUT_STRIKES in a row with no successful connect in
+        between; refusals still quarantine at once.
+        """
         state = self._clusters.get(uuid)
         if state is None:
             return
+        if timeout:
+            with state.lock:
+                ni = state.nodes.get(host)
+                if ni is not None:
+                    ni.connect_timeouts += 1
+                    if ni.connect_timeouts < _CONNECT_TIMEOUT_STRIKES:
+                        logger.info(
+                            "connect timeout on %s (uuid=%s), %d/%d before "
+                            "quarantine",
+                            host, uuid, ni.connect_timeouts,
+                            _CONNECT_TIMEOUT_STRIKES,
+                        )
+                        return
         now = time.monotonic()
         with state.lock:
             if (ni := state.nodes.get(host)) is not None:

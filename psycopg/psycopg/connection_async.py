@@ -275,7 +275,9 @@ class AsyncConnection(BaseConnection[Row]):
                     node.host, state.uuid, exc,
                 )
                 registry.decrement(state.uuid, node.host)
-                registry.mark_failed(state.uuid, node.host)
+                registry.mark_failed(
+                    state.uuid, node.host, timeout="timeout expired" in str(exc)
+                )
                 attempted.add(node.host)
                 last_err = exc
                 continue
