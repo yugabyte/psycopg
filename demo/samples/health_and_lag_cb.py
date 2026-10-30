@@ -169,6 +169,8 @@ class HealthAndLagCircuitBreaker:
         # DB-24852: consecutive "hold HEALTHY" decisions. Reset on any
         # health-HEALTHY or lag-converged tick.
         self._hold_ticks = 0
+        # Consecutive "hold UNHEALTHY (failback gated)" decisions.
+        self._failback_hold_ticks = 0
 
         # Compose in a health probe. Default: tracker-table with the same
         # tuning knobs the pure TrackerTable CB accepts. Callers pass their
@@ -410,6 +412,18 @@ class HealthAndLagCircuitBreaker:
         failback_config = (
             getattr(group, "failback_xcluster_config_uuid", "") or ""
         )
+        if (
+            self._yba_client_override is None
+            and getattr(group, "yba_client", None) is not None
+            and failback_config
+        ):
+            # The driver's own failback Phase 2 is wired: it waits on
+            # B→A lag after the dispatch barrier (so the source is
+            # quiesced and lag can actually drain) and is bounded by
+            # failbackLagWaitTimeoutSecs. Gating here as well measures
+            # lag while the app is still writing to B, which never
+            # reaches a 0 ms threshold — failback would hold forever.
+            return True
         client = (
             self._yba_client_override
             or getattr(group, "yba_client", None)
@@ -428,13 +442,30 @@ class HealthAndLagCircuitBreaker:
                 exc,
             )
             return True
-        drained = lag_ms <= self.threshold_lag_ms
-        if not drained:
-            logger.info(
-                "primary: failback lag %.1fms > threshold %dms",
-                lag_ms, self.threshold_lag_ms,
+        threshold = getattr(
+            group, "failback_threshold_replication_lag_ms", self.threshold_lag_ms,
+        )
+        drained = lag_ms <= threshold
+        if drained:
+            self._failback_hold_ticks = 0
+            return True
+        # Same bounded-hold backstop as the failover direction: the app
+        # keeps writing to B while we wait, so lag may never reach the
+        # threshold. Release after max_hold_ticks.
+        self._failback_hold_ticks += 1
+        if self.max_hold_ticks > 0 and self._failback_hold_ticks >= self.max_hold_ticks:
+            logger.warning(
+                "primary: failback lag %.1fms > threshold %dms for %d ticks "
+                "— releasing failback gate (max_hold_ticks=%d)",
+                lag_ms, threshold, self._failback_hold_ticks, self.max_hold_ticks,
             )
-        return drained
+            self._failback_hold_ticks = 0
+            return True
+        logger.info(
+            "primary: failback lag %.1fms > threshold %dms",
+            lag_ms, threshold,
+        )
+        return False
 
     def _record_healthy(self) -> None:
         if self._last_reported == HealthResult.UNHEALTHY:
