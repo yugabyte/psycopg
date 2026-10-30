@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 # gone at the fastest xCluster probe cadence — both well past a graceful
 # tserver restart.
 _MAX_ABSENCE_TICKS = 3
+# Grace period before a topology refresh that lists a down host clears
+# its is_down flag. Matches the default failed_host_reconnect_delay_secs.
+_DOWN_RECOVERY_GRACE_S = 5.0
 
 
 # ------------------------------------------------------------------- fork safety
@@ -1879,7 +1882,11 @@ class ClusterRegistry:
         if not state.bootstrap_kwargs and not state.bootstrap_conninfo:
             return None
         with state.lock:
-            candidates = [n for n in state.nodes.values() if not n.is_down]
+            _now = time.monotonic()
+            candidates = [
+                n for n in state.nodes.values()
+                if not n.is_down or _now - n.is_down_since > _DOWN_RECOVERY_GRACE_S
+            ]
             # All-marked-down is usually stale state, not ground truth:
             # a quorum-loss cascade marks every node within seconds; the
             # next refresh would clear them but refresh can't run without
@@ -1927,6 +1934,7 @@ class ClusterRegistry:
                 if state.control_sync is None:
                     state.control_sync = conn
                     state.last_control_connect_error = None  # clear on success
+                    self._mark_up_locked(state, node.host)
                     logger.info("control conn re-opened on %s for uuid=%s",
                                 node.host, state.uuid)
                     # agent-K PR #17:G6 — surface placeholder promotion.
@@ -1988,7 +1996,11 @@ class ClusterRegistry:
         if not state.bootstrap_kwargs and not state.bootstrap_conninfo:
             return None
         with state.lock:
-            candidates = [n for n in state.nodes.values() if not n.is_down]
+            _now = time.monotonic()
+            candidates = [
+                n for n in state.nodes.values()
+                if not n.is_down or _now - n.is_down_since > _DOWN_RECOVERY_GRACE_S
+            ]
             # See sync sibling: all-marked-down is usually stale; the
             # connect itself is the authoritative liveness signal.
             if not candidates:
@@ -2028,6 +2040,7 @@ class ClusterRegistry:
                 if state.control_async is None:
                     state.control_async = conn
                     state.last_control_connect_error = None  # clear on success
+                    self._mark_up_locked(state, node.host)
                     logger.info("control conn re-opened (async) on %s for uuid=%s",
                                 node.host, state.uuid)
                     return conn
@@ -2097,6 +2110,14 @@ class ClusterRegistry:
                     n.connection_count = existing.connection_count
                     n.is_down = existing.is_down
                     n.is_down_since = existing.is_down_since
+                    # Listed by yb_servers() again and quarantined past the
+                    # grace period → treat as recovered. Without this the
+                    # flag was sticky for the life of the process.
+                    if n.is_down and (
+                        time.monotonic() - n.is_down_since > _DOWN_RECOVERY_GRACE_S
+                    ):
+                        n.is_down = False
+                        n.is_down_since = 0.0
                     # Reappeared → reset absence counter.
                     n.absent_refresh_count = 0
                 new_dict[n.host] = n
@@ -2170,6 +2191,21 @@ class ClusterRegistry:
             if (ni := state.nodes.get(host)) is not None:
                 ni.connection_count = max(0, ni.connection_count - 1)
                 logger.log(TRACE, "decrement: %s → %d", host, ni.connection_count)
+
+    def mark_up(self, uuid: str, host: str) -> None:
+        """Clear the down flag after a successful connect to ``host``."""
+        state = self._clusters.get(uuid)
+        if state is None:
+            return
+        with state.lock:
+            self._mark_up_locked(state, host)
+
+    @staticmethod
+    def _mark_up_locked(state: "ClusterState", host: str) -> None:
+        if (ni := state.nodes.get(host)) is not None and ni.is_down:
+            ni.is_down = False
+            ni.is_down_since = 0.0
+            logger.info("host recovered: %s (uuid=%s)", host, state.uuid)
 
     def mark_failed(self, uuid: str, host: str) -> None:
         state = self._clusters.get(uuid)

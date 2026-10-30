@@ -275,6 +275,7 @@ class Connection(BaseConnection[Row]):
                 registry.decrement(state.uuid, node.host)
                 raise
 
+            registry.mark_up(state.uuid, node.host)
             conn._yb_uuid = state.uuid
             conn._yb_host = node.host
             # `active_cluster` is "primary"/"secondary" iff we routed via a
