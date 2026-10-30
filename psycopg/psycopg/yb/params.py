@@ -322,16 +322,16 @@ class YBParams:
     # Phase 2 timeout policy — determines what happens when the YBA lag
     # wait exceeds ``lag_wait_timeout_s`` without converging.
     #
-    # ``"fail"`` (default): the drain does NOT flip routing. Dispatch
-    #     unpauses, status stays on the current side, a WARNING is
-    #     logged, and the probe thread will try again on its next tick.
-    #     Protects against DB corruption from flipping to a target that
-    #     is known to be behind.
+    # ``"proceed"`` (default): flip anyway once the lag wait times out.
+    #     The app moves to a target that may be missing the outgoing
+    #     side's last writes; that staleness is the documented cost of a
+    #     bounded switch.
     #
-    # ``"proceed"``: the pre-fix behavior — flip anyway and accept the
-    #     data-consistency risk. Operators who want aggressive failover
-    #     under lag-source outages can opt in.
-    on_phase2_timeout: str = "fail"
+    # ``"fail"``: on a FAILBACK timeout the drain does NOT flip routing.
+    #     Dispatch unpauses, status stays on the current side, and the
+    #     probe retries after the cooldown. Failover always proceeds —
+    #     staying on a side the CB just declared dead is worse.
+    on_phase2_timeout: str = "proceed"
 
     # Failback overrides (design doc §3.5.1). Each is populated at
     # parse time with either the operator's ``yb.failback.<knob>`` value
@@ -592,11 +592,12 @@ def extract_yb_params(
         else:
             auto_failback_enabled = DEFAULT_AUTO_FAILBACK_ENABLED
 
-    # Phase 2 timeout policy. 'fail' (default) means do not flip when
-    # lag doesn't converge; 'proceed' preserves pre-fix behavior.
+    # Phase 2 timeout policy. 'proceed' (default) flips once the lag
+    # wait times out; 'fail' keeps routing on the current side when a
+    # failback times out.
     on_phase2_timeout_raw = raw.get("yb_failover_on_phase2_timeout")
     if on_phase2_timeout_raw is None:
-        on_phase2_timeout = "fail"
+        on_phase2_timeout = "proceed"
     else:
         low = on_phase2_timeout_raw.strip().lower()
         if low in ("fail", "proceed"):
