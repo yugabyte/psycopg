@@ -168,6 +168,11 @@ class AsyncConnection(BaseConnection[Row]):
                 dispatch_generation as _dispatch_generation,
                 wait_for_dispatch_async as _wait_for_dispatch_async,
             )
+            from .yb.params import with_xcluster_socket_defaults
+
+            cleaned_kwargs = with_xcluster_socket_defaults(
+                cleaned_conninfo, cleaned_kwargs
+            )
             failover_group = await registry.aget_or_bootstrap_failover_group(
                 yb_params, cleaned_conninfo, cleaned_kwargs
             )
