@@ -755,3 +755,39 @@ def test_merge_keeps_unlisted_down_node_down_past_grace(fresh_registry):
     fresh_registry._merge_new_nodes(state, [_make_node("h1")])
 
     assert state.nodes["h2"].is_down is True
+
+
+# ------------------------------------------------------- connect-timeout strikes
+
+def test_single_connect_timeout_does_not_quarantine(fresh_registry):
+    """false_quarantine (stress 64a57bb5 cycle 1): one connect timeout to
+    a live node quarantined it. Timeouts need consecutive strikes."""
+    from psycopg.yb.registry import _CONNECT_TIMEOUT_STRIKES
+    state = _install_state(fresh_registry, ["h1"])
+
+    for _ in range(_CONNECT_TIMEOUT_STRIKES - 1):
+        fresh_registry.mark_failed("X", "h1", timeout=True)
+    assert state.nodes["h1"].is_down is False
+
+    fresh_registry.mark_failed("X", "h1", timeout=True)
+    assert state.nodes["h1"].is_down is True
+
+
+def test_successful_connect_resets_timeout_strikes(fresh_registry):
+    from psycopg.yb.registry import _CONNECT_TIMEOUT_STRIKES
+    state = _install_state(fresh_registry, ["h1"])
+
+    for _ in range(_CONNECT_TIMEOUT_STRIKES - 1):
+        fresh_registry.mark_failed("X", "h1", timeout=True)
+    fresh_registry.mark_up("X", "h1")
+    fresh_registry.mark_failed("X", "h1", timeout=True)
+
+    assert state.nodes["h1"].is_down is False
+
+
+def test_refused_connect_still_quarantines_immediately(fresh_registry):
+    state = _install_state(fresh_registry, ["h1"])
+
+    fresh_registry.mark_failed("X", "h1")
+
+    assert state.nodes["h1"].is_down is True
