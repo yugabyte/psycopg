@@ -83,6 +83,11 @@ class Phase2TimeoutError(Exception):
     transition (does NOT flip routing) and resumes dispatch.
     """
 
+# Minimum time between closing the outgoing side's conns and resuming
+# dispatch onto the incoming side (see the close fence in
+# _drain_and_apply). Covers an owner that polls its conn once a second.
+_CLOSE_FENCE_S = 1.0
+
 # Wall-clock budget for the parallel force-close phase — separate from
 # drainTimeoutSecs (which is the grace window for natural drain).
 # Rationale: libpq's PQfinish calls send() to push a Terminate byte
@@ -730,6 +735,8 @@ def _drain_and_apply(
             )
         with group.lock:
             group.last_phase1_complete_ts = now
+        closed_any = bool(survivors) or total_idle_closed > 0
+        closed_at = time.monotonic()
 
         # 4b. Phase 2 — YBA replication-lag wait. Direction-aware:
         #   * Failover  (UNHEALTHY): poll the A→B config UUID iff set.
@@ -795,6 +802,18 @@ def _drain_and_apply(
         # SKIPPED when Phase 2 aborted on timeout (data-corruption fix) —
         # we don't flip to a target we know is behind.
         if not phase2_aborted:
+            # Close fence: a conn we just closed is only noticed by its
+            # owner on its next call. An app that holds session state
+            # (an advisory-lock leader heartbeating every ~1s) would
+            # otherwise still believe it holds the lock while a new
+            # session on the incoming side acquires it. Hold dispatch
+            # until the fence has elapsed since the last close; Phase 2
+            # time counts towards it. Once per flip, only when something
+            # was closed.
+            if closed_any:
+                remaining = closed_at + _CLOSE_FENCE_S - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
             _apply_status_change(
                 group, which_cluster, new_status, after_drain=True,
             )
