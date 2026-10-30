@@ -772,3 +772,28 @@ def test_failback_params_stripped_from_cleaned_conninfo():
     assert "failback" not in cleaned.lower()
     assert "rep-b-to-a" not in cleaned
 
+
+
+# ------------------------------------------------------- xCluster socket defaults
+
+def test_xcluster_socket_defaults_fill_missing_keys():
+    """hung_workers (stress 64a57bb5 cycle 1, nat_idle_drop): with no
+    keepalives or tcp_user_timeout a NAT-dropped socket blocked its owner
+    until the workload stopped."""
+    from psycopg.yb.params import (
+        XCLUSTER_SOCKET_DEFAULTS, with_xcluster_socket_defaults,
+    )
+
+    assert with_xcluster_socket_defaults("host=a", {}) == XCLUSTER_SOCKET_DEFAULTS
+
+
+def test_xcluster_socket_defaults_never_override_user_values():
+    from psycopg.yb.params import with_xcluster_socket_defaults
+
+    out = with_xcluster_socket_defaults(
+        "host=a keepalives_idle=30", {"tcp_user_timeout": 0},
+    )
+
+    assert "keepalives_idle" not in out          # conninfo value wins
+    assert out["tcp_user_timeout"] == 0          # kwarg value wins
+    assert out["keepalives_count"] == "3"

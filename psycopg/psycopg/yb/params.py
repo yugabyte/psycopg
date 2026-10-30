@@ -466,6 +466,33 @@ def _clamp_lo(value: int, lo: int) -> int:
     return max(lo, value)
 
 
+# Socket settings applied in xCluster mode when the DSN leaves them out.
+# Without keepalives or tcp_user_timeout a socket the network silently
+# drops (NAT idle expiry, partition) blocks the owner forever: only a
+# drain closes it, and between flips none runs. Keepalives every 5 s also
+# keep NAT idle timers from expiring the flow. A key set in the DSN or
+# kwargs, under its libpq name, always wins.
+XCLUSTER_SOCKET_DEFAULTS: dict[str, str] = {
+    "keepalives": "1",
+    "keepalives_idle": "5",
+    "keepalives_interval": "2",
+    "keepalives_count": "3",
+    "tcp_user_timeout": "10000",
+}
+
+
+def with_xcluster_socket_defaults(
+    conninfo: str, kwargs: dict[str, object],
+) -> dict[str, object]:
+    """Return ``kwargs`` plus every XCLUSTER_SOCKET_DEFAULTS key that
+    neither ``conninfo`` nor ``kwargs`` sets."""
+    from ..conninfo import conninfo_to_dict
+
+    present = conninfo_to_dict(conninfo, **kwargs)  # type: ignore[arg-type]
+    missing = {k: v for k, v in XCLUSTER_SOCKET_DEFAULTS.items() if k not in present}
+    return {**missing, **kwargs}
+
+
 def extract_yb_params(
     conninfo: str, kwargs: dict[str, object]
 ) -> tuple["YBParams", str, dict[str, object]]:

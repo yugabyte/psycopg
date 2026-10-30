@@ -158,6 +158,11 @@ class Connection(BaseConnection[Row]):
             from .yb.state import dispatch_generation as _dispatch_generation
             from .yb.state import wait_for_dispatch as _wait_for_dispatch
 
+            from .yb.params import with_xcluster_socket_defaults
+
+            cleaned_kwargs = with_xcluster_socket_defaults(
+                cleaned_conninfo, cleaned_kwargs
+            )
             failover_group = registry.get_or_bootstrap_failover_group(
                 yb_params, cleaned_conninfo, cleaned_kwargs
             )
