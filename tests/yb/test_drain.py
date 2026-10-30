@@ -138,33 +138,6 @@ def test_no_drain_when_secondary_flips_and_primary_stays_healthy(fake_state):
     assert pause_observations == [], "pause_dispatch shouldn't fire"
 
 
-def test_no_drain_when_transition_is_none_to_secondary(fake_state):
-    """From (primary UNHEALTHY, secondary UNHEALTHY) → serving None. Then
-    secondary flips HEALTHY → serving becomes secondary. Nothing was
-    active before, so no drain."""
-    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
-    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
-    group = FailoverGroup(
-        primary=p, secondary=s, lock=threading.Lock(),
-        primary_status=HealthResult.UNHEALTHY,
-        secondary_status=HealthResult.UNHEALTHY,
-        cooldown_s=0,
-    )
-    # A stale primary conn that would nominally get closed if drain ran.
-    stale = _FakeConn(TransactionStatus.INTRANS)
-    group.primary.tracked_conns.add(stale)
-
-    trigger_drain(
-        group,
-        which_cluster="secondary",
-        new_status=HealthResult.HEALTHY,
-        drain_timeout_s=5,
-    )
-
-    assert group.secondary_status == HealthResult.HEALTHY
-    assert stale.closed is False   # nothing was active before, no drain
-
-
 # ------------------------------------------------------- routing change
 
 def test_primary_flip_drains_primary_and_flips_dispatch(fake_state):
@@ -513,3 +486,87 @@ def test_timestamps_not_touched_when_no_routing_change(fake_state):
     assert group.last_failover_complete_ts == 0.0
     assert group.last_failback_complete_ts == 0.0
 
+
+
+# ------------------------------------------------------- no-viable transitions
+
+def test_last_viable_cluster_going_down_opens_no_drain(fake_state, caplog):
+    """Routing on secondary (primary already UNHEALTHY), then secondary
+    goes UNHEALTHY → no viable cluster. There is nothing to drain
+    towards, so no drain window opens (the harness models a drain as
+    outgoing → incoming; an X → None drain never gets closed)."""
+    import logging
+    group = _make_group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    conn = _FakeConn(TransactionStatus.INTRANS)
+    group.secondary.tracked_conns.add(conn)
+    pauses: list[bool] = []
+    orig_pause = group.pause_dispatch
+    group.pause_dispatch = lambda: (pauses.append(True), orig_pause())[1]  # type: ignore[method-assign]
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert group.secondary_status == HealthResult.UNHEALTHY
+    assert pauses == []
+    assert conn.closed is False
+    assert not any("drain-wait start" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("recovering,other", [
+    ("secondary", "primary"),
+    ("primary", "secondary"),
+])
+def test_recovery_from_no_viable_drains_the_other_side(
+    fake_state, caplog, recovering, other,
+):
+    """Both UNHEALTHY → one recovers. Routing changes None → recovering,
+    so the driver must run a real drain against the other side (closing
+    conns that outlived the outage there) and log the flip as a routing
+    change, not "routing unchanged"."""
+    import logging
+    group = _make_group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    group.secondary_status = HealthResult.UNHEALTHY
+    survivor = _FakeConn(TransactionStatus.IDLE)
+    getattr(group, other).tracked_conns.add(survivor)
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+
+    trigger_drain(group, recovering, HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert getattr(group, f"{recovering}_status") == HealthResult.HEALTHY
+    assert survivor.closed is True
+    assert group.dispatch_paused is False
+    msgs = [r.getMessage() for r in caplog.records]
+    other_uuid = getattr(group, other).uuid
+    assert any(
+        "drain-wait start" in m and f"outgoing={other_uuid}" in m for m in msgs
+    ), msgs
+    assert any("routing target flipped" in m for m in msgs), msgs
+    assert not any("routing unchanged" in m for m in msgs), msgs
+    if recovering == "primary":
+        assert group.last_failback_complete_ts > 0
+    else:
+        assert group.last_failover_complete_ts > 0
+
+
+def test_recovery_from_no_viable_skips_phase2(fake_state):
+    """The other side wasn't serving during no-viable, so there is no
+    lag to wait for: Phase 2 must not poll YBA on recovery."""
+    group = _make_group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    group.secondary_status = HealthResult.UNHEALTHY
+
+    class _NoPollYBA:
+        def get_committed_lag_ms(self, uuid):
+            raise AssertionError("Phase 2 must be skipped on no-viable recovery")
+
+        get_committed_lag_sample = get_committed_lag_ms
+
+    group.yba_client = _NoPollYBA()
+    group.xcluster_config_uuid = "xcc-a2b"
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+
+    trigger_drain(group, "secondary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.secondary_status == HealthResult.HEALTHY

@@ -241,12 +241,47 @@ def trigger_drain(
             new_status == HealthResult.HEALTHY,
         )
 
-    if before_active == after_active or before_active is None:
+    if before_active == after_active:
         # No routing change — apply the status without disturbing
         # dispatch. This covers e.g. "secondary flips while primary is
-        # HEALTHY" and "before was no-viable; new status doesn't change
-        # active".
+        # HEALTHY".
         _apply_status_change(group, which_cluster, new_status)
+        return
+
+    if after_active is None:
+        # Last viable cluster went UNHEALTHY. There is no target to
+        # drain towards, so don't open a drain window: dispatch starts
+        # raising NoViableClusterError and conns on the dead side fail
+        # on their own. Any that survive are closed by the drain that
+        # runs when a cluster comes back (below).
+        logger.warning(
+            "xCluster %s → %s leaves no viable cluster (primary_uuid=%s); "
+            "routing suspended until a cluster recovers",
+            which_cluster, new_status.value, group.primary.uuid,
+        )
+        _apply_status_change(group, which_cluster, new_status)
+        return
+
+    if before_active is None:
+        # Recovery from no-viable. Routing changes (None → after_active),
+        # so run a real drain against the OTHER side: it closes anything
+        # still open there (e.g. conns that outlived a probe-only
+        # outage) before dispatch resumes onto after_active. Phase 2 is
+        # skipped — the other side was not serving, so there is nothing
+        # in flight to replicate.
+        outgoing = group.secondary if after_active == "primary" else group.primary
+        now_start = time.monotonic()
+        with group.lock:
+            group.last_failover_start_ts = now_start
+        _drain_and_apply(
+            group=group,
+            which_cluster=which_cluster,
+            new_status=new_status,
+            outgoing=outgoing,
+            drain_timeout_s=drain_timeout_s,
+            is_failback=after_active == "primary",
+            skip_phase2=True,
+        )
         return
 
     # Auto-failback gate. When the operator has set
@@ -345,8 +380,12 @@ def _drain_and_apply(
     outgoing: "ClusterState",
     drain_timeout_s: int,
     is_failback: bool = False,
+    skip_phase2: bool = False,
 ) -> None:
-    """Full barrier-drain-flip sequence. See module docstring."""
+    """Full barrier-drain-flip sequence. See module docstring.
+
+    ``skip_phase2`` is set for recovery from no-viable, where the
+    outgoing side was not serving and there is no lag to wait for."""
     # Snapshot the initial tracked-conn count for the log line — the
     # weakref set may shrink under GC during the drain.
     initial_tracked = len(outgoing.tracked_conns)
@@ -612,7 +651,7 @@ def _drain_and_apply(
         #                            (per §3.5.1 symmetric behaviour).
         # A missing config UUID in either direction fails open — same
         # semantics as YBA being unreachable.
-        if group.yba_client is not None:
+        if group.yba_client is not None and not skip_phase2:
             if new_status == HealthResult.UNHEALTHY and group.xcluster_config_uuid:
                 _wait_for_replication_lag(group, which_cluster, is_failback=False)
             elif (
