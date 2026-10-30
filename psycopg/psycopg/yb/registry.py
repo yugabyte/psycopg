@@ -492,11 +492,10 @@ class FailoverGroup:
     # from the operator's side). Default True preserves v1 behaviour.
     auto_failback_enabled: bool = True
 
-    # Phase 2 timeout policy (DB-corruption fix). ``"fail"`` (default)
-    # means do NOT flip routing when Phase 2 lag wait times out —
-    # protects against committing on a target that is known to be behind.
-    # ``"proceed"`` restores pre-fix behavior (flip anyway).
-    on_phase2_timeout: str = "fail"
+    # Phase 2 timeout policy. ``"proceed"`` (default) flips once the
+    # lag wait times out. ``"fail"`` keeps routing on the current side
+    # when a FAILBACK lag wait times out; failover always proceeds.
+    on_phase2_timeout: str = "proceed"
 
     # Per-stage timestamps (design doc §3.8). All ``time.monotonic()``
     # floats. Zero means "never fired". Written under ``self.lock`` at
@@ -517,7 +516,7 @@ class FailoverGroup:
     # this timestamp to distinguish "no viable cluster" from
     # "transient stale conn" after a PoolTimeout.
     last_no_viable_ts: float = 0.0
-    # Set by the drain when a Phase 2 lag wait times out and
+    # Set by the drain when a failback Phase 2 lag wait times out and
     # ``on_phase2_timeout == "fail"`` aborts the flip. Operators can
     # scrape this to detect degraded failover; custom CBs can read it
     # to rate-limit their trip signaling.

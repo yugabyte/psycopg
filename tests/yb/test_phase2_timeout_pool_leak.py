@@ -28,10 +28,10 @@ Root cause (two bugs compounding):
 
 Fix (this PR):
 
-  (a) `on_phase2_timeout="fail"` (default): on timeout, raise
-      `Phase2TimeoutError`; the drain catches it and SKIPS the status
-      change. Routing stays on the current side. Operator-visible
-      `last_phase2_timeout_ts` stamped.
+  (a) `on_phase2_timeout="fail"` (opt-in; default is "proceed"): on a
+      failback timeout, raise `Phase2TimeoutError`; the drain catches it
+      and SKIPS the status change. Routing stays on the current side.
+      Operator-visible `last_phase2_timeout_ts` stamped.
 
   (b) `_decide_eviction` during `dispatch_paused`: treat the current
       "active" cluster as OUTGOING, and evict any pool conn on it so
@@ -146,6 +146,39 @@ def test_shubham_cycle7_failback_timeout_does_not_flip(
     assert group.dispatch_paused is False, (
         "dispatch must unpause after an aborted drain — app can't hang"
     )
+
+
+def test_default_policy_failback_timeout_proceeds(fake_state, fresh_registry):
+    """Default is "proceed": a failback whose lag wait times out still
+    flips back to primary (the stress harness expects failback to
+    complete on timeout, e.g. `failback_asym`, `fault_in_drain`)."""
+    yba = _FakeYBAClient(lag_ms=5000.0)
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="PRIMARY-A")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="SECONDARY-B")
+    group = FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.UNHEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0,
+        yba_client=yba,
+        xcluster_config_uuid="xcc-a2b",
+        failback_xcluster_config_uuid="xcc-b2a",
+        threshold_replication_lag_ms=0,
+        lag_wait_timeout_s=2,
+        failback_lag_wait_timeout_s=2,
+    )
+    assert group.on_phase2_timeout == "proceed"
+
+    trigger_drain(
+        group,
+        which_cluster="primary",
+        new_status=HealthResult.HEALTHY,
+        drain_timeout_s=0,
+    )
+
+    assert group.primary_status is HealthResult.HEALTHY
+    assert group.last_failback_complete_ts > 0
+    assert group.dispatch_paused is False
 
 
 def test_proceed_policy_preserves_pre_fix_behavior(fake_state, fresh_registry):

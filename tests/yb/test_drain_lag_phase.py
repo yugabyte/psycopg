@@ -150,17 +150,17 @@ def test_lag_wait_converges_after_multiple_polls(fake_state):
 
 # ------------------------------------------------------- exit condition: timeout
 
-def test_lag_wait_timeout_when_never_converges_fail_policy(fake_state):
-    """DB-corruption fix: `onPhase2Timeout=fail` (default) aborts the
-    flip when the lag wait times out. Status stays HEALTHY, dispatch
-    unpauses, and `last_phase2_timeout_ts` is set."""
+def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
+    """`onPhase2Timeout=fail` only gates FAILBACK. A failover lag wait
+    that times out still flips — staying on the side the CB just
+    declared dead is worse than a lagged target."""
     group, client = _make_group_with_yba(
         fake_state,
         yba_responses=[500.0],   # sticky high value
         threshold_ms=1,
         lag_wait_timeout_s=2,
     )
-    # on_phase2_timeout defaults to "fail" — don't override.
+    group.on_phase2_timeout = "fail"
     import time
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
@@ -168,23 +168,13 @@ def test_lag_wait_timeout_when_never_converges_fail_policy(fake_state):
 
     assert 1.5 <= elapsed <= 3.5
     assert len(client.calls) >= 2
-    # Status does NOT flip — we don't commit the app to a known-stale target.
-    assert group.primary_status == HealthResult.HEALTHY, (
-        "under on_phase2_timeout=fail (default), status must stay on the "
-        "current side when Phase 2 times out — DB-corruption fix"
-    )
-    assert group.last_phase2_timeout_ts > 0, (
-        "last_phase2_timeout_ts should be stamped so operators + CBs can "
-        "observe degraded failover"
-    )
-    assert group.dispatch_paused is False, (
-        "dispatch must unpause even on abort — app shouldn't hang"
-    )
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.dispatch_paused is False
 
 
 def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
-    """`onPhase2Timeout=proceed` preserves pre-fix behavior — flip
-    anyway and accept the data-consistency risk."""
+    """`onPhase2Timeout=proceed` (default) — flip anyway once the lag
+    wait times out."""
     group, client = _make_group_with_yba(
         fake_state,
         yba_responses=[500.0],
@@ -460,3 +450,27 @@ def test_failover_direction_still_uses_failover_config(fake_state):
     assert len(client.calls) == 1
     assert client.calls[0] == "xcc-a2b"
 
+
+
+def test_lag_wait_timeout_uses_nearly_full_budget_with_fast_polls(fake_state, caplog):
+    """Fast YBA polls must not cost 2×(connect+read) of the budget: a
+    12s wait with millisecond polls runs to ≥11s, and the exit is logged
+    as a plain "lag wait timeout"."""
+    import logging
+    import time
+    group, client = _make_group_with_yba(
+        fake_state,
+        yba_responses=[500.0],
+        threshold_ms=1,
+        lag_wait_timeout_s=12,
+    )
+    caplog.set_level(logging.WARNING, logger="psycopg.yb.drain")
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    assert 11.0 <= elapsed <= 12.5, elapsed
+    assert group.primary_status == HealthResult.UNHEALTHY
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("lag wait timeout after") for m in msgs), msgs
+    assert not any("near-timeout" in m for m in msgs)

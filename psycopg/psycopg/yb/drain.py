@@ -75,17 +75,12 @@ logger = logging.getLogger(__name__)
 
 
 class Phase2TimeoutError(Exception):
-    """Raised by Phase 2 lag wait when it times out and the group's
-    ``on_phase2_timeout`` is ``"fail"`` (default).
+    """Raised by a FAILBACK Phase 2 lag wait when it times out and the
+    group's ``on_phase2_timeout`` is ``"fail"`` (opt-in; the default
+    is ``"proceed"``).
 
     Caught by ``_drain_and_apply``, which then SKIPS the status
-    transition (does NOT flip routing) and resumes dispatch. Protects
-    against the data-corruption window Shubham reported in cycle 7
-    (Oct 23 2026): flipping to a known-stale secondary let the app
-    delete rows on A that it had just inserted on B.
-
-    Operators who want the pre-fix "flip anyway on timeout" behavior
-    set ``yb.failover.onPhase2Timeout=proceed`` in the DSN.
+    transition (does NOT flip routing) and resumes dispatch.
     """
 
 # Wall-clock budget for the parallel force-close phase — separate from
@@ -667,8 +662,8 @@ def _drain_and_apply(
         # A missing config UUID in either direction fails open — same
         # semantics as YBA being unreachable.
         #
-        # DB-corruption fix: wrap in `Phase2TimeoutError` catch. On
-        # ``onPhase2Timeout="fail"`` (default), the lag-wait raises
+        # Wrap in `Phase2TimeoutError` catch. On
+        # ``onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
         # when it times out before converging. We log, record the
         # timeout timestamp, and SKIP the status change — routing
         # stays on the current (known-good) side. Dispatch still
@@ -821,12 +816,20 @@ def _wait_for_replication_lag(
         getattr(group.yba_client, "connect_timeout_s", 2.0),
         getattr(group.yba_client, "read_timeout_s", 3.0),
     ) * 2.0
-    _MIN_POLL_BUDGET_S = (
-        _one_poll_cost_s if timeout_s >= _one_poll_cost_s * 2.0 else 0.0
-    )
+    _poll_guard = timeout_s >= _one_poll_cost_s * 2.0
+    # Reserve twice the slowest poll seen so far (floor 0.5s), capped at
+    # the worst case. Reserving the worst case outright cut a 30s wait
+    # to 24s even though real polls take milliseconds.
+    slowest_poll_s = 0.0
 
     while True:
         now = time.monotonic()
+        if slowest_poll_s > 0.0:
+            _MIN_POLL_BUDGET_S = min(_one_poll_cost_s, max(0.5, slowest_poll_s * 2.0))
+        else:
+            _MIN_POLL_BUDGET_S = _one_poll_cost_s
+        if not _poll_guard:
+            _MIN_POLL_BUDGET_S = 0.0
         if now >= deadline:
             elapsed = now - started
             # Phase 2 timeout policy. Agent-K PR #18:710,575. The `fail`
@@ -840,12 +843,12 @@ def _wait_for_replication_lag(
             # direction regardless of the knob — the knob only matters
             # for the failback case where staying on current side is
             # a safe degraded-mode choice.
-            policy = getattr(group, "on_phase2_timeout", "fail")
+            policy = getattr(group, "on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=%s, "
                     "threshold=%.1fms) — ABORTING flip; routing stays "
-                    "on current side (set yb.failback.onPhase2Timeout="
+                    "on current side (set yb.failover.onPhase2Timeout="
                     "proceed to flip anyway)",
                     elapsed, direction_label, threshold_ms,
                 )
@@ -879,30 +882,29 @@ def _wait_for_replication_lag(
             # bypassing the abort and silently flipping onto a
             # known-lagged target during tight lag_wait_timeout_s
             # settings.
+            # Same "lag wait timeout" prefix as the deadline branch so log
+            # consumers see one timeout outcome, not two.
             elapsed = now - started
-            policy = getattr(group, "on_phase2_timeout", "fail")
+            policy = getattr(group, "on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
-                    "lag wait near-timeout: %.1fs remaining is below "
-                    "min poll budget %.1fs — ABORTING flip "
-                    "(direction=failback, policy=fail) rather than "
-                    "overshooting the lag budget onto a known-lagged "
-                    "target (elapsed=%.1fs / %ds)",
-                    deadline - now, _MIN_POLL_BUDGET_S, elapsed, timeout_s,
+                    "lag wait timeout after %.1fs (direction=failback, "
+                    "threshold=%.1fms; %.1fs left is below the %.1fs poll "
+                    "budget) — ABORTING flip; routing stays on current side",
+                    elapsed, threshold_ms, deadline - now, _MIN_POLL_BUDGET_S,
                 )
                 raise Phase2TimeoutError(
-                    f"lag wait near-timeout after {elapsed:.1f}s "
-                    f"(direction=failback, min_poll_budget="
-                    f"{_MIN_POLL_BUDGET_S:.1f}s)"
+                    f"lag wait timeout after {elapsed:.1f}s "
+                    f"(direction=failback, threshold={threshold_ms:.1f}ms)"
                 )
             logger.warning(
-                "lag wait near-timeout: %.1fs remaining is below "
-                "min poll budget %.1fs — proceeding with flip "
-                "(elapsed=%.1fs / %ds)",
-                deadline - now, _MIN_POLL_BUDGET_S, elapsed, timeout_s,
+                "lag wait timeout after %.1fs (%.1fs left is below the "
+                "%.1fs poll budget) — proceeding with flip (direction=%s)",
+                elapsed, deadline - now, _MIN_POLL_BUDGET_S, direction_label,
             )
             return
 
+        poll_started = time.monotonic()
         try:
             # DB-24483: prefer the sample-returning variant so we can
             # log how old the YBA data was. Custom lag sources that
@@ -919,6 +921,7 @@ def _wait_for_replication_lag(
             else:
                 lag_ms = group.yba_client.get_committed_lag_ms(xcluster_uuid)
                 sample_ts = None
+            slowest_poll_s = max(slowest_poll_s, time.monotonic() - poll_started)
             unreachable_streak = 0
             # One line per poll — operator can trace exactly what the
             # driver observed on each 1-second tick. INFO because
@@ -943,6 +946,7 @@ def _wait_for_replication_lag(
                     lag_ms, threshold_ms, age_str, elapsed, timeout_s,
                 )
         except YBAClientError as exc:
+            slowest_poll_s = max(slowest_poll_s, time.monotonic() - poll_started)
             unreachable_streak += 1
             logger.warning(
                 "lag wait: YBA unreachable (%d/%d): %s",
