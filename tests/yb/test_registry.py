@@ -274,6 +274,7 @@ def _state_with_bootstrap(reg: ClusterRegistry, hosts: list[str], down: set[str]
     state.control_sync = None
     for h in down:
         state.nodes[h].is_down = True
+        state.nodes[h].is_down_since = time.monotonic()
     return state
 
 
@@ -712,3 +713,45 @@ def test_merge_clears_force_refresh(fresh_registry):
     fresh_registry._merge_new_nodes(state, [_make_node("h1")])
 
     assert state.force_refresh is False
+
+
+# ------------------------------------------------------- node recovery
+
+def test_mark_up_clears_down_flag(fresh_registry):
+    """node_recovery (stress, every outage cycle): nothing ever cleared
+    is_down, so a node that failed one connect stayed "down" for the life
+    of the process. A successful connect must clear it."""
+    state = _install_state(fresh_registry, ["h1"])
+    fresh_registry.mark_failed("X", "h1")
+    assert state.nodes["h1"].is_down is True
+
+    fresh_registry.mark_up("X", "h1")
+
+    assert state.nodes["h1"].is_down is False
+    assert state.nodes["h1"].is_down_since == 0.0
+
+
+def test_merge_clears_down_flag_once_listed_past_grace(fresh_registry):
+    """The inactive universe gets no app connects, so refresh is the
+    recovery signal there: still listed by yb_servers() and down for
+    longer than the reconnect TTL → recovered."""
+    from psycopg.yb.registry import _DOWN_RECOVERY_GRACE_S
+    state = _install_state(fresh_registry, ["h1", "h2"])
+    state.nodes["h2"].is_down = True
+    state.nodes["h2"].is_down_since = time.monotonic() - (_DOWN_RECOVERY_GRACE_S + 1)
+
+    fresh_registry._merge_new_nodes(state, [_make_node("h1"), _make_node("h2")])
+
+    assert state.nodes["h2"].is_down is False
+
+
+def test_merge_keeps_unlisted_down_node_down_past_grace(fresh_registry):
+    """Recovery via refresh needs the host to be listed again."""
+    from psycopg.yb.registry import _DOWN_RECOVERY_GRACE_S
+    state = _install_state(fresh_registry, ["h1", "h2"])
+    state.nodes["h2"].is_down = True
+    state.nodes["h2"].is_down_since = time.monotonic() - (_DOWN_RECOVERY_GRACE_S + 1)
+
+    fresh_registry._merge_new_nodes(state, [_make_node("h1")])
+
+    assert state.nodes["h2"].is_down is True

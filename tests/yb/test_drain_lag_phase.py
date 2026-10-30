@@ -95,6 +95,11 @@ def _make_group_with_yba(
     threshold_ms: int = 0,
     lag_wait_timeout_s: int = 5,
     with_yba_client: bool = True,
+    # DB-24483: these tests predate the freshness + liveness gates and
+    # exercise the pre-fix single-sample convergence. Opt out by
+    # default; test_drain_db24483_freshness_gate.py covers the gate.
+    lag_freshness_s: int = 0,
+    lag_confirmation_samples: int = 1,
 ) -> tuple[FailoverGroup, _FakeYBAClient]:
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
@@ -108,6 +113,10 @@ def _make_group_with_yba(
         xcluster_config_uuid="xcc-abcd",
         threshold_replication_lag_ms=threshold_ms,
         lag_wait_timeout_s=lag_wait_timeout_s,
+        lag_freshness_s=lag_freshness_s,
+        lag_confirmation_samples=lag_confirmation_samples,
+        failback_lag_freshness_s=lag_freshness_s,
+        failback_lag_confirmation_samples=lag_confirmation_samples,
     )
     return group, client
 
@@ -343,6 +352,11 @@ def _make_group_with_failback_yba(
     failback_threshold_ms: int = 0,
     failback_timeout_s: int = 5,
     failback_config_uuid: str = "xcc-b2a",
+    # DB-24483: default both sides to pre-fix single-sample semantics so
+    # existing tests keep testing the direction/UUID selection they were
+    # written for; the gate itself has dedicated tests.
+    lag_freshness_s: int = 0,
+    lag_confirmation_samples: int = 1,
 ) -> tuple[FailoverGroup, _FakeYBAClient]:
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
@@ -359,6 +373,10 @@ def _make_group_with_failback_yba(
         failback_xcluster_config_uuid=failback_config_uuid,
         failback_threshold_replication_lag_ms=failback_threshold_ms,
         failback_lag_wait_timeout_s=failback_timeout_s,
+        lag_freshness_s=lag_freshness_s,
+        lag_confirmation_samples=lag_confirmation_samples,
+        failback_lag_freshness_s=lag_freshness_s,
+        failback_lag_confirmation_samples=lag_confirmation_samples,
     )
     return group, client
 
