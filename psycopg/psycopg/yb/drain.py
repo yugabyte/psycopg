@@ -83,6 +83,11 @@ class Phase2TimeoutError(Exception):
     transition (does NOT flip routing) and resumes dispatch.
     """
 
+# Minimum time between closing the outgoing side's conns and resuming
+# dispatch onto the incoming side (see the close fence in
+# _drain_and_apply). Covers an owner that polls its conn once a second.
+_CLOSE_FENCE_S = 1.0
+
 # Wall-clock budget for the parallel force-close phase — separate from
 # drainTimeoutSecs (which is the grace window for natural drain).
 # Rationale: libpq's PQfinish calls send() to push a Terminate byte
@@ -199,6 +204,56 @@ def _in_flight_conns(tracked: "weakref.WeakSet") -> list:
         if status_int in _IN_FLIGHT_TX_STATUSES:
             result.append(c)
     return result
+
+
+def _close_idle_tracked_during_drain(
+    tracked: "weakref.WeakSet", outgoing_uuid: str,
+) -> int:
+    """Close every tracked direct conn that is currently IDLE (not in a
+    transaction) and not yet closed. Returns the number of conns closed.
+
+    Called from the drain poll loop while ``dispatch_paused=True`` (barrier
+    held) to prevent persistent sockets from starting a FRESH transaction
+    on the outgoing universe between two commits. The current txn (if any)
+    is left alone — the loop will see it as in-flight on the next tick and
+    only close it once it commits. Without this, with
+    ``drainTimeoutSecs=-1`` the loop waits for a "zero in-flight" instant
+    that never arrives under steady load — persistent conns loop
+    txn→IDLE→txn forever on the outgoing side (DB-25012).
+
+    The close is sync here (no thread pool) because an IDLE conn has no
+    in-flight libpq state — ``pgconn.finish()`` returns in microseconds.
+    Uses ``_safe_close`` for sync/async dispatch (DB-24960, PR-H1). Pool
+    conns are strong-referenced by the pool and are not in ``tracked`` —
+    they're evicted by ``xcluster_check`` on the next ``getconn``, not
+    here.
+    """
+    closed = 0
+    for c in list(tracked):
+        try:
+            if getattr(c, "closed", False):
+                continue
+            status = c.info.transaction_status
+            if int(status) in _IN_FLIGHT_TX_STATUSES:
+                continue
+        except Exception:
+            # Broken conn / stale weakref / in the middle of a status
+            # read race — treat as "do nothing", the next tick retries.
+            continue
+        exc = _safe_close(c)
+        if exc is None:
+            closed += 1
+        else:
+            # Rare — _safe_close on an IDLE conn mostly just calls
+            # pgconn.finish(). If it raised, log at debug (not warning)
+            # because the next tick's _in_flight_conns check will treat
+            # a half-closed conn as not-in-flight and the drain still
+            # progresses.
+            logger.debug(
+                "drain: idle-close on tracked conn failed on uuid=%s: %s",
+                outgoing_uuid, exc,
+            )
+    return closed
 
 
 def _compute_active(primary_healthy: bool, secondary_healthy: bool):
@@ -431,14 +486,31 @@ def _drain_and_apply(
         # 3. Poll until either all in-flight transactions drain OR the
         # deadline hits. The loop exit is driven by in-flight count
         # alone so natural drain remains the fast path.
+        #
+        # Each tick ALSO closes any tracked direct conn that happens to
+        # be IDLE at the moment of the check — stops the persistent-
+        # socket reuse pattern (txn commits → conn goes IDLE → app's next
+        # cursor.execute starts a new txn on the same socket, still
+        # routed to the outgoing universe) that made `drainTimeoutSecs=-1`
+        # loop forever under steady load (DB-25012). The current txn on
+        # a persistent conn is left alone; it will be seen in-flight and
+        # closed the tick after it commits. See
+        # `_close_idle_tracked_during_drain`.
         drained_naturally = False
+        total_idle_closed = 0
         while True:
+            idle_closed = _close_idle_tracked_during_drain(
+                outgoing.tracked_conns, outgoing.uuid,
+            )
+            total_idle_closed += idle_closed
             in_txn = _in_flight_conns(outgoing.tracked_conns)
             if not in_txn:
                 drained_naturally = True
                 logger.debug(
-                    "drain: all in-flight txns completed on %s (tracked=%d)",
+                    "drain: all in-flight txns completed on %s "
+                    "(tracked=%d, idle_closed_this_drain=%d)",
                     outgoing.uuid, len(outgoing.tracked_conns),
+                    total_idle_closed,
                 )
                 break
             now = time.monotonic()
@@ -631,11 +703,18 @@ def _drain_and_apply(
                 phase1_elapsed, outgoing.uuid,
             )
         elif drained_naturally:
+            # agent-K PR #19:466 — include total_idle_closed so the
+            # operator can see how many persistent conns were closed
+            # during the drain loop (the DB-25012 H7 path), separate
+            # from the ones closed at the flip boundary.
             logger.info(
                 "xCluster drain: Phase 1 completed in %.2fs — all %d "
                 "in-flight txn(s) drained naturally; closed %d idle "
-                "tracked conn(s) at flip boundary (DB-24801)",
+                "tracked conn(s) at flip boundary (DB-24801), %d "
+                "additional idle conn(s) closed during drain loop "
+                "(DB-25012)",
                 phase1_elapsed, initial_in_flight, len(survivors),
+                total_idle_closed,
             )
         else:
             # Count how many survivors were in-flight at the deadline
@@ -647,13 +726,17 @@ def _drain_and_apply(
                 "xCluster drain: Phase 1 hit the %ds drain-wait deadline "
                 "→ kill-at-timeout fired: %d tracked conn(s) force-closed "
                 "(%d in-flight + %d idle at deadline), %d completed "
-                "naturally before deadline",
+                "naturally before deadline, %d idle conn(s) closed "
+                "during drain loop (DB-25012)",
                 drain_timeout_s, len(survivors),
                 at_deadline_in_flight, at_deadline_idle,
                 initial_in_flight - at_deadline_in_flight,
+                total_idle_closed,
             )
         with group.lock:
             group.last_phase1_complete_ts = now
+        closed_any = bool(survivors) or total_idle_closed > 0
+        closed_at = time.monotonic()
 
         # 4b. Phase 2 — YBA replication-lag wait. Direction-aware:
         #   * Failover  (UNHEALTHY): poll the A→B config UUID iff set.
@@ -719,6 +802,18 @@ def _drain_and_apply(
         # SKIPPED when Phase 2 aborted on timeout (data-corruption fix) —
         # we don't flip to a target we know is behind.
         if not phase2_aborted:
+            # Close fence: a conn we just closed is only noticed by its
+            # owner on its next call. An app that holds session state
+            # (an advisory-lock leader heartbeating every ~1s) would
+            # otherwise still believe it holds the lock while a new
+            # session on the incoming side acquires it. Hold dispatch
+            # until the fence has elapsed since the last close; Phase 2
+            # time counts towards it. Once per flip, only when something
+            # was closed.
+            if closed_any:
+                remaining = closed_at + _CLOSE_FENCE_S - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
             _apply_status_change(
                 group, which_cluster, new_status, after_drain=True,
             )
