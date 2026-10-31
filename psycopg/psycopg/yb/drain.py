@@ -1032,11 +1032,6 @@ def _drain_and_apply(
 
 # --------------------------------------------------------------------- Phase 2
 
-# Lag waits shorter than this use a single confirmation sample even when
-# more are configured: a second distinct YBA point can take one ~10 s
-# step, plus Phase 1 eats into the same window.
-_CONFIRMATION_MIN_WAIT_S = 20
-
 # Fixed 1-second poll interval per Amogh's 2026-08-11 Slack message.
 _LAG_POLL_INTERVAL_S = 1.0
 
@@ -1097,17 +1092,6 @@ def _wait_for_replication_lag(
     # freshness gate degrades to "any sample is fresh" and the liveness
     # gate still runs on sample identity.
     barrier_ts = float(getattr(group, "barrier_ts", 0.0))
-    # A second confirmation needs a new YBA point (up to one ~10 s step).
-    # Waits too short to fit that keep the single-sample behaviour
-    # instead of timing out on every planned flip.
-    if required_samples > 1 and timeout_s < _CONFIRMATION_MIN_WAIT_S:
-        logger.info(
-            "lag wait: timeout %ds is below %ds — using 1 confirmation "
-            "instead of %d (direction=%s)",
-            timeout_s, _CONFIRMATION_MIN_WAIT_S, required_samples,
-            direction_label,
-        )
-        required_samples = 1
 
     logger.warning(
         "lag wait start: direction=%s outgoing=%s xcluster_config=%s "
@@ -1332,15 +1316,15 @@ def _wait_for_replication_lag(
             # from "same stale replay reused". Require N distinct
             # ``sample_ts`` values at ≤ threshold before flipping.
             if (
-                required_samples > 1
-                and sample_ts is not None
+                sample_ts is not None
                 and barrier_ts > 0
                 and sample_ts <= barrier_ts
             ):
                 # A point collected before the barrier cannot show that
                 # writes acknowledged before the barrier have arrived
                 # (stress phase2_claim: converged on such a sample while
-                # B was still missing batches).
+                # B was still missing batches). Applies at any
+                # confirmation count: with one, it is the only guard.
                 logger.info(
                     "lag wait: lag=%.1fms sample at %.3f predates the "
                     "barrier %.3f — not counting (confirmations=%d/%d, "
