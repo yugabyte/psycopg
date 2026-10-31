@@ -129,6 +129,24 @@ class HealthAndLagCircuitBreaker:
         # supplied.
         tracker_table_tablets: int = 9,
         max_health_failures_allowed: int = 0,
+        # DB-24852 — bounded-hold backstop. After this many consecutive
+        # "health UNHEALTHY but lag > threshold" ticks we trip to
+        # UNHEALTHY anyway, on the theory that if the primary is really
+        # dead the lag number can never move: nobody is left to report
+        # it, and YBA keeps replaying the last sample for its
+        # ~5-minute Prometheus window. The ``max_hold_ticks`` default
+        # (12) bounds the hold at 12 × ``yb_servers_refresh_interval``.
+        # The driver's default refresh interval is 300 s (5 min), so
+        # the default bound is ~60 min — too long for a dead-primary
+        # outage. Operators who care about dead-primary latency should
+        # EITHER lower this to a small number of ticks AND set
+        # ``yb_servers_refresh_interval`` to a short value in the DSN
+        # (e.g. refresh=5, max_hold_ticks=12 → ~60 s bound), OR size
+        # ``max_hold_ticks`` explicitly in wall-clock terms:
+        # ``int(desired_bound_s / yb_servers_refresh_interval)``. Set
+        # to 0 to disable (preserves the pre-fix infinite-hold
+        # behaviour — not recommended). Agent-K PR #15:137.
+        max_hold_ticks: int = 12,
     ) -> None:
         if which_cluster not in ("primary", "secondary"):
             raise ValueError(
@@ -139,10 +157,20 @@ class HealthAndLagCircuitBreaker:
             raise ValueError(
                 f"threshold_lag_ms must be >= 0, got {threshold_lag_ms}"
             )
+        if max_hold_ticks < 0:
+            raise ValueError(
+                f"max_hold_ticks must be >= 0, got {max_hold_ticks}"
+            )
         self.which_cluster = which_cluster
         self.threshold_lag_ms = threshold_lag_ms
+        self.max_hold_ticks = max_hold_ticks
         self._yba_client_override = yba_client
         self._xcluster_config_uuid_override = xcluster_config_uuid
+        # DB-24852: consecutive "hold HEALTHY" decisions. Reset on any
+        # health-HEALTHY or lag-converged tick.
+        self._hold_ticks = 0
+        # Consecutive "hold UNHEALTHY (failback gated)" decisions.
+        self._failback_hold_ticks = 0
 
         # Compose in a health probe. Default: tracker-table with the same
         # tuning knobs the pure TrackerTable CB accepts. Callers pass their
@@ -161,10 +189,38 @@ class HealthAndLagCircuitBreaker:
         self.last_trip_time: float = 0.0
         self.last_recovery_time: float = 0.0
         self._last_reported: HealthResult = HealthResult.HEALTHY
+        # agent-K PR #15:G9 — DB-24852/DB-24483 interaction. If the
+        # operator attaches this CB AND the driver's Phase 2 lag wait
+        # is also enabled on the group (``yba_client`` set), both gates
+        # run back-to-back on every planned failover, doubling the
+        # wall-clock. Log once per CB instance when ``check()`` first
+        # observes both are wired, so operators see the misconfig in
+        # their logs without hunting through two layers of config.
+        self._double_wait_warned = False
 
     # ---------------------------------------------------------- check()
 
     def check(self, group: "FailoverGroup") -> HealthResult:
+        # agent-K PR #15:G9 — warn once if driver Phase 2 is ALSO
+        # enabled on the group. The CB already gates on lag inside its
+        # UNHEALTHY path; running the driver's Phase 2 after that is
+        # redundant and doubles planned-failover wall-clock. Operators
+        # should set ``drainTimeoutSecs=0`` (and treat Phase 2 as a
+        # no-op) when attaching this CB. Checked here rather than at
+        # construction time because the CB is attached BEFORE
+        # ``_bootstrap_yba_lag_phase`` wires ``yba_client`` on the group.
+        if not self._double_wait_warned and getattr(group, "yba_client", None):
+            logger.warning(
+                "%s: HealthAndLagCircuitBreaker is attached AND driver "
+                "Phase 2 (yb.failover.ybaEndpoint) is wired on the "
+                "group — BOTH gate on lag back-to-back, doubling the "
+                "planned-failover wall-clock. Either remove the YBA "
+                "DSN knobs or set yb.failover.drainTimeoutSecs=0 so "
+                "Phase 2 skips the lag wait (the CB will do it).",
+                self.which_cluster,
+            )
+            self._double_wait_warned = True
+
         # Step 1: run the health probe. Any exception the wrapped CB
         # doesn't handle bubbles up — the driver's probe wraps this
         # call in a try/except anyway and preserves the previous status.
@@ -199,6 +255,12 @@ class HealthAndLagCircuitBreaker:
         # No YBA path available — fall back to health-only. Fail-open:
         # better to trip than to wedge waiting for a control plane we
         # don't have.
+        # agent-K PR #15:294 — each fail-open UNHEALTHY return breaks
+        # the "consecutive holds" chain the DB-24852 backstop measures.
+        # Reset the counter so a later re-hold starts fresh; otherwise
+        # a YBA blip between stuck ticks would silently preserve the
+        # count and let the backstop fire before N uninterrupted
+        # stuck-lag ticks.
         if client is None or not config_uuid:
             logger.warning(
                 "%s health probe says UNHEALTHY and no YBA lag source is "
@@ -208,6 +270,7 @@ class HealthAndLagCircuitBreaker:
                 "set" if client is not None else "unset",
                 config_uuid or "",
             )
+            self._hold_ticks = 0
             self._record_unhealthy(reason="health-fail, no YBA")
             return HealthResult.UNHEALTHY
 
@@ -223,6 +286,7 @@ class HealthAndLagCircuitBreaker:
                 "(fail-open)",
                 self.which_cluster, exc,
             )
+            self._hold_ticks = 0
             self._record_unhealthy(reason="health-fail, YBA error")
             return HealthResult.UNHEALTHY
         except Exception:
@@ -233,6 +297,7 @@ class HealthAndLagCircuitBreaker:
                 "unexpectedly; reporting UNHEALTHY (fail-open)",
                 self.which_cluster, exc_info=True,
             )
+            self._hold_ticks = 0
             self._record_unhealthy(reason="health-fail, YBA unexpected")
             return HealthResult.UNHEALTHY
 
@@ -244,6 +309,7 @@ class HealthAndLagCircuitBreaker:
                 "data; reporting UNHEALTHY (fail-open)",
                 self.which_cluster,
             )
+            self._hold_ticks = 0
             self._record_unhealthy(reason="health-fail, YBA no-data")
             return HealthResult.UNHEALTHY
 
@@ -253,18 +319,56 @@ class HealthAndLagCircuitBreaker:
                 "threshold %dms — CB tripping to UNHEALTHY",
                 self.which_cluster, lag_ms, self.threshold_lag_ms,
             )
+            # This is the "real" trip path (standby caught up). Reset
+            # the DB-24852 hold counter so a later re-hold starts
+            # fresh; `_record_unhealthy` deliberately does not reset
+            # to protect the sustained-stuck trip path from
+            # ping-ponging.
+            self._hold_ticks = 0
             self._record_unhealthy(
                 reason=f"health-fail, lag {lag_ms:.1f}ms ≤ threshold"
             )
             return HealthResult.UNHEALTHY
 
-        # Health is bad but the target still hasn't caught up. Hold
-        # HEALTHY so the driver doesn't trip; next tick will consult
-        # both signals again.
+        # Health is bad but the target still hasn't caught up.
+        # DB-24852: track consecutive holds; if we've been holding past
+        # ``max_hold_ticks`` the primary is likely dead (nothing is
+        # left to write to it, so the lag number YBA replays will
+        # never move). Trip anyway — the standby being behind is
+        # better than the application staying pointed at a dead
+        # universe.
+        self._hold_ticks += 1
+        if self.max_hold_ticks > 0 and self._hold_ticks >= self.max_hold_ticks:
+            # agent-K PR #15:296 — fire the WARNING only on the
+            # transition tick, not every subsequent tick while the
+            # backstop stays tripped. ``_record_unhealthy`` leaves
+            # ``_last_reported`` at UNHEALTHY, so an ongoing stuck
+            # state after the first trip comes back here with
+            # ``_last_reported == UNHEALTHY`` and skips the WARNING.
+            if self._last_reported == HealthResult.HEALTHY:
+                logger.warning(
+                    "🔴 %s: health probe UNHEALTHY for %d consecutive ticks "
+                    "with lag stuck at %.1fms (> threshold %dms) — tripping "
+                    "to UNHEALTHY anyway (DB-24852 backstop: primary may be "
+                    "dead and the YBA lag sample can only move once the "
+                    "primary comes back)",
+                    self.which_cluster, self._hold_ticks, lag_ms,
+                    self.threshold_lag_ms,
+                )
+            self._record_unhealthy(
+                reason=(
+                    f"sustained UNHEALTHY {self._hold_ticks} ticks, "
+                    f"lag stuck at {lag_ms:.1f}ms"
+                )
+            )
+            return HealthResult.UNHEALTHY
+
         logger.info(
             "%s: health probe UNHEALTHY but lag %.1fms > threshold %dms "
-            "— holding HEALTHY (target not ready)",
+            "— holding HEALTHY (%d/%d, target not ready)",
             self.which_cluster, lag_ms, self.threshold_lag_ms,
+            self._hold_ticks,
+            self.max_hold_ticks if self.max_hold_ticks > 0 else -1,
         )
         # Deliberately NOT calling _record_unhealthy — this is a hold,
         # not a trip. Keep last_reported as-is.
@@ -308,6 +412,18 @@ class HealthAndLagCircuitBreaker:
         failback_config = (
             getattr(group, "failback_xcluster_config_uuid", "") or ""
         )
+        if (
+            self._yba_client_override is None
+            and getattr(group, "yba_client", None) is not None
+            and failback_config
+        ):
+            # The driver's own failback Phase 2 is wired: it waits on
+            # B→A lag after the dispatch barrier (so the source is
+            # quiesced and lag can actually drain) and is bounded by
+            # failbackLagWaitTimeoutSecs. Gating here as well measures
+            # lag while the app is still writing to B, which never
+            # reaches a 0 ms threshold — failback would hold forever.
+            return True
         client = (
             self._yba_client_override
             or getattr(group, "yba_client", None)
@@ -326,13 +442,30 @@ class HealthAndLagCircuitBreaker:
                 exc,
             )
             return True
-        drained = lag_ms <= self.threshold_lag_ms
-        if not drained:
-            logger.info(
-                "primary: failback lag %.1fms > threshold %dms",
-                lag_ms, self.threshold_lag_ms,
+        threshold = getattr(
+            group, "failback_threshold_replication_lag_ms", self.threshold_lag_ms,
+        )
+        drained = lag_ms <= threshold
+        if drained:
+            self._failback_hold_ticks = 0
+            return True
+        # Same bounded-hold backstop as the failover direction: the app
+        # keeps writing to B while we wait, so lag may never reach the
+        # threshold. Release after max_hold_ticks.
+        self._failback_hold_ticks += 1
+        if self.max_hold_ticks > 0 and self._failback_hold_ticks >= self.max_hold_ticks:
+            logger.warning(
+                "primary: failback lag %.1fms > threshold %dms for %d ticks "
+                "— releasing failback gate (max_hold_ticks=%d)",
+                lag_ms, threshold, self._failback_hold_ticks, self.max_hold_ticks,
             )
-        return drained
+            self._failback_hold_ticks = 0
+            return True
+        logger.info(
+            "primary: failback lag %.1fms > threshold %dms",
+            lag_ms, threshold,
+        )
+        return False
 
     def _record_healthy(self) -> None:
         if self._last_reported == HealthResult.UNHEALTHY:
@@ -342,6 +475,10 @@ class HealthAndLagCircuitBreaker:
                 self.which_cluster,
             )
         self._last_reported = HealthResult.HEALTHY
+        # Reset the DB-24852 hold counter: either health recovered, or
+        # lag finally converged on this tick — either way, the next
+        # hold starts fresh.
+        self._hold_ticks = 0
 
     def _record_unhealthy(self, reason: str) -> None:
         if self._last_reported == HealthResult.HEALTHY:
@@ -350,3 +487,10 @@ class HealthAndLagCircuitBreaker:
                 "%s CB trip cause: %s", self.which_cluster, reason,
             )
         self._last_reported = HealthResult.UNHEALTHY
+        # Deliberately NOT clearing ``_hold_ticks`` here. If a sustained-
+        # stuck trip (DB-24852 backstop) called us, the next tick is
+        # still a hold candidate — resetting would let the CB flip back
+        # to HEALTHY on the very next probe and ping-pong the status.
+        # The lag-converge trip path explicitly resets before calling
+        # us (that's a "real" trip, not a stuck one). ``_record_healthy``
+        # also resets on any genuine recovery.

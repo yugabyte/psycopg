@@ -322,3 +322,46 @@ def test_trip_and_recovery_timestamps():
     probe.verdict = HealthResult.HEALTHY
     assert cb.check(group) is HealthResult.HEALTHY
     assert cb.last_recovery_time >= trip_at
+
+
+# ------------------------------------------------------- failback gate
+
+def _recovering_primary(yba_client, **group_kw):
+    cb = HealthAndLagCircuitBreaker(
+        which_cluster="primary",
+        threshold_lag_ms=0,
+        health_probe=_StubHealthProbe(HealthResult.HEALTHY),
+        **({"yba_client": group_kw.pop("override")} if "override" in group_kw else {}),
+    )
+    cb._last_reported = HealthResult.UNHEALTHY
+    group = _fake_group(
+        yba_client=yba_client,
+        failback_xcluster_config_uuid="xcc-b2a",
+        **group_kw,
+    )
+    return cb, group
+
+
+def test_failback_gate_defers_to_driver_phase2_when_wired():
+    """a7932f37 cycle 3: B→A lag sat at 98–133 ms while the app kept
+    writing to B, so a 0 ms CB gate held failback forever. With the
+    driver's failback Phase 2 wired, the CB must not gate (the driver
+    waits after the barrier, bounded by failbackLagWaitTimeoutSecs)."""
+    yba = _StubYBAClient([133.5])
+    cb, group = _recovering_primary(yba)
+
+    assert cb.check(group) == HealthResult.HEALTHY
+    assert yba.calls == []
+
+
+def test_failback_gate_with_override_client_is_bounded():
+    """Gate still runs when only the CB has a YBA client, but releases
+    after max_hold_ticks instead of holding forever."""
+    yba = _StubYBAClient([133.5])
+    cb, group = _recovering_primary(None, override=yba)
+    cb.max_hold_ticks = 3
+
+    verdicts = [cb.check(group) for _ in range(3)]
+
+    assert verdicts[:2] == [HealthResult.UNHEALTHY, HealthResult.UNHEALTHY]
+    assert verdicts[2] == HealthResult.HEALTHY

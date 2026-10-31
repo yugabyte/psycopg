@@ -788,13 +788,32 @@ def _wait_for_replication_lag(
             return
 
         try:
-            lag_ms = group.yba_client.get_committed_lag_ms(xcluster_uuid)
+            # DB-24483: prefer the sample-returning variant so we can
+            # log how old the YBA data was. Custom lag sources that
+            # only implement the legacy ``get_committed_lag_ms`` fall
+            # back to that — otherwise an AttributeError would land in
+            # the except-Exception path below and silently skip the
+            # lag wait (agent-K PR #15:698). We still trust YBA as the
+            # lag source of truth; surfacing the age gives operators a
+            # concrete number to reason about after a flip.
+            if hasattr(group.yba_client, "get_committed_lag_sample"):
+                sample = group.yba_client.get_committed_lag_sample(xcluster_uuid)
+                lag_ms = None if sample is None else sample[0]
+                sample_ts = None if sample is None else sample[1]
+            else:
+                lag_ms = group.yba_client.get_committed_lag_ms(xcluster_uuid)
+                sample_ts = None
             unreachable_streak = 0
             # One line per poll — operator can trace exactly what the
             # driver observed on each 1-second tick. INFO because
             # WARNING would spam in production; the demo bumps this
             # logger to INFO to make it visible.
             elapsed = time.monotonic() - started
+            if sample_ts is not None:
+                sample_age_s = max(0.0, time.time() - sample_ts)
+                age_str = f" sample_age={sample_age_s:.1f}s"
+            else:
+                age_str = ""
             if lag_ms is None:
                 logger.info(
                     "lag wait poll: no data reported by YBA "
@@ -803,9 +822,9 @@ def _wait_for_replication_lag(
                 )
             else:
                 logger.info(
-                    "lag wait poll: lag=%.1fms threshold=%.1fms "
+                    "lag wait poll: lag=%.1fms threshold=%.1fms%s "
                     "(elapsed=%.1fs / %ds)",
-                    lag_ms, threshold_ms, elapsed, timeout_s,
+                    lag_ms, threshold_ms, age_str, elapsed, timeout_s,
                 )
         except YBAClientError as exc:
             unreachable_streak += 1
@@ -821,6 +840,7 @@ def _wait_for_replication_lag(
                 )
                 return
             lag_ms = None
+            sample_ts = None
         except Exception:
             # Belt-and-braces — never let an unexpected exception in the
             # YBA client wedge the drain barrier.
@@ -832,10 +852,16 @@ def _wait_for_replication_lag(
 
         if lag_ms is not None and lag_ms <= threshold_ms:
             elapsed = time.monotonic() - started
+            # Log sample age at convergence so a post-mortem can tell
+            # whether we trusted a fresh or stale "caught-up" reading.
+            if sample_ts is not None:
+                age_str = f", sample_age={max(0.0, time.time() - sample_ts):.1f}s"
+            else:
+                age_str = ""
             logger.warning(
-                "lag wait converged in %.1fs (lag=%.1fms ≤ threshold=%.1fms) "
-                "— switching now",
-                elapsed, lag_ms, threshold_ms,
+                "lag wait converged in %.1fs (lag=%.1fms ≤ threshold=%.1fms"
+                "%s) — switching now",
+                elapsed, lag_ms, threshold_ms, age_str,
             )
             return
 
