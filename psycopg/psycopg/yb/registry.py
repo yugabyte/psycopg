@@ -970,8 +970,9 @@ class ClusterRegistry:
     #      the lock so we never block other callers).
     #   3. Run `yb_servers()` + `yb_universe_uuid()` on the new connection.
     #   4. Re-acquire the registry lock. If `_clusters[uuid]` already exists
-    #      (another caller beat us to it), install the alias key and either
-    #      attach our conn as the missing control connection or close it.
+    #      (another caller beat us to it), install the alias key and close
+    #      our conn (it was opened with the caller's DSN, not the control
+    #      DSN, so it is never adopted as the control connection).
     #      Otherwise, build the new `ClusterState` and install.
 
     def get_or_bootstrap(
@@ -1003,23 +1004,22 @@ class ClusterRegistry:
             existing = self._clusters.get(uuid)
             if existing is not None:
                 self._key_to_uuid[key] = uuid
-                if existing.control_sync is None:
-                    logger.debug(
-                        "bootstrap race: aliasing key=%s to existing uuid=%s; "
-                        "attaching our conn as the sync control connection",
-                        key, uuid,
-                    )
-                    existing.control_sync = conn
-                else:
-                    logger.debug(
-                        "bootstrap race: aliasing key=%s to existing uuid=%s; "
-                        "discarding redundant contact conn",
-                        key, uuid,
-                    )
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+                # DB-25060 — never adopt our conn as the control conn,
+                # even when `existing.control_sync` is None. A different
+                # key means a different DSN (typically another dbname):
+                # after a fork, or after the control conn drops, adopting
+                # it points the CBs at the app database instead of the
+                # one the signal/tracker tables live in.
+                # `_ensure_control_sync` reopens with bootstrap_kwargs.
+                logger.debug(
+                    "bootstrap race: aliasing key=%s to existing uuid=%s; "
+                    "discarding contact conn",
+                    key, uuid,
+                )
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 return existing
 
             state = ClusterState(
@@ -1072,23 +1072,18 @@ class ClusterRegistry:
             existing = self._clusters.get(uuid)
             if existing is not None:
                 self._key_to_uuid[key] = uuid
-                if existing.control_async is None:
-                    logger.debug(
-                        "bootstrap race (async): aliasing key=%s to existing uuid=%s; "
-                        "attaching our conn as the async control connection",
-                        key, uuid,
-                    )
-                    existing.control_async = conn
-                else:
-                    logger.debug(
-                        "bootstrap race (async): aliasing key=%s to existing uuid=%s; "
-                        "discarding redundant contact conn",
-                        key, uuid,
-                    )
-                    try:
-                        await conn.close()
-                    except Exception:
-                        pass
+                # DB-25060 — see the sync sibling: never adopt our conn
+                # as the control conn; `_aensure_control_async` reopens
+                # with bootstrap_kwargs.
+                logger.debug(
+                    "bootstrap race (async): aliasing key=%s to existing uuid=%s; "
+                    "discarding contact conn",
+                    key, uuid,
+                )
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
                 return existing
 
             state = ClusterState(

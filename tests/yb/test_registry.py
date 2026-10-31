@@ -278,6 +278,44 @@ def _state_with_bootstrap(reg: ClusterRegistry, hosts: list[str], down: set[str]
     return state
 
 
+def test_alias_bootstrap_never_adopts_caller_conn_as_control(
+    fresh_registry, monkeypatch
+):
+    """DB-25060: the cluster was bootstrapped on the control dbname and
+    then lost its control conn (fork reset, or the conn dropped). The next
+    connect with a different dbname aliases to the same uuid; its conn
+    must be closed, not adopted, so the reopen uses the control dbname."""
+    state = _state_with_bootstrap(fresh_registry, ["h1"])
+    state.bootstrap_kwargs = {"dbname": "driver_ctl", "user": "yugabyte"}
+    fresh_registry._key_to_uuid[
+        ClusterKey.from_params({"host": "h1", "dbname": "driver_ctl"})
+    ] = "X"
+
+    opened: list[tuple[_FakeConn, object]] = []
+
+    def fake_connect(conninfo, **kwargs):
+        conn = _FakeConn(kwargs["host"])
+        opened.append((conn, kwargs.get("dbname")))
+        return conn
+
+    from psycopg.connection import Connection
+    from psycopg.yb import discovery
+    monkeypatch.setattr(Connection, "_connect_plain", classmethod(lambda cls, *a, **k: fake_connect(*a, **k)))
+    monkeypatch.setattr(discovery, "fetch_servers_sync", lambda conn: (list(state.nodes.values()), "X"))
+
+    app_key = ClusterKey.from_params({"host": "h1", "dbname": "xcf_app"})
+    got = fresh_registry.get_or_bootstrap(app_key, "", {"host": "h1", "dbname": "xcf_app"})
+
+    assert got is state
+    assert state.control_sync is None
+    app_conn, _ = opened[0]
+    assert app_conn.closed
+
+    ctrl = fresh_registry._ensure_control_sync(state)
+    assert ctrl is opened[1][0]
+    assert opened[1][1] == "driver_ctl"
+
+
 def test_ensure_control_sync_returns_existing_when_present(fresh_registry):
     state = _state_with_bootstrap(fresh_registry, ["h1", "h2"])
     existing = _FakeConn("h1")
