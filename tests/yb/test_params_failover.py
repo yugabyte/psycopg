@@ -289,7 +289,7 @@ def test_yba_params_default_lag_wait_disabled():
     assert yb.yba_api_token == ""
     assert yb.replication_name == ""
     assert yb.threshold_replication_lag_ms == 0
-    assert yb.lag_wait_timeout_s == 30
+    assert yb.lag_wait_timeout_s == 30       # DEFAULT_LAG_WAIT_TIMEOUT_SEC
 
 
 def test_yba_params_full_camel_case():
@@ -321,6 +321,10 @@ def test_yba_params_snake_and_kebab_forms():
         "yb_failover_yba_api_token=t "
         "yb.failover.replication_name=repname "
         "yb-failover-threshold-replication-lag-ms=100 "
+        # DB-24483 — opt out of the freshness gate so the 15s wait fits
+        # under the floor. This test exercises key normalisation, not
+        # Phase 2 semantics.
+        "yb.failover.lag_freshness_secs=0 "
         "yb.failover.lag_wait_timeout_secs=15",
         {},
     )
@@ -768,3 +772,28 @@ def test_failback_params_stripped_from_cleaned_conninfo():
     assert "failback" not in cleaned.lower()
     assert "rep-b-to-a" not in cleaned
 
+
+
+# ------------------------------------------------------- xCluster socket defaults
+
+def test_xcluster_socket_defaults_fill_missing_keys():
+    """hung_workers (stress 64a57bb5 cycle 1, nat_idle_drop): with no
+    keepalives or tcp_user_timeout a NAT-dropped socket blocked its owner
+    until the workload stopped."""
+    from psycopg.yb.params import (
+        XCLUSTER_SOCKET_DEFAULTS, with_xcluster_socket_defaults,
+    )
+
+    assert with_xcluster_socket_defaults("host=a", {}) == XCLUSTER_SOCKET_DEFAULTS
+
+
+def test_xcluster_socket_defaults_never_override_user_values():
+    from psycopg.yb.params import with_xcluster_socket_defaults
+
+    out = with_xcluster_socket_defaults(
+        "host=a keepalives_idle=30", {"tcp_user_timeout": 0},
+    )
+
+    assert "keepalives_idle" not in out          # conninfo value wins
+    assert out["tcp_user_timeout"] == 0          # kwarg value wins
+    assert out["keepalives_count"] == "3"

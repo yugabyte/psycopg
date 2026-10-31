@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 # gone at the fastest xCluster probe cadence — both well past a graceful
 # tserver restart.
 _MAX_ABSENCE_TICKS = 3
+# Grace period before a topology refresh that lists a down host clears
+# its is_down flag. Matches the default failed_host_reconnect_delay_secs.
+_DOWN_RECOVERY_GRACE_S = 5.0
+# Consecutive connect timeouts (not refusals) before a host is quarantined.
+_CONNECT_TIMEOUT_STRIKES = 3
 
 
 # ------------------------------------------------------------------- fork safety
@@ -209,6 +214,14 @@ _FAILOVER_GOVERNING_PARAMS = (
     "failback_lag_wait_timeout_s",
     "failback_threshold_replication_lag_ms",
     "failback_global_time_budget_secs",
+    # DB-24483 — Phase 2 freshness + liveness gate knobs. A second DSN
+    # with a different freshness floor would silently inherit the first
+    # DSN's group and never apply its own gate, so treat them as
+    # governing (same pattern as the other Phase 2 params above).
+    "lag_freshness_s",
+    "lag_confirmation_samples",
+    "failback_lag_freshness_s",
+    "failback_lag_confirmation_samples",
     # agent-K PR #20:212 — typo: real YBParams field is
     # ``global_time_budget_secs``, not ``global_time_budget_s``. The old
     # name doesn't exist on YBParams so both sides returned _MISSING and
@@ -581,6 +594,14 @@ class FailoverGroup:
     xcluster_config_uuid: str = ""
     threshold_replication_lag_ms: int = 0
     lag_wait_timeout_s: int = 30
+    # DB-24483 — Phase 2 freshness + liveness gate knobs. See
+    # params.py for semantics. ``barrier_ts`` is the wall-clock
+    # ``time.time()`` stamp at the moment ``pause_dispatch`` fires; the
+    # drain's lag loop uses it to compare each YBA ``sample_ts`` and
+    # reject samples that cannot reflect post-barrier replication.
+    lag_freshness_s: int = 25
+    lag_confirmation_samples: int = 2
+    barrier_ts: float = 0.0
 
     # Failback-direction (B→A) Phase 2 config (design doc §3.5.1).
     # Populated at bootstrap only when the operator set
@@ -591,6 +612,9 @@ class FailoverGroup:
     failback_xcluster_config_uuid: str = ""
     failback_threshold_replication_lag_ms: int = 0
     failback_lag_wait_timeout_s: int = 30
+    # DB-24483 — same gates in the failback direction.
+    failback_lag_freshness_s: int = 25
+    failback_lag_confirmation_samples: int = 2
 
     # Auto-failback toggle (see design doc §3.5.1 / §7.3). When False,
     # the driver stays on secondary even after the primary CB reports
@@ -650,10 +674,18 @@ class FailoverGroup:
         """Set ``dispatch_paused = True``. Called from the drain sequence
         (Phase E) at the start of a failover. Every ``group.lock``-held
         write must set-and-notify together, so we expose this as a
-        method rather than relying on callers to remember the notify."""
+        method rather than relying on callers to remember the notify.
+
+        DB-24483: stamp ``barrier_ts`` under the same lock so Phase 2's
+        freshness gate can compare YBA sample timestamps against the
+        exact moment the barrier was armed. ``time.time()`` (wall-clock)
+        matches YBA's Prometheus timestamp units; ``time.monotonic``
+        would need a conversion on every poll.
+        """
         with self.lock:
             self.dispatch_paused = True
             self.barrier_generation += 1
+            self.barrier_ts = time.time()
 
     def resume_dispatch(self) -> None:
         """Set ``dispatch_paused = False`` and notify all waiters. Called
@@ -780,6 +812,14 @@ class FailoverGroup:
         self.dispatch_paused_condition = threading.Condition(self.lock)
         self.dispatch_paused = False
         self.async_dispatch_waiters = []
+        # DB-24483 — zero the barrier so the child's first drain stamps
+        # its own `time.time()` rather than reusing the parent's. The
+        # parent's monotonic-domain cooldown stamps survive fork (same
+        # host), but barrier_ts is wall-clock and compared only against
+        # YBA sample timestamps from the same wall-clock domain, so
+        # zeroing it is safe and avoids false "stale" readings if the
+        # child ever ran Phase 2 before pause_dispatch re-stamped.
+        self.barrier_ts = 0.0
         # agent-K PR #16:515. KEEP the parent's cool-down timestamps.
         # ``time.monotonic()`` is shared across fork on the same host,
         # so the parent's windows are directly comparable in the child.
@@ -1135,6 +1175,10 @@ class ClusterRegistry:
         # them consistently.
         group.threshold_replication_lag_ms = yb_params.threshold_replication_lag_ms
         group.lag_wait_timeout_s = yb_params.lag_wait_timeout_s
+        # DB-24483 — Phase 2 freshness + liveness gates. Mirrored on the
+        # group so the drain loop reads them without a YBParams import.
+        group.lag_freshness_s = yb_params.lag_freshness_s
+        group.lag_confirmation_samples = yb_params.lag_confirmation_samples
         # Failback-direction knobs. `failback_xcluster_config_uuid` is
         # populated below only if the operator set
         # yb.failback.replicationName.
@@ -1142,6 +1186,10 @@ class ClusterRegistry:
             yb_params.failback_threshold_replication_lag_ms
         )
         group.failback_lag_wait_timeout_s = yb_params.failback_lag_wait_timeout_s
+        group.failback_lag_freshness_s = yb_params.failback_lag_freshness_s
+        group.failback_lag_confirmation_samples = (
+            yb_params.failback_lag_confirmation_samples
+        )
 
         try:
             client = YBAClient(
@@ -1250,10 +1298,12 @@ class ClusterRegistry:
         with self._bootstrap_lock_for(primary_key):
             return self._do_bootstrap_failover_group(
                 yb_params, conninfo, kwargs, primary_key, HealthResult,
+                strict_param_check=strict_param_check,
             )
 
     def _do_bootstrap_failover_group(
         self, yb_params, conninfo, kwargs, primary_key, HealthResult,
+        strict_param_check: bool = False,
     ) -> "FailoverGroup":
         # 1. Try primary — tolerate failure.
         primary: "ClusterState | None" = None
@@ -1426,10 +1476,12 @@ class ClusterRegistry:
         async with self._async_bootstrap_lock_for(primary_key):  # type: ignore[attr-defined]
             return await self._ado_bootstrap_failover_group(
                 yb_params, conninfo, kwargs, primary_key, HealthResult,
+                strict_param_check=strict_param_check,
             )
 
     async def _ado_bootstrap_failover_group(
         self, yb_params, conninfo, kwargs, primary_key, HealthResult,
+        strict_param_check: bool = False,
     ) -> "FailoverGroup":
         primary: "ClusterState | None" = None
         primary_exc: "Exception | None" = None
@@ -1832,7 +1884,11 @@ class ClusterRegistry:
         if not state.bootstrap_kwargs and not state.bootstrap_conninfo:
             return None
         with state.lock:
-            candidates = [n for n in state.nodes.values() if not n.is_down]
+            _now = time.monotonic()
+            candidates = [
+                n for n in state.nodes.values()
+                if not n.is_down or _now - n.is_down_since > _DOWN_RECOVERY_GRACE_S
+            ]
             # All-marked-down is usually stale state, not ground truth:
             # a quorum-loss cascade marks every node within seconds; the
             # next refresh would clear them but refresh can't run without
@@ -1880,6 +1936,7 @@ class ClusterRegistry:
                 if state.control_sync is None:
                     state.control_sync = conn
                     state.last_control_connect_error = None  # clear on success
+                    self._mark_up_locked(state, node.host)
                     logger.info("control conn re-opened on %s for uuid=%s",
                                 node.host, state.uuid)
                     # agent-K PR #17:G6 — surface placeholder promotion.
@@ -1941,7 +1998,11 @@ class ClusterRegistry:
         if not state.bootstrap_kwargs and not state.bootstrap_conninfo:
             return None
         with state.lock:
-            candidates = [n for n in state.nodes.values() if not n.is_down]
+            _now = time.monotonic()
+            candidates = [
+                n for n in state.nodes.values()
+                if not n.is_down or _now - n.is_down_since > _DOWN_RECOVERY_GRACE_S
+            ]
             # See sync sibling: all-marked-down is usually stale; the
             # connect itself is the authoritative liveness signal.
             if not candidates:
@@ -1981,6 +2042,7 @@ class ClusterRegistry:
                 if state.control_async is None:
                     state.control_async = conn
                     state.last_control_connect_error = None  # clear on success
+                    self._mark_up_locked(state, node.host)
                     logger.info("control conn re-opened (async) on %s for uuid=%s",
                                 node.host, state.uuid)
                     return conn
@@ -2050,6 +2112,14 @@ class ClusterRegistry:
                     n.connection_count = existing.connection_count
                     n.is_down = existing.is_down
                     n.is_down_since = existing.is_down_since
+                    # Listed by yb_servers() again and quarantined past the
+                    # grace period → treat as recovered. Without this the
+                    # flag was sticky for the life of the process.
+                    if n.is_down and (
+                        time.monotonic() - n.is_down_since > _DOWN_RECOVERY_GRACE_S
+                    ):
+                        n.is_down = False
+                        n.is_down_since = 0.0
                     # Reappeared → reset absence counter.
                     n.absent_refresh_count = 0
                 new_dict[n.host] = n
@@ -2124,10 +2194,51 @@ class ClusterRegistry:
                 ni.connection_count = max(0, ni.connection_count - 1)
                 logger.log(TRACE, "decrement: %s → %d", host, ni.connection_count)
 
-    def mark_failed(self, uuid: str, host: str) -> None:
+    def mark_up(self, uuid: str, host: str) -> None:
+        """Clear the down flag after a successful connect to ``host``."""
         state = self._clusters.get(uuid)
         if state is None:
             return
+        with state.lock:
+            self._mark_up_locked(state, host)
+
+    @staticmethod
+    def _mark_up_locked(state: "ClusterState", host: str) -> None:
+        if (ni := state.nodes.get(host)) is None:
+            return
+        ni.connect_timeouts = 0
+        if ni.is_down:
+            ni.is_down = False
+            ni.is_down_since = 0.0
+            logger.info("host recovered: %s (uuid=%s)", host, state.uuid)
+
+    def mark_failed(self, uuid: str, host: str, timeout: bool = False) -> None:
+        """Quarantine ``host`` after a failed connect.
+
+        ``timeout=True`` means the attempt got no answer (connect_timeout
+        expired) rather than a refusal. A single timeout is weak evidence
+        — a NAT that recycled a port, a SYN lost under load — and
+        quarantining on it took live nodes out of rotation (stress
+        false_quarantine). Timeouts only quarantine after
+        _CONNECT_TIMEOUT_STRIKES in a row with no successful connect in
+        between; refusals still quarantine at once.
+        """
+        state = self._clusters.get(uuid)
+        if state is None:
+            return
+        if timeout:
+            with state.lock:
+                ni = state.nodes.get(host)
+                if ni is not None:
+                    ni.connect_timeouts += 1
+                    if ni.connect_timeouts < _CONNECT_TIMEOUT_STRIKES:
+                        logger.info(
+                            "connect timeout on %s (uuid=%s), %d/%d before "
+                            "quarantine",
+                            host, uuid, ni.connect_timeouts,
+                            _CONNECT_TIMEOUT_STRIKES,
+                        )
+                        return
         now = time.monotonic()
         with state.lock:
             if (ni := state.nodes.get(host)) is not None:
