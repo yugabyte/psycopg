@@ -353,6 +353,11 @@ class RenameAsyncToSync(ast.NodeTransformer):  # type: ignore
         "_aconnect_plain": "_connect_plain",
         # xCluster failover async/sync pair (Phase 5):
         "aget_or_bootstrap_failover_group": "get_or_bootstrap_failover_group",
+        # xCluster failover async-dispatch barrier (DB-24838 part 1).
+        # The `_async` sibling yields the event loop instead of
+        # blocking a thread; the sync version is the original.
+        "wait_for_dispatch_async": "wait_for_dispatch",
+        "_wait_for_dispatch_async": "_wait_for_dispatch",
     }
     _skip_imports = {
         "acompat": {"alist", "anext", "skip_sync"},
@@ -469,6 +474,14 @@ class RenameAsyncToSync(ast.NodeTransformer):  # type: ignore
         node.module = self.names_map.get(node.module, node.module)
         for n in node.names:
             n.name = self.names_map.get(n.name, n.name)
+            # Rename the alias too (agent-K PR #14:360 blocker). Without
+            # this, `from X import a_async as _a_async` generates
+            # `from X import a as _a_async`, and `visit_Name` renames
+            # the call to `_a` → NameError at runtime. All sync `connect`
+            # paths that import an aliased async helper break at the
+            # next codegen run.
+            if n.asname is not None:
+                n.asname = self.names_map.get(n.asname, n.asname)
         return node
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
