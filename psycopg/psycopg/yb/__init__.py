@@ -170,6 +170,7 @@ def bootstrap_failover_group(conninfo: str = "", **kwargs):
         yb_params, cleaned_conninfo, cleaned_kwargs
     )
     _warn_statement_timeout_sync(group, yb_params.drain_timeout_s)
+    _log_pool_wiring_reminder()
     return group
 
 
@@ -194,7 +195,42 @@ async def abootstrap_failover_group(conninfo: str = "", **kwargs):
         yb_params, cleaned_conninfo, cleaned_kwargs
     )
     await _awarn_statement_timeout_async(group, yb_params.drain_timeout_s)
+    _log_pool_wiring_reminder()
     return group
+
+
+# --- pool-wiring reminder (DB-24413 follow-up)
+#
+# The driver can't observe psycopg_pool.ConnectionPool configurations at
+# bootstrap — pools are created later, with their own `check=` arg. An
+# xCluster DSN handed to a pool without `check=xcluster_check` lets the
+# pool keep serving stale conns on the OUTGOING cluster during and after
+# the drain barrier (dual-write window the whole fix is designed to
+# close). Emit one INFO at bootstrap pointing operators at the right
+# wiring; a true runtime warning would require wrapping the pool class
+# in a sibling package. We log once per process, not per bootstrap
+# call, so re-bootstrap and tests don't spam.
+
+_pool_wiring_reminder_logged = False
+
+
+def _log_pool_wiring_reminder() -> None:
+    """Log a one-shot INFO reminding the operator to wire their
+    psycopg_pool.ConnectionPool with `check=xcluster_check` (sync) or
+    `check=xcluster_check_async` (async). DB-24413 follow-up (agent-K
+    PR #13:G8)."""
+    global _pool_wiring_reminder_logged
+    if _pool_wiring_reminder_logged:
+        return
+    _pool_wiring_reminder_logged = True
+    _logging.getLogger("psycopg.yb").info(
+        "xCluster bootstrap complete. If this DSN is used with a "
+        "psycopg_pool.ConnectionPool, set check=xcluster_check "
+        "(or check=xcluster_check_async for AsyncConnectionPool) so the "
+        "pool evicts stale conns on the outgoing universe during drain. "
+        "See psycopg.yb.pool module docstring; omitting the check lets "
+        "pool conns dual-write to the universe the driver has left."
+    )
 
 
 # --- statement_timeout coordination (Phase G / design doc §3.4)

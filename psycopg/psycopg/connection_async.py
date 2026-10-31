@@ -156,6 +156,7 @@ class AsyncConnection(BaseConnection[Row]):
         # is False (the common case).
         active_cluster: str | None = None
         failover_group = None
+        dispatch_gen = 0
         if yb_params.xcluster_enabled:
             from .yb import (                          # late import; cycle-safe
                 MissingCircuitBreakerError,
@@ -163,6 +164,8 @@ class AsyncConnection(BaseConnection[Row]):
             )
             from .yb.state import (
                 active_cluster as _active_cluster,
+                barrier_crossed as _barrier_crossed,
+                dispatch_generation as _dispatch_generation,
                 wait_for_dispatch as _wait_for_dispatch,
             )
             failover_group = await registry.aget_or_bootstrap_failover_group(
@@ -185,6 +188,7 @@ class AsyncConnection(BaseConnection[Row]):
             # the drain is bounded by drainTimeoutSecs, so the wait is
             # inherently short.
             _wait_for_dispatch(failover_group)
+            dispatch_gen = _dispatch_generation(failover_group)
             which = _active_cluster(failover_group)
             if which is None:
                 raise NoViableClusterError(
@@ -288,6 +292,35 @@ class AsyncConnection(BaseConnection[Row]):
             # (design doc §3.1).
             if failover_group is not None:
                 state.tracked_conns.add(conn)
+                if _barrier_crossed(failover_group, dispatch_gen):
+                    # A drain armed while this TCP connect was in progress
+                    # and may already have swept tracked_conns; this conn
+                    # would write to the outgoing cluster (DB-24801). Drop
+                    # it and route again once the barrier releases.
+                    yb_logger.info(
+                        "xCluster: drain barrier armed while connecting to %s "
+                        "(uuid=%s); closing and re-routing",
+                        node.host, state.uuid,
+                    )
+                    state.tracked_conns.discard(conn)
+                    await conn.close()
+                    _wait_for_dispatch(failover_group)
+                    dispatch_gen = _dispatch_generation(failover_group)
+                    which = _active_cluster(failover_group)
+                    if which is None:
+                        raise NoViableClusterError(
+                            f"xCluster: both primary and secondary clusters report "
+                            f"UNHEALTHY — no viable target for new connections "
+                            f"(primary_uuid={failover_group.primary.uuid})"
+                        )
+                    if which == "secondary":
+                        state = failover_group.secondary
+                    else:
+                        state = failover_group.primary
+                    active_cluster = which
+                    attempted = set()
+                    last_err = None
+                    continue
             yb_logger.debug(
                 "smart-driver connect succeeded: host=%s, uuid=%s, cluster=%s",
                 node.host, state.uuid, active_cluster or "(single-cluster)",

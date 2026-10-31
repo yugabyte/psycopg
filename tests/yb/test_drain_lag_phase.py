@@ -248,25 +248,22 @@ def test_lag_phase_skipped_on_recovery(fake_state):
 
 # ------------------------------------------------------- secondary-side flip
 
-def test_lag_wait_still_runs_when_outgoing_is_secondary(fake_state):
-    """When primary was already UNHEALTHY and secondary now flips too, the
-    outgoing (draining) side is SECONDARY. The lag poll still runs
-    against the same xcluster_config_uuid (YBA aggregates across both
-    stream directions under one config UUID for the metrics endpoint)."""
+def test_no_lag_wait_when_last_viable_cluster_goes_down(fake_state):
+    """Primary already UNHEALTHY, secondary now flips too: routing goes
+    secondary → None. There is no target to switch to, so no drain runs
+    and YBA is not polled."""
     group, client = _make_group_with_yba(
         fake_state,
-        yba_responses=[0.0],   # instant converge
+        yba_responses=[0.0],
     )
-    # Bootstrap the failover: primary UNHEALTHY, active=secondary.
     with group.lock:
         group.primary_status = HealthResult.UNHEALTHY
-    client.calls.clear()   # drop any prior fake calls
+    client.calls.clear()
 
-    # Now secondary flips UNHEALTHY — routing goes from secondary → None,
-    # outgoing = secondary.
     trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
-    assert len(client.calls) == 1
-    assert client.calls[0] == "xcc-abcd"
+
+    assert client.calls == []
+    assert group.secondary_status == HealthResult.UNHEALTHY
 
 
 # ------------------------------------------------------- unexpected exceptions
