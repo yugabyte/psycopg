@@ -1277,6 +1277,7 @@ def _wait_for_replication_lag(
             return
 
         poll_started = time.monotonic()
+        report = None
         try:
             # DB-24483: prefer the sample-returning variant so we can
             # log how old the YBA data was. Custom lag sources that
@@ -1286,12 +1287,13 @@ def _wait_for_replication_lag(
             # lag wait (agent-K PR #15:698). We still trust YBA as the
             # lag source of truth; surfacing the age gives operators a
             # concrete number to reason about after a flip.
-            if pass_deadline:
-                sample = group.yba_client.get_committed_lag_sample(
-                    xcluster_uuid, deadline=deadline,
+            if hasattr(group.yba_client, "get_committed_lag_report"):
+                kw = {"deadline": deadline} if pass_deadline else {}
+                report = group.yba_client.get_committed_lag_report(
+                    xcluster_uuid, **kw,
                 )
-                lag_ms = None if sample is None else sample[0]
-                sample_ts = None if sample is None else sample[1]
+                lag_ms = None if report is None else report["lag_ms"]
+                sample_ts = None if report is None else report["sample_ts"]
             elif hasattr(group.yba_client, "get_committed_lag_sample"):
                 sample = group.yba_client.get_committed_lag_sample(xcluster_uuid)
                 lag_ms = None if sample is None else sample[0]
@@ -1311,6 +1313,14 @@ def _wait_for_replication_lag(
                 age_str = f" sample_age={sample_age_s:.1f}s"
             else:
                 age_str = ""
+            if report is not None:
+                # Per producer node, so a converge on a universe whose
+                # nodes stopped reporting can be read off the log.
+                age_str += " nodes=" + ",".join(
+                    f"{node}:{value:g}" for node, value in report["values"].items()
+                )
+                if report["stale"]:
+                    age_str += f" stale={','.join(report['stale'])}"
             if lag_ms is None:
                 logger.info(
                     "lag wait poll: no data reported by YBA "
@@ -1406,6 +1416,24 @@ def _wait_for_replication_lag(
                     lag_ms, sample_ts, barrier_ts, confirmed_count,
                     required_samples, elapsed, timeout_s,
                 )
+            elif report is not None and (report["stale"] or not report["leader_reported"]):
+                # A producer whose tablets lost their leaders reports 0
+                # from the nodes still up, and nothing from the nodes
+                # down (stress phase2_claim, a_majority_down: converged
+                # on lag=0 two seconds after the barrier while a batch
+                # could not leave A). Neither is a caught-up universe.
+                why = (
+                    f"node(s) {','.join(report['stale'])} stopped reporting"
+                    if report["stale"] else "no tablet leader reporting (all 0)"
+                )
+                logger.info(
+                    "lag wait: lag=%.1fms but %s — not counting "
+                    "(confirmations=%d/%d, elapsed=%.1fs / %ds)",
+                    lag_ms, why, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
+                confirmed_count = 0
+                last_counted_sample_ts = None
             elif sample_ts is not None and sample_ts == last_counted_sample_ts:
                 logger.info(
                     "lag wait: lag=%.1fms ≤ threshold but sample_ts %.3f "

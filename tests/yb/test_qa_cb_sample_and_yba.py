@@ -289,6 +289,7 @@ def test_db24483_step_10_is_sent_in_metrics_request_body():
     from psycopg.yb.yba_client import YBAClient
     fake = _FakeClient()
     fake.get_committed_lag_sample = YBAClient.get_committed_lag_sample.__get__(fake)
+    fake._fetch_lag_metrics = YBAClient._fetch_lag_metrics.__get__(fake)
 
     fake.get_committed_lag_sample("xcc-1")
 

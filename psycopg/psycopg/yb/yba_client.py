@@ -443,6 +443,27 @@ class YBAClient:
         unreachable poll" and moves on — three consecutive
         unreachables trigger the graceful degradation path.
         """
+        return _extract_committed_lag_sample(
+            self._fetch_lag_metrics(xcluster_config_uuid, lookback_s, deadline)
+        )
+
+    def get_committed_lag_report(
+        self,
+        xcluster_config_uuid: str,
+        lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
+        deadline: "float | None" = None,
+    ) -> "dict | None":
+        """:meth:`get_committed_lag_sample` plus what each producer node
+        reported, so the lag wait can tell a caught-up universe from one
+        whose nodes stopped reporting. See :func:`_lag_report_from_traces`.
+        """
+        return _extract_committed_lag_report(
+            self._fetch_lag_metrics(xcluster_config_uuid, lookback_s, deadline)
+        )
+
+    def _fetch_lag_metrics(
+        self, xcluster_config_uuid: str, lookback_s: int, deadline: "float | None",
+    ) -> Any:
         # Deadline passed only when set, so subclasses and test doubles
         # that override these without it keep working.
         kw = {} if deadline is None else {"deadline": deadline}
@@ -461,10 +482,9 @@ class YBAClient:
             # accepted by YBA's /metrics endpoint.
             "step": "10",
         }
-        resp = self._request(
+        return self._request(
             "POST", f"/customers/{cid}/metrics", body=body, **kw,
         )
-        return _extract_committed_lag_sample(resp)
 
 
 # ------------------------------------------------------------------- helpers
@@ -556,6 +576,69 @@ def _max_lag_sample_from_traces(
             continue
         newest_ts = x if newest_ts is None else max(newest_ts, x)
     return (0.0, newest_ts)
+
+
+def _lag_report_from_traces(
+    traces: list, name_hints: Iterable[str] = _COMMITTED_LAG_TRACE_NAMES,
+) -> "dict | None":
+    """Per-node view of the committed-lag traces (one trace per producer
+    tserver). ``lag_ms`` / ``sample_ts`` match
+    :func:`_max_lag_sample_from_traces`; on top of that:
+
+      * ``values`` — node → latest value (ms), for the poll log.
+      * ``stale`` — nodes whose series ends before the newest point.
+        YBA evaluates every live series at the same 10 s steps, so a
+        shorter series is a node that stopped being scraped.
+      * ``leader_reported`` — some node at the newest point reported
+        more than 0. A tablet leader that has caught up stores 1 us
+        (cdc_service.cc UpdateTabletXClusterMetrics); a node that leads
+        no tablet stores exactly 0 (XClusterTabletMetrics::ClearMetrics).
+        With every value at 0, no leader is reporting: the producer has
+        lost its leaders, not caught up.
+
+    ``None`` when no matching trace carries a value.
+    """
+    latest: dict[str, tuple[float, float | None]] = {}
+    for trace in traces:
+        name = (trace.get("name") or trace.get("metricName") or "").strip()
+        if name_hints and not any(hint in name for hint in name_hints):
+            continue
+        y, x = _latest_xy(trace)
+        if y is None or y >= _NOT_REPORTED_THRESHOLD_MS or y < 0:
+            continue
+        node = str(trace.get("instanceName") or name or len(latest))
+        latest[node] = (y, x)
+    if not latest:
+        return None
+    sample = _max_lag_sample_from_traces(traces, name_hints)
+    xs = [x for _, x in latest.values() if x is not None]
+    newest = max(xs) if xs else None
+    stale = sorted(
+        node for node, (_, x) in latest.items()
+        if newest is not None and x is not None and x < newest
+    )
+    leader_reported = any(
+        y > 0 for node, (y, x) in latest.items() if node not in stale
+    )
+    return {
+        "lag_ms": None if sample is None else sample[0],
+        "sample_ts": None if sample is None else sample[1],
+        "values": {node: y for node, (y, _) in sorted(latest.items())},
+        "stale": stale,
+        "leader_reported": leader_reported,
+    }
+
+
+def _extract_committed_lag_report(response: Any) -> "dict | None":
+    if not isinstance(response, dict):
+        return None
+    block = response.get("tserver_async_replication_lag_micros")
+    if not isinstance(block, dict) or block.get("error"):
+        return None
+    data = block.get("data")
+    if not isinstance(data, list):
+        return None
+    return _lag_report_from_traces(data)
 
 
 def _extract_committed_lag_ms(response: Any) -> float | None:
