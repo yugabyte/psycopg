@@ -136,7 +136,19 @@ class YBAClient:
 
     # ------------------------------------------------------------- HTTP core
 
-    def _open_connection(self) -> http.client.HTTPConnection:
+    def _op_timeout(self, deadline: "float | None") -> float:
+        """Per-op socket timeout: max(connect, read), cut to what is left
+        before ``deadline`` (monotonic) when one is given."""
+        timeout = max(self.connect_timeout_s, self.read_timeout_s)
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError("deadline reached")
+        return timeout
+
+    def _open_connection(
+        self, deadline: "float | None" = None,
+    ) -> http.client.HTTPConnection:
         """Open a fresh HTTP(S) connection. Idempotent — closes any
         existing one first."""
         self._close_connection()
@@ -151,7 +163,7 @@ class YBAClient:
         # Phase 2 drain loop in `drain.py` checks the elapsed budget
         # before each poll (and now also inside the YBA request path —
         # see `_request_with_elapsed_cap` below). agent-K PR #8:144.
-        timeout = max(self.connect_timeout_s, self.read_timeout_s)
+        timeout = self._op_timeout(deadline)
         if self._is_https:
             self._conn = http.client.HTTPSConnection(
                 self._host,
@@ -194,6 +206,7 @@ class YBAClient:
         path: str,
         body: dict | None = None,
         query: dict | None = None,
+        deadline: "float | None" = None,
     ) -> Any:
         """Execute one HTTP call over the persistent connection. Returns
         parsed JSON on 2xx, raises :class:`YBAClientError` otherwise.
@@ -202,6 +215,9 @@ class YBAClient:
         ``RemoteDisconnected``) reconnects once and retries. Anything
         after that surfaces to the caller — the poll loop's 3-strike
         rule handles it from there.
+
+        ``deadline`` (monotonic) caps every socket op at the time left
+        before it, so a blocked call returns at the deadline.
         """
         request_target = f"/api/v1{path}"
         if query:
@@ -221,7 +237,10 @@ class YBAClient:
             for attempt in (1, 2):
                 if self._conn is None or attempt_reconnect:
                     try:
-                        self._open_connection()
+                        if deadline is None:
+                            self._open_connection()
+                        else:
+                            self._open_connection(deadline)
                     except (TimeoutError, OSError, ssl.SSLError) as exc:
                         raise YBAClientError(
                             f"YBA {method} {path} connect failed: {exc}"
@@ -230,6 +249,11 @@ class YBAClient:
 
                 try:
                     assert self._conn is not None
+                    timeout = self._op_timeout(deadline)
+                    self._conn.timeout = timeout
+                    sock = getattr(self._conn, "sock", None)
+                    if sock is not None:
+                        sock.settimeout(timeout)
                     self._conn.request(method, request_target, body=data, headers=headers)
                     resp = self._conn.getresponse()
                     raw = resp.read()
@@ -282,13 +306,13 @@ class YBAClient:
 
     # ------------------------------------------------------------- API surface
 
-    def get_session_info(self) -> str:
+    def get_session_info(self, deadline: "float | None" = None) -> str:
         """Fetch the customer UUID from ``/session_info``. Cached after
         first successful call — subsequent calls return the cached value
         without a network round-trip."""
         if self._customer_uuid is not None:
             return self._customer_uuid
-        info = self._request("GET", "/session_info")
+        info = self._request("GET", "/session_info", deadline=deadline)
         if not isinstance(info, dict):
             raise YBAClientError("/session_info returned non-JSON-object")
         cid = info.get("customerUUID")
@@ -385,6 +409,7 @@ class YBAClient:
         self,
         xcluster_config_uuid: str,
         lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
+        deadline: "float | None" = None,
     ) -> "tuple[float | None, float | None] | None":
         """Return ``(lag_ms, sample_epoch_s)`` for the given xCluster
         config: the max committed replication lag in milliseconds, and
@@ -418,7 +443,10 @@ class YBAClient:
         unreachable poll" and moves on — three consecutive
         unreachables trigger the graceful degradation path.
         """
-        cid = self.get_session_info()
+        # Deadline passed only when set, so subclasses and test doubles
+        # that override these without it keep working.
+        kw = {} if deadline is None else {"deadline": deadline}
+        cid = self.get_session_info(**kw)
         end_ts = int(time.time())
         start_ts = end_ts - max(int(lookback_s), _MIN_METRICS_LOOKBACK_SEC)
         body = {
@@ -433,7 +461,9 @@ class YBAClient:
             # accepted by YBA's /metrics endpoint.
             "step": "10",
         }
-        resp = self._request("POST", f"/customers/{cid}/metrics", body=body)
+        resp = self._request(
+            "POST", f"/customers/{cid}/metrics", body=body, **kw,
+        )
         return _extract_committed_lag_sample(resp)
 
 
