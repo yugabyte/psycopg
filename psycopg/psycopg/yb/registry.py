@@ -27,7 +27,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
-from . import TRACE, discovery
+from . import TRACE, discovery, fork_follow
 from .node import NodeInfo
 from ..errors import OperationalError as _PsycopgOperationalError
 
@@ -89,7 +89,9 @@ def _register_fork_hook_once() -> None:
         if _FORK_HOOK_REGISTERED:
             return
         try:
-            os.register_at_fork(after_in_child=_after_fork_in_child)
+            os.register_at_fork(
+                before=_before_fork, after_in_child=_after_fork_in_child,
+            )
             _FORK_HOOK_REGISTERED = True
             logger.debug("xcluster fork-safety hook registered (DB-25060)")
         except (AttributeError, OSError):
@@ -311,6 +313,31 @@ def _is_placeholder_uuid(uuid: str) -> bool:
     return uuid.startswith(_PLACEHOLDER_UUID_PREFIX)
 
 
+def _before_fork() -> None:
+    """Parent side: reserve a follower slot per group for the child about
+    to be forked (fork_follow.py)."""
+    inst = ClusterRegistry._instance
+    if inst is None:
+        return
+    for group in list(inst._failover_groups.values()):
+        try:
+            fork_follow.before_fork(group)
+        except Exception:
+            group._follow_pending_slot = None
+
+
+def _start_probes_after_parent_gone(group: "FailoverGroup") -> None:
+    inst = ClusterRegistry._instance
+    if inst is None:
+        return
+    inst._start_probe(
+        group,
+        group._probe_interval_s,
+        group._probe_check_timeout_s,
+        group._probe_drain_timeout_s,
+    )
+
+
 def _after_fork_in_child() -> None:
     """Called in the child process after `os.fork()`. Rebuilds the state
     inside every FailoverGroup that doesn't survive fork, then restarts
@@ -376,9 +403,12 @@ def _after_fork_in_child() -> None:
                 getattr(getattr(group, "primary", None), "uuid", "?"),
                 exc_info=True,
             )
-    # Restart probes using the stashed per-group params.
+    # Follow the parent's failovers (fork_follow.py); a group with nothing
+    # to follow restarts its own probes from the stashed per-group params.
     for group in groups:
         try:
+            if fork_follow.start_follower(group, _start_probes_after_parent_gone):
+                continue
             inst._start_probe(
                 group,
                 group._probe_interval_s,
@@ -661,6 +691,11 @@ class FailoverGroup:
     # ``repr(group)`` doesn't leak ``yba_api_token`` or other secrets
     # the YBParams dataclass may hold (agent-K PR #20:589).
     bootstrap_params: "object | None" = field(default=None, repr=False)
+    # DB-25060 — shared state forked workers follow (fork_follow.py).
+    # Allocated by the process that runs the probes; inherited by children.
+    _follow: "object | None" = field(default=None, repr=False)
+    _follow_pending_slot: "int | None" = field(default=None, repr=False)
+    _follower_thread: "object | None" = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # Bind the condition to `lock` — so wait/notify releases and re-
@@ -1679,6 +1714,7 @@ class ClusterRegistry:
         group._probe_interval_s = interval_s
         group._probe_check_timeout_s = check_timeout_s
         group._probe_drain_timeout_s = drain_timeout_s
+        fork_follow.ensure_shared_state(group)
         if group.primary_probe is None:
             p = HealthProbe(
                 group, interval_s,

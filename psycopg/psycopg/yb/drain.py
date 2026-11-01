@@ -66,7 +66,7 @@ import time
 import weakref
 from typing import TYPE_CHECKING
 
-from . import TRACE
+from . import TRACE, fork_follow
 from .health import HealthResult
 
 if TYPE_CHECKING:
@@ -514,6 +514,8 @@ def _apply_status_change(
         previous = getattr(group, status_attr)
         setattr(group, status_attr, new_status)
         setattr(group, transition_attr, now)
+    if fork_follow.is_leader(group):
+        group._follow.publish_statuses(group.primary_status, group.secondary_status)
     if after_drain:
         logger.info(
             "xCluster %s status transition: %s → %s "
@@ -569,6 +571,12 @@ def _drain_and_apply(
 
     # 1. Pause dispatch (new opens block on the Condition).
     group.pause_dispatch()
+    # DB-25060 — forked workers pause with us and report their in-flight
+    # transactions back (fork_follow.py).
+    follow = group._follow if fork_follow.is_leader(group) else None
+    gen = group.barrier_generation
+    if follow is not None:
+        follow.publish_pause(gen, outgoing is group.primary)
 
     try:
         # 2. Compute deadline from the sentinel.
@@ -600,7 +608,10 @@ def _drain_and_apply(
             )
             total_idle_closed += idle_closed
             in_txn = _in_flight_conns(outgoing.tracked_conns)
-            if not in_txn:
+            children_in_txn = (
+                follow.children_in_flight(gen) if follow is not None else 0
+            )
+            if not in_txn and not children_in_txn:
                 drained_naturally = True
                 logger.debug(
                     "drain: all in-flight txns completed on %s "
@@ -633,6 +644,10 @@ def _drain_and_apply(
             c for c in list(outgoing.tracked_conns)
             if c is not None and not getattr(c, "closed", False)
         ]
+        children_live = 0
+        if follow is not None:
+            children_live = follow.live_children()
+            follow.publish_kill(gen)
 
         # 4. Kill at timeout (step 3 in design doc §3). Force-close
         # any conns still in-flight at the deadline. Only reached with
@@ -880,6 +895,15 @@ def _drain_and_apply(
         #   (c) deadline hit — force-closed every tracked conn still
         #       alive at the deadline (in-flight + idle). The in-flight
         #       count at the deadline moment is reported separately.
+        if follow is not None and children_live:
+            pending = follow.wait_children_killed(gen, _KILL_AT_TIMEOUT_BUDGET_S)
+            if pending:
+                logger.warning(
+                    "xCluster drain: %d forked worker(s) did not confirm "
+                    "closing their conns on %s within %ss",
+                    pending, outgoing.uuid, _KILL_AT_TIMEOUT_BUDGET_S,
+                )
+
         now = time.monotonic()
         phase1_elapsed = now - (
             group.last_failover_start_ts or now
@@ -923,7 +947,7 @@ def _drain_and_apply(
             )
         with group.lock:
             group.last_phase1_complete_ts = now
-        closed_any = bool(survivors) or total_idle_closed > 0
+        closed_any = bool(survivors) or total_idle_closed > 0 or children_live > 0
         closed_at = time.monotonic()
 
         # 4b. Phase 2 — YBA replication-lag wait. Direction-aware:
@@ -1008,6 +1032,8 @@ def _drain_and_apply(
     finally:
         # 6. Resume dispatch — release waiters.
         group.resume_dispatch()
+        if follow is not None:
+            follow.publish_resume(group.primary_status, group.secondary_status)
         # Record the direction-appropriate completion timestamp — but
         # only when the flip actually happened. agent-K PR #18:612:
         # debounced CBs read ``last_failover_complete_ts`` as "the
