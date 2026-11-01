@@ -539,3 +539,75 @@ def test_failback_uses_failback_budget(fake_state):
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
     assert time.monotonic() - t0 <= 1.2
+
+
+# ------------------------------------------------------- per-node lag report
+
+class _ReportYBAClient:
+    """Returns per-node lag reports like YBAClient.get_committed_lag_report."""
+
+    def __init__(self, reports: list) -> None:
+        self.reports = list(reports)
+        self.calls = 0
+
+    def get_committed_lag_report(self, xcluster_uuid, deadline=None):
+        import time as _time
+        self.calls += 1
+        r = self.reports[0] if len(self.reports) == 1 else self.reports.pop(0)
+        return dict(r, sample_ts=_time.time() + 1)
+
+
+def _report(values, stale=()):
+    return {
+        "lag_ms": max([v for v in values.values() if v > 1.0], default=0.0),
+        "sample_ts": None,
+        "values": values,
+        "stale": list(stale),
+        "leader_reported": any(v > 0 for n, v in values.items() if n not in stale),
+    }
+
+
+def _group_with_reports(fake_state, reports, timeout_s=2):
+    group, _ = _make_group_with_yba(
+        fake_state, yba_responses=[], threshold_ms=0, lag_wait_timeout_s=timeout_s,
+    )
+    client = _ReportYBAClient(reports)
+    group.yba_client = client
+    return group, client
+
+
+def test_all_zero_lag_from_producer_does_not_converge(fake_state, caplog):
+    """Stress phase2_claim (a_majority_down): the A nodes still up
+    reported 0 because no tablet had a leader. Not a caught-up A."""
+    import logging, time
+    group, client = _group_with_reports(fake_state, [_report({"n1": 0.0, "n3": 0.0})])
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert time.monotonic() - t0 >= 1.5
+    assert "no tablet leader reporting" in caplog.text
+    assert "lag wait converged" not in caplog.text
+    assert "lag wait timeout" in caplog.text
+
+
+def test_node_that_stopped_reporting_blocks_converge(fake_state, caplog):
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.001}, stale=["n2"])],
+    )
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert "n2 stopped reporting" in caplog.text
+    assert "lag wait converged" not in caplog.text
+
+
+def test_caught_up_leader_report_converges(fake_state, caplog):
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.0, "n3": 0.001})], timeout_s=10,
+    )
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert client.calls == 1
+    assert "lag wait converged" in caplog.text
+    assert "nodes=n1:0.001,n2:0,n3:0.001" in caplog.text
