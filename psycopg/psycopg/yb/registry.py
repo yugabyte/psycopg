@@ -646,6 +646,13 @@ class FailoverGroup:
     failback_lag_freshness_s: int = 25
     failback_lag_confirmation_samples: int = 2
 
+    # ``globalTimeBudgetSecs`` per direction (None = no budget). The
+    # drain derives its two phase timeouts from it, and also caps the
+    # lag wait at the budget measured from drain start, so the time
+    # Phase 1 runs over its share comes out of Phase 2.
+    global_time_budget_secs: "int | None" = None
+    failback_global_time_budget_secs: "int | None" = None
+
     # Auto-failback toggle (see design doc §3.5.1 / §7.3). When False,
     # the driver stays on secondary even after the primary CB reports
     # HEALTHY. Failback requires operator action (e.g. writing UNHEALTHY
@@ -1219,6 +1226,10 @@ class ClusterRegistry:
         group.failback_lag_freshness_s = yb_params.failback_lag_freshness_s
         group.failback_lag_confirmation_samples = (
             yb_params.failback_lag_confirmation_samples
+        )
+        group.global_time_budget_secs = yb_params.global_time_budget_secs
+        group.failback_global_time_budget_secs = (
+            yb_params.failback_global_time_budget_secs
         )
 
         try:

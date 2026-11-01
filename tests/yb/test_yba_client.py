@@ -527,3 +527,41 @@ def test_persistent_ssl_eof_still_raises(yba_server):
 
     with pytest.raises(YBAClientError, match="connection error"):
         client.get_committed_lag_ms("xcc-1")
+    # The poisoned keep-alive conn stays open otherwise, and the
+    # single-threaded mock server's shutdown() blocks on it.
+    client.close()
+
+
+# ------------------------------------------------------------- deadline cut
+
+def test_blocked_metrics_call_returns_at_deadline():
+    """A YBA that accepts and never answers holds a call for the full
+    socket timeout; under a globalTimeBudgetSecs deadline the call is cut
+    when the deadline arrives (stress budget_split overshoot)."""
+    import socket
+    import time
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    host, port = listener.getsockname()
+    try:
+        client = YBAClient(
+            f"http://{host}:{port}", api_token="tok",
+            connect_timeout_s=2.0, read_timeout_s=3.0,
+        )
+        client._customer_uuid = "cust-1"
+        t0 = time.monotonic()
+        with pytest.raises(YBAClientError):
+            client.get_committed_lag_sample("xcc-1", deadline=t0 + 0.5)
+        assert time.monotonic() - t0 < 1.2
+        client.close()
+    finally:
+        listener.close()
+
+
+def test_call_past_deadline_fails_without_network():
+    client = YBAClient("http://127.0.0.1:9", api_token="tok")
+    client._customer_uuid = "cust-1"
+    with pytest.raises(YBAClientError):
+        client.get_committed_lag_sample("xcc-1", deadline=0.0)

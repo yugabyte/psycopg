@@ -492,3 +492,50 @@ def test_lag_wait_timeout_uses_nearly_full_budget_with_fast_polls(fake_state, ca
     msgs = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("lag wait timeout after") for m in msgs), msgs
     assert not any("near-timeout" in m for m in msgs)
+
+
+# ------------------------------------------------------- globalTimeBudgetSecs
+
+class _InFlightConn(_FakeConn):
+    """In a transaction that never commits; the drain deadline closes it."""
+
+    def __init__(self) -> None:
+        super().__init__(TransactionStatus.INTRANS)
+        import types
+        self.pgconn = types.SimpleNamespace(socket=-1)
+
+
+def test_budget_caps_lag_wait_from_drain_start(fake_state):
+    """Stress budget_split: drain start → drain complete must fit
+    globalTimeBudgetSecs. Phase 1 used its whole share, so the lag wait
+    only gets what is left of the budget, not its own full timeout."""
+    import time
+
+    group, client = _make_group_with_yba(
+        fake_state, yba_responses=[500.0], threshold_ms=1, lag_wait_timeout_s=3,
+    )
+    group.global_time_budget_secs = 3
+    conn = _InFlightConn()
+    group.primary.tracked_conns.add(conn)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=1)
+    elapsed = time.monotonic() - t0
+
+    assert conn.closed
+    assert 2.4 <= elapsed <= 3.0, elapsed
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_failback_uses_failback_budget(fake_state):
+    import time
+
+    group, client = _make_group_with_failback_yba(
+        fake_state, yba_responses=[500.0], failback_threshold_ms=1,
+        failback_timeout_s=3,
+    )
+    group.global_time_budget_secs = 60
+    group.failback_global_time_budget_secs = 1
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    assert time.monotonic() - t0 <= 1.2

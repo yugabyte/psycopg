@@ -551,6 +551,7 @@ def _drain_and_apply(
     outgoing side was not serving and there is no lag to wait for."""
     # Snapshot the initial tracked-conn count for the log line — the
     # weakref set may shrink under GC during the drain.
+    drain_started = time.monotonic()
     initial_tracked = len(outgoing.tracked_conns)
     initial_in_flight = len(_in_flight_conns(outgoing.tracked_conns))
     initial_drained = initial_tracked - initial_in_flight
@@ -968,12 +969,21 @@ def _drain_and_apply(
         if group.yba_client is not None and not skip_phase2:
             try:
                 if new_status == HealthResult.UNHEALTHY and group.xcluster_config_uuid:
-                    _wait_for_replication_lag(group, which_cluster, is_failback=False)
+                    _wait_for_replication_lag(
+                        group, which_cluster, is_failback=False,
+                        budget_deadline=_budget_deadline(
+                            group.global_time_budget_secs, drain_started),
+                    )
                 elif (
                     new_status == HealthResult.HEALTHY
                     and group.failback_xcluster_config_uuid
                 ):
-                    _wait_for_replication_lag(group, which_cluster, is_failback=True)
+                    _wait_for_replication_lag(
+                        group, which_cluster, is_failback=True,
+                        budget_deadline=_budget_deadline(
+                            group.failback_global_time_budget_secs,
+                            drain_started),
+                    )
             except Phase2TimeoutError as exc:
                 phase2_aborted = True
                 abort_now = time.monotonic()
@@ -1071,11 +1081,26 @@ _LAG_UNREACHABLE_STRIKES = 3
 # or the same one (YBA's replay pathology).
 _LAG_SCRAPE_HINT_S = 10.0
 
+# Time kept back from ``globalTimeBudgetSecs`` for the work after the lag
+# wait returns (status change, dispatch resume). Stress budget_split
+# measured drain start → drain complete at 20.0s against a 20s budget:
+# the 40/60 split leaves no room for Phase 1's force-close or the flip.
+_BUDGET_FLIP_MARGIN_S = 0.25
+
+
+def _budget_deadline(budget_secs: "int | None", drain_started: float) -> "float | None":
+    """Monotonic time by which the lag wait must return so that the whole
+    drain fits ``globalTimeBudgetSecs``; None without a budget."""
+    if budget_secs is None:
+        return None
+    return drain_started + budget_secs - _BUDGET_FLIP_MARGIN_S
+
 
 def _wait_for_replication_lag(
     group: "FailoverGroup",
     which_cluster: str,
     is_failback: bool = False,
+    budget_deadline: "float | None" = None,
 ) -> None:
     """Poll YBA for the outgoing side's replication lag every second, exit
     on any of three conditions:
@@ -1129,6 +1154,19 @@ def _wait_for_replication_lag(
 
     started = time.monotonic()
     deadline = started + timeout_s
+    if budget_deadline is not None and budget_deadline < deadline:
+        # Phase 1 ran past its share of globalTimeBudgetSecs; the lag
+        # wait gets what is left of the budget, not its full share.
+        logger.info(
+            "lag wait: %.1fs left of the global time budget (lag wait "
+            "timeout %ds)", max(0.0, budget_deadline - started), timeout_s,
+        )
+        deadline = budget_deadline
+    # A YBA call made under a budget is cut at the deadline as well.
+    from .yba_client import YBAClient
+    pass_deadline = (
+        budget_deadline is not None and isinstance(group.yba_client, YBAClient)
+    )
     unreachable_streak = 0
     # DB-24483 — liveness tracking: consecutive distinct post-barrier
     # samples at ≤ threshold.
@@ -1248,7 +1286,13 @@ def _wait_for_replication_lag(
             # lag wait (agent-K PR #15:698). We still trust YBA as the
             # lag source of truth; surfacing the age gives operators a
             # concrete number to reason about after a flip.
-            if hasattr(group.yba_client, "get_committed_lag_sample"):
+            if pass_deadline:
+                sample = group.yba_client.get_committed_lag_sample(
+                    xcluster_uuid, deadline=deadline,
+                )
+                lag_ms = None if sample is None else sample[0]
+                sample_ts = None if sample is None else sample[1]
+            elif hasattr(group.yba_client, "get_committed_lag_sample"):
                 sample = group.yba_client.get_committed_lag_sample(xcluster_uuid)
                 lag_ms = None if sample is None else sample[0]
                 sample_ts = None if sample is None else sample[1]
@@ -1281,6 +1325,10 @@ def _wait_for_replication_lag(
                 )
         except YBAClientError as exc:
             slowest_poll_s = max(slowest_poll_s, time.monotonic() - poll_started)
+            if pass_deadline and time.monotonic() >= deadline:
+                # Cut at the budget deadline: a timeout, not a strike.
+                logger.info("lag wait: YBA call cut at the budget deadline: %s", exc)
+                continue
             unreachable_streak += 1
             logger.warning(
                 "lag wait: YBA unreachable (%d/%d): %s",
