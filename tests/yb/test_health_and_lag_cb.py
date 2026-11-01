@@ -272,15 +272,16 @@ def test_health_unhealthy_and_no_config_uuid_fails_open():
 
 
 def test_primary_slot_uses_a2b_config_uuid_from_group():
-    """When no override is provided, the CB reads
+    """With an explicit client but no config override, the CB reads
     ``group.xcluster_config_uuid`` for the primary slot."""
     yba = _StubYBAClient(responses=[0.0])
     cb = HealthAndLagCircuitBreaker(
         which_cluster="primary",
         threshold_lag_ms=10,
         health_probe=_StubHealthProbe(HealthResult.UNHEALTHY),
-    )   # no yba_client override, no config_uuid override
-    group = _fake_group(yba_client=yba, xcluster_config_uuid="xcc-a2b-from-group")
+        yba_client=yba,
+    )
+    group = _fake_group(yba_client=None, xcluster_config_uuid="xcc-a2b-from-group")
     assert cb.check(group) is HealthResult.UNHEALTHY
     assert yba.calls == ["xcc-a2b-from-group"]
 
@@ -292,14 +293,36 @@ def test_secondary_slot_uses_b2a_config_uuid_from_group():
         which_cluster="secondary",
         threshold_lag_ms=10,
         health_probe=_StubHealthProbe(HealthResult.UNHEALTHY),
+        yba_client=yba,
     )
     group = _fake_group(
-        yba_client=yba,
+        yba_client=None,
         xcluster_config_uuid="xcc-a2b",              # would be wrong for failback
         failback_xcluster_config_uuid="xcc-b2a",
     )
     assert cb.check(group) is HealthResult.UNHEALTHY
     assert yba.calls == ["xcc-b2a"]
+
+
+@pytest.mark.parametrize("which, field", [
+    ("primary", "xcluster_config_uuid"),
+    ("secondary", "failback_xcluster_config_uuid"),
+])
+def test_driver_phase2_wired_trips_without_lag_gate(which, field):
+    """Stress timing_detect_s (health_lag_cb): with the driver's Phase 2
+    wired, gating on lag here measured it while the app was still
+    writing, never reached 0 ms, and every planned failover waited out
+    the 12-tick backstop. The CB now trips on health and leaves the lag
+    wait to Phase 2, which runs after the dispatch barrier."""
+    yba = _StubYBAClient(responses=[500.0])         # would hold
+    cb = HealthAndLagCircuitBreaker(
+        which_cluster=which,
+        threshold_lag_ms=0,
+        health_probe=_StubHealthProbe(HealthResult.UNHEALTHY),
+    )
+    group = _fake_group(yba_client=yba, **{field: "xcc"})
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    assert yba.calls == []
 
 
 def test_constructor_override_wins_over_group():
