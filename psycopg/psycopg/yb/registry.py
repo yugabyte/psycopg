@@ -1765,6 +1765,13 @@ class ClusterRegistry:
                     return group
             return None
 
+    def dbnames_for(self, uuid: str) -> "set[str]":
+        """Database names the application has connected to on cluster
+        ``uuid`` (one ClusterKey per dbname). Lets a circuit breaker
+        that probes a control database also look at the app's own."""
+        with self._lock:
+            return {k.dbname for k, u in self._key_to_uuid.items() if u == uuid}
+
     def reset_failover_group(self, primary_uuid: str) -> bool:
         """Operator failback API. Flips BOTH primary and secondary status
         back to HEALTHY immediately. Returns True if a group existed and

@@ -30,6 +30,7 @@ doesn't match the auto-marker prefixes.
 from __future__ import annotations
 
 import threading
+import types
 
 import pytest
 
@@ -77,6 +78,13 @@ class _Cursor:
             assert self._conn._raise_exc is not None
             raise self._conn._raise_exc
         self._conn.executed.append(sql)
+        self._conn.params.append(args[0] if args else None)
+
+    def fetchone(self):
+        return (self._conn._rowcount,)
+
+    def fetchall(self):
+        return list(self._conn.db_settings)
 
 
 class _Conn:
@@ -98,6 +106,10 @@ class _Conn:
         self._raise_exc = raise_exc
         self._rowcount = rowcount
         self._executes = 0          # shared counter across cursors
+        self.params: list = []
+        # Rows for the pg_db_role_setting query: (datname, setconfig).
+        self.db_settings: list[tuple[str, list[str]]] = []
+        self.info = types.SimpleNamespace(dbname="driver_ctl")
 
     def cursor(self):
         return _Cursor(self)
@@ -192,7 +204,7 @@ def test_first_check_creates_table_and_seeds_rows():
     # CREATE TABLE + INSERT + UPDATE all ran.
     assert any("CREATE TABLE IF NOT EXISTS" in s for s in conn.executed)
     assert any("INSERT INTO yb_cluster_health_tracker" in s for s in conn.executed)
-    assert any(s.startswith("UPDATE yb_cluster_health_tracker") for s in conn.executed)
+    assert any(s.startswith("SELECT COUNT(*) FROM yb_cluster_health_tracker") for s in conn.executed)
     assert cb._table_setup_done is True
 
 
@@ -201,12 +213,12 @@ def test_subsequent_check_skips_table_setup():
     conn = _Conn()
     group = _make_group(primary_conn=conn)
     cb.check(group)
-    # Second call should NOT re-create or re-INSERT — only UPDATE.
+    # Second call should NOT re-create or re-INSERT — only the COUNT(*) probe.
     conn.executed.clear()
     cb.check(group)
     assert all("CREATE TABLE" not in s for s in conn.executed)
     assert all("INSERT INTO" not in s for s in conn.executed)
-    assert any(s.startswith("UPDATE") for s in conn.executed)
+    assert any(s.startswith("SELECT COUNT(*)") for s in conn.executed)
 
 
 # ----------------------------------------------------------------- failure threshold
@@ -393,3 +405,60 @@ def test_check_secondary_cluster_falls_back_to_healthy_when_cb_is_none():
     group = _make_group()
     group.secondary_circuit_breaker = None
     assert check_secondary_cluster(group) == HealthResult.HEALTHY
+
+
+# ----------------------------------------------------------------- application database read-only
+
+def test_read_only_app_database_trips_breaker():
+    """Stress breaker_blind: A's application database set to
+    default_transaction_read_only rejects every app write while the
+    tracker table in the control database still answers. The breaker
+    reads the setting from pg_db_role_setting and counts a failure."""
+    cb = TrackerTableCircuitBreaker(app_databases=["xcf_app"])
+    conn = _Conn()
+    group = _make_group(primary_conn=conn)
+    assert cb.check(group) == HealthResult.HEALTHY
+
+    conn.db_settings = [("xcf_app", ["default_transaction_read_only=on"])]
+    assert cb.check(group) == HealthResult.UNHEALTHY
+    assert any("pg_db_role_setting" in s for s in conn.executed)
+    assert (["xcf_app"],) in conn.params
+
+    conn.db_settings = []
+    assert cb.check(group) == HealthResult.HEALTHY
+
+
+@pytest.mark.parametrize("value, read_only", [
+    ("on", True), ("true", True), ("1", True), ("yes", True), ("t", True),
+    ("off", False), ("false", False), ("0", False), ("no", False),
+])
+def test_read_only_setting_spellings(value, read_only):
+    from demo.samples.tracker_table_cb import _read_only_dbs
+    rows = [("xcf_app", ["search_path=public", f"default_transaction_read_only={value}"])]
+    assert _read_only_dbs(rows) == (["xcf_app"] if read_only else [])
+
+
+def test_app_databases_default_to_registry_dbnames(fresh_registry):
+    """Without app_databases, the breaker checks the databases the app
+    connected to on either cluster, minus its own control database."""
+    from psycopg.yb.registry import ClusterKey, ClusterRegistry
+
+    cb = TrackerTableCircuitBreaker()
+    conn = _Conn()
+    group = _make_group(primary_conn=conn)
+    registry = ClusterRegistry.instance()
+    for db in ("driver_ctl", "xcf_app"):
+        key = ClusterKey(hosts=("h1",), port=5433, dbname=db, user="u")
+        registry._key_to_uuid[key] = group.primary.uuid
+    conn.db_settings = [("xcf_app", ["default_transaction_read_only=on"])]
+
+    assert cb.check(group) == HealthResult.UNHEALTHY
+    assert (["xcf_app"],) in conn.params
+
+
+def test_no_app_databases_skips_settings_query(fresh_registry):
+    cb = TrackerTableCircuitBreaker()
+    conn = _Conn()
+    group = _make_group(primary_conn=conn)
+    assert cb.check(group) == HealthResult.HEALTHY
+    assert all("pg_db_role_setting" not in s for s in conn.executed)
