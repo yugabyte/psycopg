@@ -689,3 +689,48 @@ def test_get_committed_lag_report_end_to_end(yba_server):
     r = client.get_committed_lag_report("xcc-1")
     assert r["lag_ms"] == 12.5 and r["sample_ts"] == 1700000000.0
     assert r["leader_reported"] and r["stale"] == []
+
+
+# ------------------------------------------------------------- non-finite values
+
+def test_nan_latest_value_is_not_caught_up():
+    """Review #8 (Amogh): NaN fails every comparison and used to land in
+    the caught-up bucket: ["5000", "NaN"] returned (0.0, ts). The NaN is
+    skipped and the last finite point (with its own x) is used."""
+    from psycopg.yb.yba_client import _max_lag_sample_from_traces
+    r = _max_lag_sample_from_traces([
+        {"name": "Committed Lag", "y": ["5000", "NaN"], "x": ["1000000", "1010000"]},
+    ])
+    assert r == (5000.0, 1000.0)
+
+
+@pytest.mark.parametrize("ys", [["NaN"], ["NaN", "nan"], ["inf"], ["-Infinity", "NaN"]])
+def test_series_with_no_finite_value_is_no_data(ys):
+    from psycopg.yb.yba_client import (
+        _lag_report_from_traces, _max_lag_sample_from_traces,
+    )
+    traces = [{"name": "Committed Lag", "y": ys, "x": ["1000000"] * len(ys)}]
+    assert _max_lag_sample_from_traces(traces) is None
+    assert _max_lag_from_traces(traces) is None
+    assert _lag_report_from_traces(traces) is None
+
+
+def test_nan_node_does_not_hide_lag_in_report():
+    """A node whose newest point is NaN keeps its last finite value and
+    is flagged stale (its series ends early), so the lag wait does not
+    count the sample."""
+    from psycopg.yb.yba_client import _lag_report_from_traces
+    xs = ["1000000", "1010000"]
+    r = _lag_report_from_traces([
+        _trace("n1", ["0.001", "0.001"], xs),
+        _trace("n2", ["0.001", "NaN"], xs),
+    ])
+    assert r["values"] == {"n1": 0.001, "n2": 0.001}
+    assert r["stale"] == ["n2"]
+
+
+def test_extract_committed_lag_ms_nan_only_is_none():
+    resp = {"tserver_async_replication_lag_micros": {"data": [
+        {"name": "Committed Lag", "y": ["NaN"], "x": ["1000000"]},
+    ]}}
+    assert _extract_committed_lag_ms(resp) is None

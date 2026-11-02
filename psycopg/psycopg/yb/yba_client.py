@@ -23,6 +23,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import math
 import ssl
 import threading
 import time
@@ -539,22 +540,36 @@ def _latest_xy(trace: dict) -> "tuple[float | None, float | None]":
     convert to seconds for consistency with ``time.time()``. Either
     element may be ``None`` independently (e.g. ``y`` present but
     malformed ``x``).
+
+    Non-finite or unparseable ``y`` values (Prometheus emits ``NaN`` for
+    missing or stale series) are skipped: the point used is the last one
+    with a finite value, and its own ``x``. A series with no finite value
+    gives ``y = None`` ("no data"). A ``NaN`` used to fail every
+    comparison and land in the caught-up bucket.
     """
     y_values = trace.get("y") or []
     x_values = trace.get("x") or []
     y_out: float | None = None
     x_out: float | None = None
-    if y_values:
+    idx = len(x_values) - 1
+    for i in range(len(y_values) - 1, -1, -1):
         try:
-            y_out = float(y_values[-1])
+            y = float(y_values[i])
         except (TypeError, ValueError):
-            pass
-    if x_values:
+            continue
+        if math.isfinite(y):
+            y_out = y
+            if i < len(x_values):
+                idx = i
+            break
+    if x_values and idx >= 0:
         try:
             # YBA sends epoch milliseconds as strings; normalise to seconds.
-            x_out = float(x_values[-1]) / 1000.0
+            x_out = float(x_values[idx]) / 1000.0
         except (TypeError, ValueError):
             pass
+        if x_out is not None and not math.isfinite(x_out):
+            x_out = None
     return y_out, x_out
 
 
