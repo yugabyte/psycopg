@@ -26,8 +26,9 @@ It composes:
      ``_safe_close`` type-dispatches and calls ``pgconn.finish()``
      for async conns (DB-24960). Close is bounded by
      ``_KILL_AT_TIMEOUT_BUDGET_S`` (default 2 s); any conn whose
-     close hasn't returned within the budget gets its socket fd
-     hard-closed via ``os.close`` — a stuck TCP ``send()`` in libpq's
+     close hasn't returned within the budget gets its socket shut
+     down (``SHUT_RDWR`` through a dup of its fd; the fd itself is
+     never closed by the drain) — a stuck TCP ``send()`` in libpq's
      ``PQfinish`` could otherwise block for ``tcp_retries2`` (~15 min
      on Linux, worse with TCP keepalive disabled). Bounds total drain
      wall-clock at ``drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S``
@@ -98,8 +99,27 @@ _CLOSE_FENCE_S = 1.0
 # OS's tcp_retries2 gives up — ~15 min on Linux default. A serial
 # for-loop of c.close() would therefore hang drain past its own
 # deadline. This budget bounds the parallel close phase; anything still
-# stuck at the end gets its fd hard-closed via os.close.
+# stuck at the end gets its socket shut down (see _shutdown_socket_fd).
 _KILL_AT_TIMEOUT_BUDGET_S = 2.0
+
+
+def _shutdown_socket_fd(dup_fd: int) -> None:
+    """``shutdown(SHUT_RDWR)`` the socket behind ``dup_fd``, our own dup
+    of a conn's fd. Unblocks any thread inside libpq on that socket
+    (its read/write errors out) without closing the conn's fd, so the
+    fd number can't be reused under libpq. The caller closes
+    ``dup_fd``."""
+    import socket as _socket
+    try:
+        sock = _socket.socket(fileno=dup_fd)
+    except OSError:
+        return   # not a socket
+    try:
+        sock.shutdown(_socket.SHUT_RDWR)
+    except OSError:
+        pass     # already shut down / disconnected
+    finally:
+        sock.detach()
 
 
 def _release_registry_count(c) -> None:
@@ -738,10 +758,9 @@ def _drain_and_apply(
         # on the FIRST hung TCP session for ~tcp_retries2 (up to ~15
         # min on Linux, worse with keepalive=0), which would wedge
         # drain past its own deadline. For any close() that doesn't
-        # return within _KILL_AT_TIMEOUT_BUDGET_S, escape via raw
-        # os.close on the socket fd — the libpq send() may still be
-        # blocked upstream, but from the driver's perspective the conn
-        # is disowned and drain proceeds. Bounds total wall-clock at
+        # return within _KILL_AT_TIMEOUT_BUDGET_S (or never started),
+        # escape by shutting its socket down — the blocked libpq call
+        # errors out, and drain proceeds. Bounds total wall-clock at
         # drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S regardless of
         # TCP state.
         if survivors:
@@ -765,8 +784,12 @@ def _drain_and_apply(
                     drain_timeout_s, len(survivors), outgoing.uuid,
                     _KILL_AT_TIMEOUT_BUDGET_S,
                 )
-            # Snapshot fds BEFORE close() nulls the pgconn state —
-            # we need them for the hard-fd escape hatch.
+            # Snapshot fds BEFORE close() nulls the pgconn state, and
+            # dup each one: the escape hatch below shuts the socket down
+            # through our own dup, so it can only ever reach this conn's
+            # socket, even if libpq closes its fd and the number is
+            # reused meanwhile. Review #6 (Amogh): the escape hatch
+            # used to os.close() the borrowed fd number.
             snapshot = []
             for c in survivors:
                 try:
@@ -774,7 +797,13 @@ def _drain_and_apply(
                     conn_id = f"conn=fd{fd}"
                 except Exception:
                     fd, conn_id = None, f"conn={id(c):x}"
-                snapshot.append((c, fd, conn_id))
+                dup_fd = None
+                if isinstance(fd, int) and fd >= 0:
+                    try:
+                        dup_fd = os.dup(fd)
+                    except OSError:
+                        dup_fd = None
+                snapshot.append((c, dup_fd, conn_id))
 
             hung = 0
             # NB: intentionally NOT using `with ThreadPoolExecutor()` —
@@ -782,45 +811,31 @@ def _drain_and_apply(
             # on hung workers and re-introduce the very problem we're
             # solving. Manual instantiation + explicit shutdown(wait=
             # False) in finally lets a stuck close() worker remain
-            # detached in the background; the driver-side conn is
-            # already disowned via os.close of its fd (see below), so
-            # the hang has no downstream effect. When the OS eventually
-            # gives up on the wedged send() (tcp_retries2), the worker
-            # unwinds naturally.
+            # detached in the background; its socket has been shut
+            # down (see below), so the stuck send() errors out and the
+            # worker unwinds, and libpq closes its own fd.
             ex = concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(len(survivors), 32),
                 thread_name_prefix="yb-kill",
             )
             try:
                 fut_by_conn = {
-                    ex.submit(_safe_close, c): (c, fd, conn_id)
-                    for c, fd, conn_id in snapshot
+                    ex.submit(_safe_close, c): (c, dup_fd, conn_id)
+                    for c, dup_fd, conn_id in snapshot
                 }
                 concurrent.futures.wait(
                     list(fut_by_conn),
                     timeout=_KILL_AT_TIMEOUT_BUDGET_S,
                 )
-                for fut, (c, fd, conn_id) in fut_by_conn.items():
+                for fut, (c, dup_fd, conn_id) in fut_by_conn.items():
+                    # Escape hatch: shutdown(SHUT_RDWR), never close.
+                    # The fd is not ours: its owner (a thread inside
+                    # libpq, or the close() worker blocked in PQfinish)
+                    # still uses it. Shutdown unblocks that thread's
+                    # read/write; the fd number stays allocated until
+                    # libpq closes it, so no other socket can be hit
+                    # (agent-K PR #21:672, Review #6).
                     needs_hard_close = False
-                    # agent-K PR #21:672 blocker. The hard-fd escape
-                    # hatch is only safe when `_closed=True` has been
-                    # set on the conn — then the driver has disowned it
-                    # and the owner thread won't touch it again. On the
-                    # hung-close branch, `_safe_close` has already set
-                    # `_closed=True` before `c.close()` started blocking.
-                    # On the lock-timeout branch (DB-25090), `_closed`
-                    # is still False and the owner is still inside
-                    # libpq holding a PGconn whose fd we are about to
-                    # free; Linux will give the next socket the lowest
-                    # free fd (likely this one), the owner's next libpq
-                    # read/write hits a different conn → cross-conn
-                    # protocol corruption. On that branch use
-                    # `shutdown(SHUT_RDWR)` instead: it unblocks the
-                    # owner's blocked read/write but keeps the fd
-                    # number reserved so no reuse race, and the
-                    # owner's eventual close() finishes teardown
-                    # cleanly (including ClusterRegistry.decrement).
-                    hard_close_mode = "close"   # vs "shutdown"
                     hard_close_reason = ""
                     if fut.done():
                         exc = fut.result()
@@ -851,12 +866,8 @@ def _drain_and_apply(
                             # from the driver's point of view, which
                             # means the owner can still issue the next
                             # cursor call on this socket post-flip and
-                            # dual-write. Use the shutdown-not-close
-                            # variant so we unblock the owner's libpq
-                            # call without racing fd reuse (agent-K
-                            # PR #21:672).
+                            # dual-write.
                             needs_hard_close = True
-                            hard_close_mode = "shutdown"
                             hard_close_reason = (
                                 f"lock held past "
                                 f"{_SAFE_CLOSE_LOCK_BUDGET_S}s "
@@ -868,83 +879,33 @@ def _drain_and_apply(
                                 "drain: close() raised on %s: %r",
                                 conn_id, exc,
                             )
-                    else:
-                        # close() hung past the budget. Hard-close the
-                        # fd directly — releases the driver's grip
-                        # even though libpq's PQfinish send() may
-                        # still be blocked in the worker thread. The
-                        # OS closes the socket immediately; libpq's
-                        # blocked send() will error out when the peer
-                        # (or the closed local half) becomes evident.
+                    elif fut.cancel():
+                        # Never started: queued behind max_workers past
+                        # the budget. Nothing closed this conn, and its
+                        # owner may be inside libpq right now.
                         needs_hard_close = True
                         hard_close_reason = (
-                            f"close() hung past "
+                            f"close() still queued after "
+                            f"{_KILL_AT_TIMEOUT_BUDGET_S}s budget"
+                        )
+                    else:
+                        # Started but not returned: blocked waiting for
+                        # conn.lock, or close() hung in PQfinish's
+                        # send(). Shutdown unblocks either.
+                        needs_hard_close = True
+                        hard_close_reason = (
+                            f"close() still running past "
                             f"{_KILL_AT_TIMEOUT_BUDGET_S}s budget"
                         )
                     if needs_hard_close:
                         hung += 1
-                        if fd is not None:
-                            try:
-                                if hard_close_mode == "shutdown":
-                                    # agent-K PR #21:672 — SHUT_RDWR
-                                    # unblocks the owner's libpq read /
-                                    # write without freeing the fd
-                                    # number. Owner's eventual close()
-                                    # (triggered by the broken-socket
-                                    # error their next call sees) runs
-                                    # the full Connection.close path
-                                    # including the registry decrement.
-                                    #
-                                    # Agent-K PR #21:G4 — hold the
-                                    # socket in a local, then call
-                                    # ``detach()`` so the socket
-                                    # object's ``__del__`` does NOT
-                                    # close the fd when it is GC'd
-                                    # right after this block. The whole
-                                    # point of using ``shutdown``
-                                    # instead of ``os.close`` is to
-                                    # keep the fd number reserved so
-                                    # the owner thread's stale libpq
-                                    # read/write can't race a reused
-                                    # fd belonging to another conn;
-                                    # a GC'd socket silently defeated
-                                    # that reservation.
-                                    import socket as _socket
-                                    try:
-                                        sock = _socket.socket(fileno=fd)
-                                        try:
-                                            sock.shutdown(_socket.SHUT_RDWR)
-                                        finally:
-                                            # Releases ownership of the
-                                            # fd back to the kernel's
-                                            # ``close`` boundary (the
-                                            # owner thread will do it);
-                                            # the socket's ``__del__``
-                                            # becomes a no-op.
-                                            sock.detach()
-                                    except OSError:
-                                        # fd already gone / not a socket
-                                        pass
-                                else:
-                                    os.close(fd)
-                                logger.warning(
-                                    "kill-at-timeout: %s %s "
-                                    "(%s on %s)",
-                                    conn_id,
-                                    (
-                                        "hard-fd-shutdown"
-                                        if hard_close_mode == "shutdown"
-                                        else "hard-fd-closed"
-                                    ),
-                                    hard_close_reason,
-                                    outgoing.uuid,
-                                )
-                            except OSError:
-                                # Either close() completed racily and
-                                # already released the fd, or the fd
-                                # was invalid to begin with. Nothing
-                                # more to do.
-                                pass
+                        if dup_fd is not None:
+                            _shutdown_socket_fd(dup_fd)
+                            logger.warning(
+                                "kill-at-timeout: %s hard-fd-shutdown "
+                                "(%s on %s)",
+                                conn_id, hard_close_reason, outgoing.uuid,
+                            )
                         else:
                             logger.warning(
                                 "kill-at-timeout: %s needs hard-close but "
@@ -954,9 +915,17 @@ def _drain_and_apply(
             finally:
                 # wait=False: never block on hung workers. Any still-
                 # running _safe_close call keeps executing after we
-                # return — its future is abandoned and it eventually
-                # unwinds when the OS releases the wedged send().
+                # return — its future is abandoned and it unwinds once
+                # its shut-down socket errors out.
                 ex.shutdown(wait=False)
+                # Our dups only: closing them never touches the conns'
+                # own fds.
+                for _c, dup_fd, _conn_id in snapshot:
+                    if dup_fd is not None:
+                        try:
+                            os.close(dup_fd)
+                        except OSError:
+                            pass
 
             logger.warning(
                 "kill-at-timeout complete on %s: %d force-closed "
