@@ -679,13 +679,14 @@ def test_failback_yba_unreachable_aborts_with_fail_policy(fake_state):
     """`yb.failback.onPhase2Timeout=fail` means "don't fail back onto a primary we
     can't confirm has caught up"; an unreachable YBA is that case. The
     failback aborts, routing stays on the healthy secondary."""
+    # 0.0: the failback pre-check passes; Phase 2 then can't reach YBA.
     group, client = _failback_group(
-        fake_state, [YBAClientError("net down")] * 3, "fail",
+        fake_state, [0.0] + [YBAClientError("net down")] * 3, "fail",
     )
 
     trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
 
-    assert len(client.calls) == 3
+    assert len(client.calls) == 1 + 3
     assert group.primary_status == HealthResult.UNHEALTHY
     assert group.last_phase2_timeout_ts > 0
     assert group.dispatch_paused is False
@@ -721,12 +722,14 @@ def test_failback_unexpected_yba_error_aborts_with_fail_policy(fake_state):
     the "unexpected YBA error — proceeding with flip" path and failed
     back with no lag confirmation, whatever the policy. Under `fail` the
     failback aborts there too."""
+    # 0.0: the failback pre-check passes; Phase 2 then gets the error.
     group, client = _failback_group(
-        fake_state, [RuntimeError("boom")], "fail",
+        fake_state, [0.0, RuntimeError("boom")], "fail",
     )
 
     trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
 
+    assert len(client.calls) == 2
     assert group.primary_status == HealthResult.UNHEALTHY
     assert group.last_phase2_timeout_ts > 0
     assert group.dispatch_paused is False
