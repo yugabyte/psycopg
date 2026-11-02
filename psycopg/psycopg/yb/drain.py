@@ -133,16 +133,16 @@ def _release_registry_count(c) -> None:
     rest of the process lifetime (agent-K PR #13:111). Call this
     manually on any close path that doesn't flow through
     ``Connection.close``.
+
+    Idempotent per conn (review #18): ``ClusterRegistry.release_conn``
+    decrements at most once, so a later ``close()`` or ``xcluster_check``
+    on the same conn doesn't decrement again. Conns without
+    ``_yb_uuid`` / ``_yb_host`` (control conns, test fakes) are skipped
+    there.
     """
-    uuid = getattr(c, "_yb_uuid", None)
-    host = getattr(c, "_yb_host", None)
-    if not uuid or not host:
-        # Not a smart-driver conn (control conn, pool bypass, test
-        # fake). The registry didn't increment for it, nothing to do.
-        return
     try:
         from .registry import ClusterRegistry
-        ClusterRegistry.instance().decrement(uuid, host)
+        ClusterRegistry.instance().release_conn(c)
     except Exception:
         # Registry decrement is best-effort — a stale uuid / torn-down
         # state must not block the actual close path.
