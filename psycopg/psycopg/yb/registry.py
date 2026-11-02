@@ -143,6 +143,31 @@ class _PartialOutageBootstrapError(_PsycopgOperationalError):
         self.secondary_exc = secondary_exc
 
 
+def _placeholder_ports(conninfo: str, kwargs: dict, n_hosts: int) -> "list[int]":
+    """Port for each of ``n_hosts`` placeholder hosts, paired like libpq:
+    the port may come from the conninfo string or kwargs (kwargs win); a
+    single port applies to every host, a comma list pairs by position,
+    and a missing or empty entry means 5433. Never raises: a bad value
+    falls back to 5433 so bootstrap still tolerates one universe down.
+    """
+    raw: object = None
+    try:
+        from ..conninfo import conninfo_to_dict  # late import
+        raw = conninfo_to_dict(str(conninfo or ""), **kwargs).get("port")
+    except Exception:
+        raw = kwargs.get("port")
+    entries = [p.strip() for p in str(raw).split(",")] if raw is not None else []
+    if len(entries) == 1:
+        entries = entries * n_hosts
+    ports: list[int] = []
+    for i in range(n_hosts):
+        try:
+            ports.append(int(entries[i]) if i < len(entries) and entries[i] else 5433)
+        except ValueError:
+            ports.append(5433)
+    return ports
+
+
 def _make_placeholder_state(
     conninfo: str,
     kwargs: dict,
@@ -172,13 +197,17 @@ def _make_placeholder_state(
     placement = __import__(
         "psycopg.yb.node", fromlist=["Placement"]
     ).Placement(cloud="", region="", zone="")
-    for host in hosts:
+    # agent-K PR #17:168 — the port used to come from kwargs only, so a
+    # port in the conninfo string was lost (placeholder got 5433 and never
+    # reconnected) and a multi-port value raised outside the try.
+    ports = _placeholder_ports(conninfo, kwargs, len(hosts))
+    for host, port in zip(hosts, ports):
         if not host:
             continue
         nodes[host] = NodeInfo(
             host=host,
             public_ip=None,
-            port=int(kwargs.get("port", 5433) or 5433),
+            port=port,
             placement=placement,
             node_type="primary",
             connection_count=0,

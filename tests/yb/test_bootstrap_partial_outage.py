@@ -119,6 +119,32 @@ def test_placeholder_state_seeds_nodes_from_hosts():
         assert node.port == 5433
 
 
+@pytest.mark.parametrize("conninfo, kwargs, hosts, expected", [
+    # Port only in the conninfo string (agent-K PR #17:168).
+    ("host=a,b port=5434", {}, ["a", "b"], [5434, 5434]),
+    # Multi-port list pairs by position, like libpq; must not raise.
+    ("host=a,b,c port=5433,5434,5435", {}, ["a", "b", "c"], [5433, 5434, 5435]),
+    ("", {"host": "a,b", "port": "6000,6001"}, ["a", "b"], [6000, 6001]),
+    # Port in kwargs, overriding the conninfo string.
+    ("host=a port=5434", {"port": 7000}, ["a"], [7000]),
+    # Missing everywhere: default.
+    ("host=a,b", {}, ["a", "b"], [5433, 5433]),
+    # Empty / short list entries fall back to the default.
+    ("host=a,b,c port=5440,,", {}, ["a", "b", "c"], [5440, 5433, 5433]),
+    ("", {"port": "6000,6001"}, ["a", "b", "c"], [6000, 6001, 5433]),
+])
+def test_placeholder_state_pairs_ports_like_libpq(conninfo, kwargs, hosts, expected):
+    state = _make_placeholder_state(conninfo, kwargs, hosts, "primary")
+    assert [state.nodes[h].port for h in hosts] == expected
+
+
+def test_placeholder_state_bad_port_never_raises():
+    """A malformed port must not abort a bootstrap that is tolerating one
+    universe being down."""
+    state = _make_placeholder_state("", {"port": "abc,5434"}, ["a", "b"], "primary")
+    assert [state.nodes[h].port for h in ("a", "b")] == [5433, 5434]
+
+
 def test_placeholder_state_remembers_bootstrap_params():
     """When the cluster comes back, the probe retries using
     bootstrap_conninfo/kwargs. Placeholder must preserve them."""
