@@ -445,3 +445,26 @@ def test_failback_gate_with_override_client_is_bounded():
 
     assert verdicts[:2] == [HealthResult.UNHEALTHY, HealthResult.UNHEALTHY]
     assert verdicts[2] == HealthResult.HEALTHY
+
+
+def test_failback_gate_no_lag_data_holds_then_releases():
+    """Review #12 (Amogh): YBA returning no data (None) raised TypeError
+    from `lag_ms <= threshold`. No data is not a confirmed drain: the
+    gate holds, and the max_hold_ticks backstop still releases it."""
+    yba = _StubYBAClient([None])
+    cb, group = _recovering_primary(None, override=yba)
+    cb.max_hold_ticks = 3
+
+    verdicts = [cb.check(group) for _ in range(3)]
+
+    assert verdicts[:2] == [HealthResult.UNHEALTHY, HealthResult.UNHEALTHY]
+    assert verdicts[2] == HealthResult.HEALTHY
+    assert len(yba.calls) == 3
+
+
+def test_failback_gate_no_lag_data_does_not_raise():
+    yba = _StubYBAClient([None])
+    cb, group = _recovering_primary(None, override=yba)
+    cb.max_hold_ticks = 0
+
+    assert cb._failback_lag_drained(group) is False

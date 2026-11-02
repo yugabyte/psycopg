@@ -424,7 +424,9 @@ class HealthAndLagCircuitBreaker:
         failback xcluster config (B→A direction) via YBA, same client
         the secondary slot would use when it goes UNHEALTHY. On any
         error, returns True (fail-open) — the recovery check is a
-        safety belt, not a hard interlock.
+        safety belt, not a hard interlock. "No data" (``None``) is not
+        an error: it holds like lag over the threshold, bounded by
+        ``max_hold_ticks``.
         """
         failback_config = (
             getattr(group, "failback_xcluster_config_uuid", "") or ""
@@ -462,7 +464,10 @@ class HealthAndLagCircuitBreaker:
         threshold = getattr(
             group, "failback_threshold_replication_lag_ms", self.threshold_lag_ms,
         )
-        drained = lag_ms <= threshold
+        # No data is not a confirmed drain: hold, like lag over the
+        # threshold, and let the max_hold_ticks backstop release it.
+        lag_str = "no data" if lag_ms is None else f"{lag_ms:.1f}ms"
+        drained = lag_ms is not None and lag_ms <= threshold
         if drained:
             self._failback_hold_ticks = 0
             return True
@@ -472,15 +477,15 @@ class HealthAndLagCircuitBreaker:
         self._failback_hold_ticks += 1
         if self.max_hold_ticks > 0 and self._failback_hold_ticks >= self.max_hold_ticks:
             logger.warning(
-                "primary: failback lag %.1fms > threshold %dms for %d ticks "
+                "primary: failback lag %s (threshold %dms) for %d ticks "
                 "— releasing failback gate (max_hold_ticks=%d)",
-                lag_ms, threshold, self._failback_hold_ticks, self.max_hold_ticks,
+                lag_str, threshold, self._failback_hold_ticks, self.max_hold_ticks,
             )
             self._failback_hold_ticks = 0
             return True
         logger.info(
-            "primary: failback lag %.1fms > threshold %dms",
-            lag_ms, threshold,
+            "primary: failback lag %s, threshold %dms — holding",
+            lag_str, threshold,
         )
         return False
 
