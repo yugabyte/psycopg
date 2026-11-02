@@ -2395,6 +2395,33 @@ class ClusterRegistry:
                 ni.connection_count = max(0, ni.connection_count - 1)
                 logger.log(TRACE, "decrement: %s → %d", host, ni.connection_count)
 
+    def release_conn(self, conn: object) -> None:
+        """Release ``conn``'s per-host counter, at most once per conn.
+
+        Several close paths can each see the same conn: ``close()``, the
+        drain's direct ``pgconn.finish()`` and the pool's
+        ``xcluster_check`` on the finished conn it later hands out.
+        Review #18: each used to decrement, so the counter drifted low.
+        The ``_yb_released`` flag is checked and set under ``state.lock``,
+        the lock the counter itself uses, so concurrent closers release
+        once. No-op for conns without ``_yb_uuid`` / ``_yb_host``.
+        """
+        uuid = getattr(conn, "_yb_uuid", None)
+        host = getattr(conn, "_yb_host", None)
+        if not uuid or not host:
+            return
+        state = self._clusters.get(uuid)
+        if state is None:
+            return
+        with state.lock:
+            # ``is True``: a test double's auto-attribute isn't a release.
+            if getattr(conn, "_yb_released", False) is True:
+                return
+            conn._yb_released = True  # type: ignore[attr-defined]
+            if (ni := state.nodes.get(host)) is not None:
+                ni.connection_count = max(0, ni.connection_count - 1)
+                logger.log(TRACE, "release: %s → %d", host, ni.connection_count)
+
     def mark_up(self, uuid: str, host: str) -> None:
         """Clear the down flag after a successful connect to ``host``."""
         state = self._clusters.get(uuid)

@@ -78,6 +78,9 @@ class Connection(BaseConnection[Row]):
     # `if self._yb_uuid` guard in `close` correctly skips decrement.
     _yb_uuid: str | None = None
     _yb_host: str | None = None
+    # Set by `ClusterRegistry.release_conn` once this conn's per-host
+    # counter has been released, so later close paths don't decrement again.
+    _yb_released: bool = False
     # xCluster tagging. "primary" / "secondary" when the conn was routed via a
     # FailoverGroup; None for the single-cluster smart-driver path and for
     # pass-through. Used by `psycopg.yb.pool.xcluster_check` to decide whether
@@ -449,6 +452,10 @@ class Connection(BaseConnection[Row]):
     def close(self) -> None:
         """Close the database connection."""
         if self.closed:
+            # A conn the server broke is already closed but still holds
+            # its per-host count; release it (no-op if already released).
+            if self._yb_uuid is not None and self._yb_host is not None:
+                ClusterRegistry.instance().release_conn(self)
             return
 
         pool = getattr(self, "_pool", None)
@@ -463,11 +470,11 @@ class Connection(BaseConnection[Row]):
 
             self.pgconn.finish()
         finally:
-            # Smart-driver: decrement the cluster's per-host counter. Guarded
-            # by `_yb_uuid` so pass-through connections (which never set it)
-            # don't touch the registry.
+            # Smart-driver: release the cluster's per-host counter (at most
+            # once per conn). Guarded by `_yb_uuid` so pass-through
+            # connections (which never set it) don't touch the registry.
             if self._yb_uuid is not None and self._yb_host is not None:
-                ClusterRegistry.instance().decrement(self._yb_uuid, self._yb_host)
+                ClusterRegistry.instance().release_conn(self)
 
     @overload
     def cursor(self, *, binary: bool = False) -> Cursor[Row]: ...
