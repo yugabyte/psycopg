@@ -377,3 +377,134 @@ def test_db25xxx_app_can_look_up_group_by_secondary_uuid_when_primary_is_placeho
     # xcluster_check which identifies conns by their uuid.
     found = ClusterRegistry.instance().get_failover_group_by_uuid("SECONDARY-B")
     assert found is group
+
+
+# ===================================================================
+# DB-25011: the probe keeps a never-reached placeholder UNHEALTHY
+# ===================================================================
+
+class _OpenConn:
+    closed = False
+
+
+def _placeholder_primary_group(fake_state):
+    from psycopg.yb.registry import FailoverGroup
+
+    primary = _make_placeholder_state(
+        conninfo="", kwargs={"port": 5433}, hosts=["p1", "p2", "p3"],
+        tag="primary",
+    )
+    secondary = _make_real_state("SECONDARY-B", "s1", fake_state)
+    return FailoverGroup(
+        primary=primary,
+        secondary=secondary,
+        lock=threading.Lock(),
+        primary_status=HealthResult.UNHEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0,
+    )
+
+
+@pytest.fixture
+def drains(monkeypatch):
+    import psycopg.yb.drain as drain_mod
+
+    calls = []
+    monkeypatch.setattr(
+        drain_mod, "trigger_drain",
+        lambda **kw: calls.append((kw["which_cluster"], kw["new_status"])),
+    )
+    return calls
+
+
+def test_db25011_placeholder_without_control_conn_ignores_healthy(
+    fake_state, drains,
+):
+    """startup_a_down: A was down at bootstrap and is still down. The
+    tracker CB answers HEALTHY while its failure count is under the
+    threshold; the probe must not fail back to the unreachable A."""
+    from psycopg.yb.health_probe import HealthProbe
+
+    group = _placeholder_primary_group(fake_state)
+    assert group.primary.control_sync is None
+    probe = HealthProbe(group, interval_s=60, which_cluster="primary")
+
+    probe._maybe_apply(HealthResult.HEALTHY)
+
+    assert drains == []
+    assert group.primary_status is HealthResult.UNHEALTHY
+    assert active_cluster(group) == "secondary"
+
+
+def test_db25011_placeholder_with_control_conn_fails_back(fake_state, drains):
+    """Once A is back the CB's check opens the control conn; the next
+    HEALTHY verdict fails back as usual."""
+    from psycopg.yb.health_probe import HealthProbe
+
+    group = _placeholder_primary_group(fake_state)
+    group.primary.control_sync = _OpenConn()
+    probe = HealthProbe(group, interval_s=60, which_cluster="primary")
+
+    probe._maybe_apply(HealthResult.HEALTHY)
+
+    assert drains == [("primary", HealthResult.HEALTHY)]
+
+
+def test_db25011_placeholder_unhealthy_verdict_is_no_op(fake_state, drains):
+    from psycopg.yb.health_probe import HealthProbe
+
+    group = _placeholder_primary_group(fake_state)
+    probe = HealthProbe(group, interval_s=60, which_cluster="primary")
+
+    probe._maybe_apply(HealthResult.UNHEALTHY)
+
+    assert drains == []
+
+
+def test_db25011_real_cluster_without_control_conn_still_fails_back(
+    fake_state, drains,
+):
+    """The gate is only for clusters never reached since bootstrap: a
+    real cluster's failback is decided by its CB, as before."""
+    from psycopg.yb.health_probe import HealthProbe
+    from psycopg.yb.registry import FailoverGroup
+
+    group = FailoverGroup(
+        primary=_make_real_state("PRIMARY-A", "p1", fake_state),
+        secondary=_make_real_state("SECONDARY-B", "s1", fake_state),
+        lock=threading.Lock(),
+        primary_status=HealthResult.UNHEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0,
+    )
+    group.primary.control_sync = None
+    probe = HealthProbe(group, interval_s=60, which_cluster="primary")
+
+    probe._maybe_apply(HealthResult.HEALTHY)
+
+    assert drains == [("primary", HealthResult.HEALTHY)]
+
+
+def test_db25011_secondary_placeholder_ignores_healthy(fake_state, drains):
+    """Mirror for startup_b_down: B unreachable at bootstrap stays
+    UNHEALTHY until the driver reaches it."""
+    from psycopg.yb.health_probe import HealthProbe
+    from psycopg.yb.registry import FailoverGroup
+
+    group = FailoverGroup(
+        primary=_make_real_state("PRIMARY-A", "p1", fake_state),
+        secondary=_make_placeholder_state(
+            conninfo="", kwargs={"port": 5433}, hosts=["s1", "s2"],
+            tag="secondary",
+        ),
+        lock=threading.Lock(),
+        primary_status=HealthResult.HEALTHY,
+        secondary_status=HealthResult.UNHEALTHY,
+        cooldown_s=0,
+    )
+    probe = HealthProbe(group, interval_s=60, which_cluster="secondary")
+
+    probe._maybe_apply(HealthResult.HEALTHY)
+
+    assert drains == []
+    assert group.secondary_status is HealthResult.UNHEALTHY
