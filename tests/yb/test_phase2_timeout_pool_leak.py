@@ -73,17 +73,25 @@ pytestmark = pytest.mark.yb_unit
 class _FakeYBAClient:
     """Lag-wait sticky-returns stub for the Phase 2 timeout path."""
 
-    def __init__(self, lag_ms: float):
+    def __init__(self, lag_ms: float, first_lag_ms: "float | None" = None):
+        # ``first_lag_ms``: value for the first read only (the failback
+        # pre-check under onPhase2Timeout=fail), so a test can pass the
+        # pre-check and still time out in Phase 2.
         self.lag_ms = lag_ms
+        self.first_lag_ms = first_lag_ms
         self.calls = 0
 
-    def get_committed_lag_ms(self, uuid):
+    def _next(self):
         self.calls += 1
+        if self.calls == 1 and self.first_lag_ms is not None:
+            return self.first_lag_ms
         return self.lag_ms
 
+    def get_committed_lag_ms(self, uuid):
+        return self._next()
+
     def get_committed_lag_sample(self, uuid):
-        self.calls += 1
-        return (self.lag_ms, time.time())
+        return (self._next(), time.time())
 
 
 def _make_group(fake_state, *, yba_client=None, failback_on_phase2_timeout="fail"):
@@ -116,7 +124,8 @@ def test_shubham_cycle7_failback_timeout_does_not_flip(
     """Replica of Shubham's cycle 7: failback lag never converges within
     the window. Under the old code the drain would flip to A despite
     knowing B→A replication was behind. The fix must NOT flip."""
-    yba = _FakeYBAClient(lag_ms=5000.0)   # sticky above threshold
+    # Lag passes the failback pre-check, then sticks above threshold.
+    yba = _FakeYBAClient(lag_ms=5000.0, first_lag_ms=0.0)
     group = _make_group(fake_state, yba_client=yba)
     group.primary_status = HealthResult.UNHEALTHY   # start on secondary
     group.secondary_status = HealthResult.HEALTHY
@@ -362,7 +371,8 @@ def test_db_corruption_window_closed_end_to_end(fake_state, fresh_registry):
       (2) pool-side conns on the outgoing cluster must have been evicted
           during Phase 2 (not served to the app during the wait)
     """
-    yba = _FakeYBAClient(lag_ms=5000.0)
+    # Lag passes the failback pre-check, then sticks above threshold.
+    yba = _FakeYBAClient(lag_ms=5000.0, first_lag_ms=0.0)
     group = _make_group(fake_state, yba_client=yba)
     _install_group_in_registry(fresh_registry, group)
     group.primary_status = HealthResult.UNHEALTHY   # start on secondary
@@ -407,3 +417,103 @@ def test_db_corruption_window_closed_end_to_end(fake_state, fresh_registry):
         "pool watcher never saw an outgoing-side conn evicted during "
         "the Phase 2 pause — the leak that corrupted index in cycle 7"
     )
+
+
+# ===================================================================
+# Failback pre-check (Review #18): abort before Phase 1 under "fail"
+# ===================================================================
+
+
+class _ErrYBAClient:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    def get_committed_lag_sample(self, uuid):
+        self.calls += 1
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+class _IdleConn:
+    def __init__(self):
+        self.info = types.SimpleNamespace(transaction_status=TransactionStatus.IDLE)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _on_secondary(fake_state, yba, policy="fail"):
+    group = _make_group(fake_state, yba_client=yba, failback_on_phase2_timeout=policy)
+    group.primary_status = HealthResult.UNHEALTHY
+    group.secondary_status = HealthResult.HEALTHY
+    conn = _IdleConn()
+    group.secondary.tracked_conns.add(conn)
+    pauses = []
+    orig_pause = group.pause_dispatch
+    group.pause_dispatch = lambda: (pauses.append(True), orig_pause())[1]
+    return group, conn, pauses
+
+
+@pytest.mark.parametrize("yba,why", [
+    (_FakeYBAClient(lag_ms=5000.0), "lag=5000.0ms > threshold=0.0ms"),
+    (_ErrYBAClient(RuntimeError("yba down")), "YBA lag read failed (yba down)"),
+    (_ErrYBAClient(None), "no lag data from YBA"),
+])
+def test_failback_precheck_aborts_before_touching_the_secondary(
+    fake_state, fresh_registry, caplog, yba, why,
+):
+    """Review #18 (Amogh): Phase 2 runs after Phase 1 has closed every
+    conn on the secondary, which stays active when Phase 2 aborts. Under
+    "fail" the lag is read once up front; over the threshold (or
+    unreadable, or no data), nothing is paused or closed."""
+    import logging
+    group, conn, pauses = _on_secondary(fake_state, yba)
+    caplog.set_level(logging.ERROR, logger="psycopg.yb.drain")
+    before = time.monotonic()
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert yba.calls == 1
+    assert pauses == []
+    assert conn.closed is False
+    assert group.primary_status is HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts >= before
+    assert group.primary_last_transition_time >= before   # cooldown armed
+    assert group.last_failover_start_ts == 0.0
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any(
+        m.startswith(f"failback pre-check: {why} — not starting the failback "
+                     "drain; routing stays on current side")
+        for m in msgs
+    ), msgs
+
+
+def test_failback_precheck_passes_then_drain_runs(fake_state, fresh_registry):
+    yba = _FakeYBAClient(lag_ms=0.0)
+    group, conn, pauses = _on_secondary(fake_state, yba)
+    group.failback_lag_confirmation_samples = 1
+    group.failback_lag_freshness_s = 0
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert pauses == [True]
+    assert conn.closed is True
+    assert group.primary_status is HealthResult.HEALTHY
+    assert yba.calls == 2     # pre-check + one Phase 2 poll
+
+
+def test_failback_precheck_not_run_under_proceed(fake_state, fresh_registry):
+    """Default "proceed": unchanged flow, no pre-check read; the drain
+    runs and flips after the lag wait times out."""
+    yba = _FakeYBAClient(lag_ms=5000.0)
+    group, conn, pauses = _on_secondary(fake_state, yba, policy="proceed")
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert pauses == [True]
+    assert conn.closed is True
+    assert group.primary_status is HealthResult.HEALTHY
+    assert group.last_phase2_timeout_ts == 0.0

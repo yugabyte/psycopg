@@ -564,6 +564,9 @@ def trigger_drain(
         # again. Cool-down bounds the log rate.
         return
 
+    if is_failback and not _failback_precheck_passes(group, which_cluster):
+        return
+
     # Stamp per-stage timestamps at their boundaries (design doc §3.8).
     # last_cb_trip_ts fires on UNHEALTHY-direction transitions (the CB
     # just observed the outgoing cluster as bad); last_failover_start_ts
@@ -585,6 +588,64 @@ def trigger_drain(
         drain_timeout_s=drain_timeout_s,
         is_failback=is_failback,
     )
+
+
+def _arm_phase2_abort_cooldown(group: "FailoverGroup", which_cluster: str) -> None:
+    """Record an aborted failback: stamp ``last_phase2_timeout_ts`` and the
+    side's transition time, so the probe's cooldown gate holds off the
+    next attempt (agent-K PR #18:608)."""
+    abort_now = time.monotonic()
+    with group.lock:
+        group.last_phase2_timeout_ts = abort_now
+        if which_cluster == "primary":
+            group.primary_last_transition_time = abort_now
+        else:
+            group.secondary_last_transition_time = abort_now
+
+
+def _failback_precheck_passes(group: "FailoverGroup", which_cluster: str) -> bool:
+    """With ``yb.failback.onPhase2Timeout=fail``, read the B→A lag once
+    before a failback starts. Review #18 (Amogh): Phase 2 runs after
+    Phase 1, so a failback that Phase 2 then aborts has already paused
+    dispatch and closed every conn on the secondary, the side that stays
+    active. When the lag is over the failback threshold, or YBA can't
+    be read or has no data, abort here instead: nothing is paused or
+    closed, routing stays on the secondary, and the cooldown is armed as
+    for a Phase 2 abort. True means go ahead (always, under "proceed"
+    or without a B→A lag source)."""
+    if getattr(group, "failback_on_phase2_timeout", "proceed") != "fail":
+        return True
+    client = group.yba_client
+    config_uuid = group.failback_xcluster_config_uuid
+    if client is None or not config_uuid:
+        return True
+    threshold_ms = float(group.failback_threshold_replication_lag_ms)
+    try:
+        if hasattr(client, "get_committed_lag_report"):
+            report = client.get_committed_lag_report(config_uuid)
+            lag_ms = None if report is None else report["lag_ms"]
+        elif hasattr(client, "get_committed_lag_sample"):
+            sample = client.get_committed_lag_sample(config_uuid)
+            lag_ms = None if sample is None else sample[0]
+        else:
+            lag_ms = client.get_committed_lag_ms(config_uuid)
+    except Exception as exc:
+        why = f"YBA lag read failed ({exc})"
+    else:
+        if lag_ms is not None and lag_ms <= threshold_ms:
+            return True
+        why = (
+            "no lag data from YBA" if lag_ms is None
+            else f"lag={lag_ms:.1f}ms > threshold={threshold_ms:.1f}ms"
+        )
+    _arm_phase2_abort_cooldown(group, which_cluster)
+    logger.error(
+        "failback pre-check: %s — not starting the failback drain; "
+        "routing stays on current side, re-arming %s cooldown "
+        "(primary_uuid=%s, yb.failback.onPhase2Timeout=fail)",
+        why, which_cluster, group.primary.uuid,
+    )
+    return False
 
 
 def _apply_status_change(
@@ -1042,26 +1103,20 @@ def _drain_and_apply(
                     )
             except Phase2TimeoutError as exc:
                 phase2_aborted = True
-                abort_now = time.monotonic()
-                with group.lock:
-                    group.last_phase2_timeout_ts = abort_now
-                    # agent-K PR #18:608. Stamp the per-side transition
-                    # time so the probe's cooldown gate (health_probe
-                    # ``_tick_check`` cooldown check) blocks the next
-                    # tick from re-firing this drain. Without this,
-                    # the probe sees status unchanged (because the
-                    # flip was aborted) and immediately re-calls
-                    # trigger_drain on its next tick (every 5 s by
-                    # default) → pause_dispatch again → force-close
-                    # every tracked conn on the active side again →
-                    # Phase 2 wait again → abort again. Shubham's
-                    # failback case turns a lag outage into a near-
-                    # total application outage. Writing the stamp
-                    # arms the cooldown so the next retry is bounded.
-                    if which_cluster == "primary":
-                        group.primary_last_transition_time = abort_now
-                    else:
-                        group.secondary_last_transition_time = abort_now
+                # agent-K PR #18:608. Stamp the per-side transition
+                # time so the probe's cooldown gate (health_probe
+                # ``_tick_check`` cooldown check) blocks the next
+                # tick from re-firing this drain. Without this,
+                # the probe sees status unchanged (because the
+                # flip was aborted) and immediately re-calls
+                # trigger_drain on its next tick (every 5 s by
+                # default) → pause_dispatch again → force-close
+                # every tracked conn on the active side again →
+                # Phase 2 wait again → abort again. Shubham's
+                # failback case turns a lag outage into a near-
+                # total application outage. Writing the stamp
+                # arms the cooldown so the next retry is bounded.
+                _arm_phase2_abort_cooldown(group, which_cluster)
                 logger.error(
                     "xCluster drain ABORTED at Phase 2: %s (primary_uuid=%s, "
                     "which=%s, new_status=%s) — routing stays on current "
