@@ -66,3 +66,8 @@ class NodeInfo:
     # a refusal). Reset by any successful connect. See
     # ClusterRegistry.mark_failed(timeout=True).
     connect_timeouts: int = 0
+    # time.monotonic() when the connect attempt behind the last counted
+    # timeout strike ended. A timeout whose attempt started before this
+    # overlapped that attempt (same slow spell, another thread) and is
+    # not a new strike.
+    last_timeout_strike_end: float = 0.0

@@ -829,3 +829,31 @@ def test_refused_connect_still_quarantines_immediately(fresh_registry):
     fresh_registry.mark_failed("X", "h1")
 
     assert state.nodes["h1"].is_down is True
+
+
+def test_overlapping_connect_timeouts_count_as_one_strike(fresh_registry):
+    """false_quarantine (r12 218880 c1): four threads timed out on one
+    host within 26 ms after a single ~3 s slow spell and the driver
+    counted 1/3, 2/3, quarantined. Attempts that overlap the one behind
+    the last counted strike are the same slow spell."""
+    state = _install_state(fresh_registry, ["h1"])
+    started = time.monotonic() - 3.0   # every attempt began ~3 s ago
+
+    for _ in range(4):
+        fresh_registry.mark_failed("X", "h1", timeout=True, attempt_started=started)
+
+    assert state.nodes["h1"].is_down is False
+    assert state.nodes["h1"].connect_timeouts == 1
+
+
+def test_non_overlapping_connect_timeouts_still_quarantine(fresh_registry):
+    """A real outage: each attempt starts after the previous one timed
+    out, so every timeout is a new strike."""
+    from psycopg.yb.registry import _CONNECT_TIMEOUT_STRIKES
+    state = _install_state(fresh_registry, ["h1"])
+
+    for _ in range(_CONNECT_TIMEOUT_STRIKES):
+        started = time.monotonic()
+        fresh_registry.mark_failed("X", "h1", timeout=True, attempt_started=started)
+
+    assert state.nodes["h1"].is_down is True
