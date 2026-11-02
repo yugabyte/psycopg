@@ -1018,24 +1018,26 @@ def _drain_and_apply(
         # resumes in the finally so the app isn't stuck. The probe
         # will try again on its next tick.
         phase2_aborted = False
+        lag_failback = new_status == HealthResult.HEALTHY
+        phase2_budget = _budget_deadline(
+            group.failback_global_time_budget_secs if lag_failback
+            else group.global_time_budget_secs,
+            drain_started,
+        )
+        if not skip_phase2:
+            phase2_budget = _retry_pending_yba(group, lag_failback, phase2_budget)
         if group.yba_client is not None and not skip_phase2:
             try:
-                if new_status == HealthResult.UNHEALTHY and group.xcluster_config_uuid:
+                if not lag_failback and group.xcluster_config_uuid:
                     _wait_for_replication_lag(
                         group, which_cluster, is_failback=False,
-                        budget_deadline=_budget_deadline(
-                            group.global_time_budget_secs, drain_started),
+                        budget_deadline=phase2_budget,
                         outgoing=outgoing,
                     )
-                elif (
-                    new_status == HealthResult.HEALTHY
-                    and group.failback_xcluster_config_uuid
-                ):
+                elif lag_failback and group.failback_xcluster_config_uuid:
                     _wait_for_replication_lag(
                         group, which_cluster, is_failback=True,
-                        budget_deadline=_budget_deadline(
-                            group.failback_global_time_budget_secs,
-                            drain_started),
+                        budget_deadline=phase2_budget,
                         outgoing=outgoing,
                     )
             except Phase2TimeoutError as exc:
@@ -1148,6 +1150,27 @@ def _budget_deadline(budget_secs: "int | None", drain_started: float) -> "float 
     if budget_secs is None:
         return None
     return drain_started + budget_secs - _BUDGET_FLIP_MARGIN_S
+
+
+def _retry_pending_yba(
+    group: "FailoverGroup", is_failback: bool, budget_deadline: "float | None",
+) -> "float | None":
+    """Retry a bootstrap YBA probe that failed transiently (see
+    ``ClusterRegistry._wire_yba_lag_phase``) before this drain's lag wait.
+
+    The probe and the lag wait share one lag-wait timeout: the probe is
+    capped at ``lag_wait_timeout_s`` from now (and the global budget), and
+    when it enables Phase 2 the returned deadline makes the lag wait end
+    there too. Otherwise ``budget_deadline`` comes back unchanged."""
+    if group.yba_client is not None or getattr(group, "yba_pending_params", None) is None:
+        return budget_deadline
+    timeout_s = group.failback_lag_wait_timeout_s if is_failback else group.lag_wait_timeout_s
+    limit = time.monotonic() + timeout_s
+    if budget_deadline is not None:
+        limit = min(limit, budget_deadline)
+    from .registry import ClusterRegistry      # late import; cycle-safe
+    ClusterRegistry.instance().retry_yba_lag_phase(group, deadline=limit)
+    return limit if group.yba_client is not None else budget_deadline
 
 
 def _all_nodes_down(state: "ClusterState") -> bool:

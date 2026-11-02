@@ -620,6 +620,9 @@ class FailoverGroup:
     # main reason we needed the YBA-side universe UUID at bootstrap
     # (which doesn't necessarily match yb_servers().universe_uuid).
     yba_client: "object | None" = None
+    # YBParams kept when the bootstrap YBA probe failed transiently; the
+    # drain retries the probe before its lag wait (``_retry_pending_yba``).
+    yba_pending_params: "object | None" = None
     yba_customer_uuid: str = ""
     xcluster_config_uuid: str = ""
     threshold_replication_lag_ms: int = 0
@@ -1200,12 +1203,14 @@ class ClusterRegistry:
         ``group.yba_client`` as ``None``. The lag-wait phase in
         ``drain.py`` treats a ``None`` client as "feature disabled" and
         proceeds with the immediate flip after the txn drain. This
-        means a broken YBA never blocks failover.
+        means a broken YBA never blocks failover. A transient failure
+        (timeout, connection error, 5xx) keeps the params on the group
+        and the drain retries the probe before its next lag wait.
         """
         if not yb_params.lag_wait_enabled:
             return
 
-        from .yba_client import YBAClient, YBAClientError
+        from .yba_client import YBAClientError
 
         # Stash the immutable knobs first — even if the initial YBA
         # probe fails, they're preserved so the drain code can log
@@ -1233,46 +1238,23 @@ class ClusterRegistry:
         )
 
         try:
-            client = YBAClient(
-                endpoint=yb_params.yba_endpoint,
-                api_token=yb_params.yba_api_token,
-                connect_timeout_s=yb_params.yba_connect_timeout_s,
-                read_timeout_s=yb_params.yba_read_timeout_s,
-            )
-            # 1. Customer UUID. Cached inside the client too, but we
-            #    surface it on the group so operators can see it in
-            #    diagnostics without poking at the client.
-            group.yba_customer_uuid = client.get_session_info()
-
-            # 2. Resolve replication_name → xClusterConfigUUID by
-            #    walking all universes' sourceXClusterConfigs. One
-            #    /universes call + one /xcluster_configs/{uuid} per
-            #    candidate.
-            group.xcluster_config_uuid = client.resolve_xcluster_config_uuid(
-                yb_params.replication_name,
-            )
-
-            # 3. If the operator configured a failback (B→A) replication
-            #    name, resolve it to a second xCluster config UUID.
-            #    Best-effort: a failure here leaves failback_xcluster_config_uuid
-            #    empty, which the drain treats as "no Phase 2 on failback"
-            #    (fail-open) but still allows the A→B Phase 2 to work.
-            if yb_params.failback_replication_name:
-                try:
-                    group.failback_xcluster_config_uuid = (
-                        client.resolve_xcluster_config_uuid(
-                            yb_params.failback_replication_name,
-                        )
-                    )
-                except YBAClientError as exc:
-                    logger.warning(
-                        "YBA failback Phase 2 disabled — could not resolve "
-                        "yb.failback.replicationName=%r: %s. Failover (A→B) "
-                        "Phase 2 still active; failback (B→A) will skip "
-                        "Phase 2 (fail-open).",
-                        yb_params.failback_replication_name, exc,
-                    )
+            self._probe_yba(group, yb_params)
         except YBAClientError as exc:
+            if exc.transient:
+                # r12 startup_a_down: with A down at bootstrap, YBA timed
+                # out answering about A's xCluster config and Phase 2
+                # stayed off for the life of the app. A timeout,
+                # connection error or 5xx can clear, so keep the params
+                # and retry before the next lag wait (drain.py
+                # ``_retry_pending_yba``).
+                group.yba_pending_params = yb_params
+                logger.warning(
+                    "YBA lag phase not enabled yet — bootstrap probe failed "
+                    "transiently: %s. Retrying before the next lag wait; "
+                    "until then the drain flips without one.",
+                    exc,
+                )
+                return
             logger.warning(
                 "YBA lag phase disabled — bootstrap probe failed: %s. "
                 "Failover drain will flip routing immediately after the "
@@ -1288,6 +1270,63 @@ class ClusterRegistry:
             )
             return
 
+    def _probe_yba(
+        self, group: "FailoverGroup", yb_params, deadline: "float | None" = None,
+    ) -> None:
+        """Create the YBA client and resolve the identifiers Phase 2 needs,
+        then set ``group.yba_client``. Raises ``YBAClientError`` (with
+        ``transient`` set) on failure, leaving ``group.yba_client`` unset.
+        ``deadline`` (monotonic) caps every YBA call."""
+        from .yba_client import YBAClient, YBAClientError
+
+        client = YBAClient(
+            endpoint=yb_params.yba_endpoint,
+            api_token=yb_params.yba_api_token,
+            connect_timeout_s=yb_params.yba_connect_timeout_s,
+            read_timeout_s=yb_params.yba_read_timeout_s,
+        )
+        # 1. Customer UUID. Cached inside the client too, but we
+        #    surface it on the group so operators can see it in
+        #    diagnostics without poking at the client.
+        customer_uuid = client.get_session_info(deadline=deadline)
+
+        # 2. Resolve replication_name → xClusterConfigUUID by
+        #    walking all universes' sourceXClusterConfigs. One
+        #    /universes call + one /xcluster_configs/{uuid} per
+        #    candidate.
+        config_uuid = client.resolve_xcluster_config_uuid(
+            yb_params.replication_name, deadline=deadline,
+        )
+
+        # 3. If the operator configured a failback (B→A) replication
+        #    name, resolve it to a second xCluster config UUID.
+        #    Best-effort: a failure here leaves failback_xcluster_config_uuid
+        #    empty, which the drain treats as "no Phase 2 on failback"
+        #    (fail-open) but still allows the A→B Phase 2 to work.
+        #    A transient failure fails the whole probe so the retry
+        #    resolves both directions.
+        failback_uuid = ""
+        if yb_params.failback_replication_name:
+            try:
+                failback_uuid = client.resolve_xcluster_config_uuid(
+                    yb_params.failback_replication_name, deadline=deadline,
+                )
+            except YBAClientError as exc:
+                if exc.transient:
+                    raise
+                logger.warning(
+                    "YBA failback Phase 2 disabled — could not resolve "
+                    "yb.failback.replicationName=%r: %s. Failover (A→B) "
+                    "Phase 2 still active; failback (B→A) will skip "
+                    "Phase 2 (fail-open).",
+                    yb_params.failback_replication_name, exc,
+                )
+
+        group.yba_customer_uuid = customer_uuid
+        group.xcluster_config_uuid = config_uuid
+        if failback_uuid:
+            group.failback_xcluster_config_uuid = failback_uuid
+        group.yba_pending_params = None
         group.yba_client = client
         logger.info(
             "YBA lag phase enabled: endpoint=%s, replication_name=%s, "
@@ -1300,6 +1339,37 @@ class ClusterRegistry:
             yb_params.threshold_replication_lag_ms,
             yb_params.lag_wait_timeout_s,
         )
+
+    def retry_yba_lag_phase(self, group: "FailoverGroup", deadline: float) -> None:
+        """Retry a bootstrap YBA probe that failed transiently. A success
+        enables Phase 2; another transient failure keeps the params for the
+        next drain; a permanent one disables Phase 2 as at bootstrap."""
+        from .yba_client import YBAClientError
+
+        yb_params = group.yba_pending_params
+        if yb_params is None or group.yba_client is not None:
+            return
+        try:
+            self._probe_yba(group, yb_params, deadline=deadline)
+        except YBAClientError as exc:
+            if exc.transient:
+                logger.warning(
+                    "YBA lag phase still not enabled — probe failed "
+                    "transiently: %s. This drain flips without a lag wait.",
+                    exc,
+                )
+                return
+            group.yba_pending_params = None
+            logger.warning(
+                "YBA lag phase disabled — probe failed: %s. Drains flip "
+                "without a lag wait.", exc,
+            )
+        except Exception:
+            group.yba_pending_params = None
+            logger.warning(
+                "YBA lag phase disabled — unexpected error during probe.",
+                exc_info=True,
+            )
 
     def get_or_bootstrap_failover_group(
         self,
