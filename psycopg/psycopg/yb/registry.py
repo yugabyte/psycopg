@@ -998,11 +998,11 @@ class ClusterRegistry:
         # the per-key Lock serializes bootstraps for that cluster
         # without serializing bootstraps of DIFFERENT clusters.
         self._bootstrap_locks: dict[ClusterKey, threading.Lock] = {}
-        # Parallel async-side map; keyed the same way. Separate so sync
-        # callers never acquire an asyncio.Lock (which would need a
-        # running loop) and async callers never block their event loop
-        # on a sync Lock held by another thread.
-        self._async_bootstrap_locks: dict[ClusterKey, "object"] = {}
+        # Parallel async-side map, keyed by (ClusterKey, event loop).
+        # Separate so sync callers never acquire an asyncio.Lock (which
+        # would need a running loop) and async callers never block their
+        # event loop on a sync Lock held by another thread.
+        self._async_bootstrap_locks: dict[tuple[ClusterKey, object], "object"] = {}
         self._bootstrap_locks_mutex = threading.Lock()
 
     def _bootstrap_lock_for(self, key: "ClusterKey") -> threading.Lock:
@@ -1017,13 +1017,23 @@ class ClusterRegistry:
 
     def _async_bootstrap_lock_for(self, key: "ClusterKey") -> "object":
         """Return the per-key async bootstrap lock (asyncio.Lock) for the
-        current loop, creating it on first use. See ``__init__``."""
+        running loop, creating it on first use. See ``__init__``.
+
+        Keyed by ``(key, loop)``: an asyncio.Lock binds to the loop that
+        first waits on it, so one lock per key raised "bound to a
+        different event loop" once a second loop (another
+        ``asyncio.run``, or a loop on another thread) contended it.
+        Review #17 (Amogh). Entries for closed loops are dropped here."""
         import asyncio
+        loop = asyncio.get_running_loop()
         with self._bootstrap_locks_mutex:
-            lock = self._async_bootstrap_locks.get(key)
+            locks = self._async_bootstrap_locks
+            for k in [k for k in locks if k[1].is_closed()]:
+                del locks[k]
+            lock = locks.get((key, loop))
             if lock is None:
                 lock = asyncio.Lock()
-                self._async_bootstrap_locks[key] = lock
+                locks[(key, loop)] = lock
             return lock
 
     @classmethod
