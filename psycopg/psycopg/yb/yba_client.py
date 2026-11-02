@@ -63,7 +63,17 @@ class YBAClientError(Exception):
     """Raised when a YBA API call fails (HTTP error, timeout, malformed
     response). Callers should treat this as "YBA unreachable this poll" —
     the failover sequence counts consecutive failures and proceeds without
-    lag confirmation after N strikes."""
+    lag confirmation after N strikes.
+
+    ``transient`` is True for failures that can clear on their own — a
+    connect failure, a timeout, a dropped connection or an HTTP 5xx — and
+    False for the rest (4xx such as a bad token, an unknown replication
+    name, a malformed response). Bootstrap retries only transient ones.
+    """
+
+    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 # ------------------------------------------------------------------- client
@@ -243,7 +253,8 @@ class YBAClient:
                             self._open_connection(deadline)
                     except (TimeoutError, OSError, ssl.SSLError) as exc:
                         raise YBAClientError(
-                            f"YBA {method} {path} connect failed: {exc}"
+                            f"YBA {method} {path} connect failed: {exc}",
+                            transient=True,
                         ) from exc
                     attempt_reconnect = False
 
@@ -278,21 +289,24 @@ class YBAClient:
                         attempt_reconnect = True
                         continue
                     raise YBAClientError(
-                        f"YBA {method} {path} connection error: {exc}"
+                        f"YBA {method} {path} connection error: {exc}",
+                        transient=True,
                     ) from exc
                 except (TimeoutError, OSError, ssl.SSLError) as exc:
                     # Force a reconnect on the next call — http.client's
                     # state machine may be wedged after this.
                     self._close_connection()
                     raise YBAClientError(
-                        f"YBA {method} {path} timeout: {exc}"
+                        f"YBA {method} {path} timeout: {exc}",
+                        transient=True,
                     ) from exc
                 break
 
         if status >= 400:
             err_body = raw.decode("utf-8", "replace")[:200] if raw else ""
             raise YBAClientError(
-                f"YBA {method} {path} → HTTP {status}: {err_body}"
+                f"YBA {method} {path} → HTTP {status}: {err_body}",
+                transient=status >= 500,
             )
 
         if not raw:
@@ -321,7 +335,9 @@ class YBAClient:
         self._customer_uuid = cid
         return cid
 
-    def resolve_xcluster_config_uuid(self, replication_name: str) -> str:
+    def resolve_xcluster_config_uuid(
+        self, replication_name: str, deadline: "float | None" = None,
+    ) -> str:
         """Resolve a human-readable ``replicationName`` to its xCluster
         config UUID.
 
@@ -342,12 +358,15 @@ class YBAClient:
 
         Raises :class:`YBAClientError` when no config with a matching
         name is found, or when multiple configs share the same name.
+        ``deadline`` (monotonic) caps every call, as in ``_request``.
         """
-        cid = self.get_session_info()
+        cid = self.get_session_info(deadline=deadline)
 
         # 1. List all universes; collect every UUID mentioned in any
         #    universe's sourceXClusterConfigs list. One HTTP call.
-        universes = self._request("GET", f"/customers/{cid}/universes")
+        universes = self._request(
+            "GET", f"/customers/{cid}/universes", deadline=deadline,
+        )
         if not isinstance(universes, list):
             raise YBAClientError(
                 "/universes returned non-list; cannot enumerate xCluster configs"
@@ -373,7 +392,7 @@ class YBAClient:
         for uuid in candidates:
             cfg = self._request(
                 "GET", f"/customers/{cid}/xcluster_configs/{uuid}",
-                query={"syncWithDB": "false"},
+                query={"syncWithDB": "false"}, deadline=deadline,
             )
             if not isinstance(cfg, dict):
                 continue
