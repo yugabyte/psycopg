@@ -341,6 +341,18 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
 _IN_FLIGHT_TX_STATUSES = frozenset((1, 2, 3))   # ACTIVE, INTRANS, INERROR
 
 
+def _tracked_snapshot(state: "ClusterState") -> list:
+    """List of ``state.tracked_conns`` taken under ``state.lock``, the
+    lock connect holds to add / discard (Review #10, Amogh): iterating
+    the WeakSet while another thread adds to it raises "Set changed size
+    during iteration"."""
+    lock = getattr(state, "lock", None)
+    if lock is None:
+        return list(state.tracked_conns)
+    with lock:
+        return list(state.tracked_conns)
+
+
 def _in_flight_conns(tracked: "weakref.WeakSet") -> list:
     """Return the list of currently-in-transaction conns from a tracked
     set. Iterates over a snapshot so mid-iteration GC evictions don't
@@ -712,8 +724,9 @@ def _drain_and_apply(
     # Snapshot the initial tracked-conn count for the log line — the
     # weakref set may shrink under GC during the drain.
     drain_started = time.monotonic()
-    initial_tracked = len(outgoing.tracked_conns)
-    initial_in_flight = len(_in_flight_conns(outgoing.tracked_conns))
+    tracked_now = _tracked_snapshot(outgoing)
+    initial_tracked = len(tracked_now)
+    initial_in_flight = len(_in_flight_conns(tracked_now))
     initial_drained = initial_tracked - initial_in_flight
     logger.info(
         "xCluster drain-wait start (barrier armed, deadline in %ss): "
@@ -765,10 +778,10 @@ def _drain_and_apply(
         total_idle_closed = 0
         while True:
             idle_closed = _close_idle_tracked_during_drain(
-                outgoing.tracked_conns, outgoing.uuid,
+                _tracked_snapshot(outgoing), outgoing.uuid,
             )
             total_idle_closed += idle_closed
-            in_txn = _in_flight_conns(outgoing.tracked_conns)
+            in_txn = _in_flight_conns(_tracked_snapshot(outgoing))
             children_in_txn = (
                 follow.children_in_flight(gen) if follow is not None else 0
             )
@@ -777,7 +790,7 @@ def _drain_and_apply(
                 logger.debug(
                     "drain: all in-flight txns completed on %s "
                     "(tracked=%d, idle_closed_this_drain=%d)",
-                    outgoing.uuid, len(outgoing.tracked_conns),
+                    outgoing.uuid, len(_tracked_snapshot(outgoing)),
                     total_idle_closed,
                 )
                 break
@@ -802,7 +815,7 @@ def _drain_and_apply(
         # conns are already evicted by ``xcluster_check`` on next
         # ``getconn``; closing them here is redundant but harmless.
         survivors = [
-            c for c in list(outgoing.tracked_conns)
+            c for c in _tracked_snapshot(outgoing)
             if c is not None and not getattr(c, "closed", False)
         ]
         children_live = 0
