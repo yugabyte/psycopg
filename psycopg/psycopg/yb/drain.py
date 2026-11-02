@@ -973,6 +973,7 @@ def _drain_and_apply(
                         group, which_cluster, is_failback=False,
                         budget_deadline=_budget_deadline(
                             group.global_time_budget_secs, drain_started),
+                        outgoing=outgoing,
                     )
                 elif (
                     new_status == HealthResult.HEALTHY
@@ -983,6 +984,7 @@ def _drain_and_apply(
                         budget_deadline=_budget_deadline(
                             group.failback_global_time_budget_secs,
                             drain_started),
+                        outgoing=outgoing,
                     )
             except Phase2TimeoutError as exc:
                 phase2_aborted = True
@@ -1096,11 +1098,19 @@ def _budget_deadline(budget_secs: "int | None", drain_started: float) -> "float 
     return drain_started + budget_secs - _BUDGET_FLIP_MARGIN_S
 
 
+def _all_nodes_down(state: "ClusterState") -> bool:
+    """True when the registry has every node of ``state`` quarantined."""
+    with state.lock:
+        nodes = list(state.nodes.values())
+    return bool(nodes) and all(n.is_down for n in nodes)
+
+
 def _wait_for_replication_lag(
     group: "FailoverGroup",
     which_cluster: str,
     is_failback: bool = False,
     budget_deadline: "float | None" = None,
+    outgoing: "ClusterState | None" = None,
 ) -> None:
     """Poll YBA for the outgoing side's replication lag every second, exit
     on any of three conditions:
@@ -1119,6 +1129,10 @@ def _wait_for_replication_lag(
 
     ``is_failback`` picks between the A→B config + failover knobs
     (default) and the B→A config + failback knobs (see design doc §3.5.1).
+
+    ``outgoing`` is the outgoing cluster's state; while the driver has
+    every one of its nodes quarantined, no sample counts toward
+    convergence.
     """
     from .yba_client import YBAClientError
 
@@ -1430,6 +1444,23 @@ def _wait_for_replication_lag(
                     "lag wait: lag=%.1fms but %s — not counting "
                     "(confirmations=%d/%d, elapsed=%.1fs / %ds)",
                     lag_ms, why, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
+                confirmed_count = 0
+                last_counted_sample_ts = None
+            elif outgoing is not None and _all_nodes_down(outgoing):
+                # Every outgoing node refused the driver, so no producer
+                # tserver can have produced this sample: YBA keeps
+                # returning the last value scraped before they went down
+                # (stress phase2_claim, region_outage_with_yba and
+                # a_outage_into_limited_b: all three A nodes at 1us ten
+                # seconds after their processes were stopped, batches
+                # committed before the stop still missing on B).
+                logger.info(
+                    "lag wait: lag=%.1fms but every node of the outgoing "
+                    "universe is down — not counting (confirmations=%d/%d, "
+                    "elapsed=%.1fs / %ds)",
+                    lag_ms, confirmed_count, required_samples,
                     elapsed, timeout_s,
                 )
                 confirmed_count = 0
