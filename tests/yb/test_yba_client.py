@@ -13,6 +13,7 @@ Auto-tagged ``yb_unit`` — no database, no network beyond loopback.
 
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -530,6 +531,74 @@ def test_persistent_ssl_eof_still_raises(yba_server):
     # The poisoned keep-alive conn stays open otherwise, and the
     # single-threaded mock server's shutdown() blocks on it.
     client.close()
+
+
+# ------------------------------------------------------------- HTTPException wrapping
+
+def _short_body_server():
+    """Raw server that answers every request with a Content-Length
+    larger than the body it sends, then closes: the client sees
+    ``http.client.IncompleteRead``."""
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(65536)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: 100\r\n\r\n{\"cust"
+                )
+            finally:
+                conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    host, port = listener.getsockname()
+    return listener, f"http://{host}:{port}"
+
+
+def test_incomplete_read_wraps_as_yba_client_error():
+    """Review #8 (Amogh): a truncated body raises IncompleteRead, an
+    HTTPException rather than an OSError. It must surface as
+    YBAClientError (so the lag wait counts it as unreachable) and the
+    connection must be reset."""
+    listener, endpoint = _short_body_server()
+    try:
+        client = YBAClient(endpoint, api_token="tok")
+        with pytest.raises(YBAClientError) as ei:
+            client.get_session_info()
+        assert isinstance(ei.value.__cause__, http.client.IncompleteRead)
+        assert ei.value.transient is True
+        assert client._conn is None
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize("exc_factory", [
+    lambda: http.client.LineTooLong("header line"),
+    lambda: http.client.ResponseNotReady("Idle"),
+])
+def test_http_exception_from_getresponse_wraps_and_resets(yba_server, exc_factory):
+    yba_server.routes["/api/v1/session_info"] = {"body": {"customerUUID": "c1"}}
+    client = YBAClient(yba_server.endpoint, api_token="tok")
+    client.get_session_info()
+    conn = client._conn
+
+    def broken_getresponse(*_a, **_kw):
+        raise exc_factory()
+    conn.getresponse = broken_getresponse                               # type: ignore[attr-defined]
+
+    with pytest.raises(YBAClientError, match="protocol error"):
+        client.get_committed_lag_sample("xcc-1")
+    assert client._conn is None
 
 
 # ------------------------------------------------------------- deadline cut

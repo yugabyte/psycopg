@@ -224,7 +224,9 @@ class YBAClient:
         On stale-socket errors (``ConnectionError`` / ``BadStatusLine`` /
         ``RemoteDisconnected``) reconnects once and retries. Anything
         after that surfaces to the caller — the poll loop's 3-strike
-        rule handles it from there.
+        rule handles it from there. Every transport / protocol failure,
+        including other ``http.client.HTTPException`` subclasses such as
+        ``IncompleteRead``, is raised as :class:`YBAClientError`.
 
         ``deadline`` (monotonic) caps every socket op at the time left
         before it, so a blocked call returns at the deadline.
@@ -298,6 +300,17 @@ class YBAClient:
                     self._close_connection()
                     raise YBAClientError(
                         f"YBA {method} {path} timeout: {exc}",
+                        transient=True,
+                    ) from exc
+                except http.client.HTTPException as exc:
+                    # IncompleteRead (short body), LineTooLong,
+                    # ResponseNotReady, ...: not OSErrors, so they used to
+                    # escape unwrapped and the lag wait read them as an
+                    # "unexpected error". The connection's state machine is
+                    # unusable after these; drop it.
+                    self._close_connection()
+                    raise YBAClientError(
+                        f"YBA {method} {path} protocol error: {exc!r}",
                         transient=True,
                     ) from exc
                 break
