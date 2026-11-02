@@ -498,3 +498,38 @@ def test_aget_or_bootstrap_failover_group_across_event_loops(fresh_registry, mon
 
     assert asyncio.run(main()) == [sentinel] * 3
     assert asyncio.run(main()) == [sentinel] * 3
+
+
+# ----------------------------------------------------------------- probe interval floor
+
+@pytest.mark.parametrize("refresh_s, expected", [(0, 1), (1, 1), (300, 300)])
+def test_start_probe_floors_interval(
+    fresh_registry, fake_state, monkeypatch, refresh_s, expected,
+):
+    """``yb_servers_refresh_interval=0`` is a valid DSN value, but as a
+    probe interval it would busy-loop CB checks. Probes started from the
+    DSN wiring tick no faster than once a second (review #9)."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s)
+    monkeypatch.setattr(HealthProbe, "start", lambda self: None)
+
+    fresh_registry._start_probe(group, refresh_s)
+
+    assert group.primary_probe._interval_s == expected
+    assert group.secondary_probe._interval_s == expected
+    # The fork hook rebuilds probes from this stash; it must be floored too.
+    assert group._probe_interval_s == expected
+
+
+def test_health_probe_direct_keeps_subsecond_interval(fake_state):
+    """The floor applies to the DSN wiring only; tests constructing a
+    HealthProbe directly can still tick fast."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.HEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+    )
+    assert HealthProbe(group, 0.05)._interval_s == 0.05

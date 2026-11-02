@@ -45,6 +45,12 @@ _MAX_ABSENCE_TICKS = 3
 _DOWN_RECOVERY_GRACE_S = 5.0
 # Consecutive connect timeouts (not refusals) before a host is quarantined.
 _CONNECT_TIMEOUT_STRIKES = 3
+# Floor on the probe tick interval for probes started from the DSN.
+# ``yb_servers_refresh_interval=0`` is a valid DSN value (it means "always
+# refresh" for the non-xCluster topology path), but as a probe interval it
+# would run both CB checks and ``yb_servers()`` ~1000 times a second.
+# HealthProbe itself keeps its 1 ms floor so unit tests can tick fast.
+_MIN_PROBE_INTERVAL_S = 1
 
 
 # ------------------------------------------------------------------- fork safety
@@ -1824,8 +1830,10 @@ class ClusterRegistry:
         ``check_timeout_s`` and refreshes ``yb_servers()`` on the same
         tick. When a transition fires the probe invokes
         ``drain.trigger_drain`` with ``drain_timeout_s`` (Phase E).
+        ``interval_s`` is floored at ``_MIN_PROBE_INTERVAL_S``.
         Idempotent — safe to call twice."""
         from .health_probe import HealthProbe       # late import; cycle-safe
+        interval_s = max(interval_s, _MIN_PROBE_INTERVAL_S)
         # Stash the construction params so the fork-safety hook
         # (DB-25060) can rebuild probes in the child without replaying
         # YBParams.
