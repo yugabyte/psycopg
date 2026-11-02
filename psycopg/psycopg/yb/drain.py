@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 class Phase2TimeoutError(Exception):
     """Raised by a FAILBACK Phase 2 lag wait when it times out, or YBA
     stays unreachable for ``_LAG_UNREACHABLE_STRIKES`` polls, and the
-    group's ``on_phase2_timeout`` is ``"fail"`` (opt-in; the default
+    group's ``failback_on_phase2_timeout`` is ``"fail"`` (opt-in; the default
     is ``"proceed"``).
 
     Caught by ``_drain_and_apply``, which then SKIPS the status
@@ -1012,7 +1012,7 @@ def _drain_and_apply(
         # semantics as YBA being unreachable.
         #
         # Wrap in `Phase2TimeoutError` catch. On
-        # ``onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
+        # ``yb.failback.onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
         # when it times out before converging or YBA stays unreachable. We log, record the
         # timeout timestamp, and SKIP the status change — routing
         # stays on the current (known-good) side. Dispatch still
@@ -1198,7 +1198,7 @@ def _wait_for_replication_lag(
       3. ``_LAG_UNREACHABLE_STRIKES`` consecutive YBA errors — fail-open.
          Better to switch without lag confirmation than to wedge failover
          because the YBA control plane happens to be down. A failback
-         with ``onPhase2Timeout="fail"`` aborts instead (stays on the
+         with ``yb.failback.onPhase2Timeout="fail"`` aborts instead (stays on the
          healthy secondary), as on a timeout.
 
     Never blocks failover on YBA availability. Never blocks longer than
@@ -1307,12 +1307,12 @@ def _wait_for_replication_lag(
             # direction regardless of the knob — the knob only matters
             # for the failback case where staying on current side is
             # a safe degraded-mode choice.
-            policy = getattr(group, "on_phase2_timeout", "proceed")
+            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=%s, "
                     "threshold=%.1fms) — ABORTING flip; routing stays "
-                    "on current side (set yb.failover.onPhase2Timeout="
+                    "on current side (set yb.failback.onPhase2Timeout="
                     "proceed to flip anyway)",
                     elapsed, direction_label, threshold_ms,
                 )
@@ -1324,7 +1324,7 @@ def _wait_for_replication_lag(
             if policy == "fail" and not is_failback:
                 logger.warning(
                     "lag wait timeout after %.1fs — proceeding with flip "
-                    "despite on_phase2_timeout='fail' (direction=failover; "
+                    "despite failback_on_phase2_timeout='fail' (direction=failover; "
                     "the current side was just marked UNHEALTHY so "
                     "staying on it is worse than flipping to a lagged "
                     "target)", elapsed,
@@ -1340,7 +1340,7 @@ def _wait_for_replication_lag(
             # Not enough budget left to safely run one more poll
             # without overshooting the lag_wait_timeout. Agent-K PR
             # #18:G3 — this branch is a timeout equivalent, so it
-            # must honour the on_phase2_timeout="fail" policy for the
+            # must honour the failback_on_phase2_timeout="fail" policy for the
             # FAILBACK direction (same reasoning as the deadline-hit
             # branch above). Previously this branch just returned,
             # bypassing the abort and silently flipping onto a
@@ -1349,7 +1349,7 @@ def _wait_for_replication_lag(
             # Same "lag wait timeout" prefix as the deadline branch so log
             # consumers see one timeout outcome, not two.
             elapsed = now - started
-            policy = getattr(group, "on_phase2_timeout", "proceed")
+            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=failback, "
@@ -1437,19 +1437,19 @@ def _wait_for_replication_lag(
                 unreachable_streak, _LAG_UNREACHABLE_STRIKES, exc,
             )
             if unreachable_streak >= _LAG_UNREACHABLE_STRIKES:
-                # onPhase2Timeout="fail" means "don't fail back onto a
+                # yb.failback.onPhase2Timeout="fail" means "don't fail back onto a
                 # primary we can't confirm has caught up"; an unreachable
                 # YBA is exactly that case. Staying on the secondary is
                 # safe (it's healthy), so a failback aborts like a
                 # timeout. A failover still proceeds: the current side
                 # was just declared unhealthy.
-                policy = getattr(group, "on_phase2_timeout", "proceed")
+                policy = getattr(group, "failback_on_phase2_timeout", "proceed")
                 if policy == "fail" and is_failback:
                     elapsed = time.monotonic() - started
                     logger.error(
                         "lag wait: YBA unreachable %d× after %.1fs "
                         "(direction=failback) — ABORTING flip; routing "
-                        "stays on current side (set yb.failover."
+                        "stays on current side (set yb.failback."
                         "onPhase2Timeout=proceed to flip anyway)",
                         _LAG_UNREACHABLE_STRIKES, elapsed,
                     )

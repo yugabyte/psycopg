@@ -126,7 +126,7 @@ def test_freshness_gate_rejects_sample_older_than_barrier_plus_floor(fake_state)
         lag_freshness_s=25,
         lag_confirmation_samples=1,
     )
-    group.on_phase2_timeout = "proceed"   # don't abort — we want the elapsed time
+    group.failback_on_phase2_timeout = "proceed"   # don't abort — we want the elapsed time
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
     elapsed = time.monotonic() - t0
@@ -221,7 +221,7 @@ def test_liveness_replay_pathology_never_converges(fake_state):
         lag_freshness_s=25,
         lag_confirmation_samples=2,
     )
-    group.on_phase2_timeout = "proceed"
+    group.failback_on_phase2_timeout = "proceed"
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
     elapsed = time.monotonic() - t0

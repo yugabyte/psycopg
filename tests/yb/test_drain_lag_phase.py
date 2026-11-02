@@ -160,7 +160,7 @@ def test_lag_wait_converges_after_multiple_polls(fake_state):
 # ------------------------------------------------------- exit condition: timeout
 
 def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
-    """`onPhase2Timeout=fail` only gates FAILBACK. A failover lag wait
+    """`yb.failback.onPhase2Timeout=fail` only gates FAILBACK. A failover lag wait
     that times out still flips — staying on the side the CB just
     declared dead is worse than a lagged target."""
     group, client = _make_group_with_yba(
@@ -169,7 +169,7 @@ def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
         threshold_ms=1,
         lag_wait_timeout_s=2,
     )
-    group.on_phase2_timeout = "fail"
+    group.failback_on_phase2_timeout = "fail"
     import time
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
@@ -182,7 +182,7 @@ def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
 
 
 def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
-    """`onPhase2Timeout=proceed` (default) — flip anyway once the lag
+    """`yb.failback.onPhase2Timeout=proceed` (default) — flip anyway once the lag
     wait times out."""
     group, client = _make_group_with_yba(
         fake_state,
@@ -190,7 +190,7 @@ def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
         threshold_ms=1,
         lag_wait_timeout_s=2,
     )
-    group.on_phase2_timeout = "proceed"
+    group.failback_on_phase2_timeout = "proceed"
     import time
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
@@ -662,7 +662,7 @@ def test_failback_outgoing_all_nodes_down_does_not_converge(fake_state, caplog):
     assert "lag wait converged" not in caplog.text
 
 
-# ------------------------------------------------------- unreachable + onPhase2Timeout=fail
+# ------------------------------------------------------- unreachable + yb.failback.onPhase2Timeout=fail
 
 def _failback_group(fake_state, responses, policy):
     group, client = _make_group_with_yba(
@@ -671,12 +671,12 @@ def _failback_group(fake_state, responses, policy):
     group.primary_status = HealthResult.UNHEALTHY
     group.failback_xcluster_config_uuid = "xcc-ba"
     group.failback_lag_wait_timeout_s = 30
-    group.on_phase2_timeout = policy
+    group.failback_on_phase2_timeout = policy
     return group, client
 
 
 def test_failback_yba_unreachable_aborts_with_fail_policy(fake_state):
-    """`onPhase2Timeout=fail` means "don't fail back onto a primary we
+    """`yb.failback.onPhase2Timeout=fail` means "don't fail back onto a primary we
     can't confirm has caught up"; an unreachable YBA is that case. The
     failback aborts, routing stays on the healthy secondary."""
     group, client = _failback_group(
@@ -706,7 +706,7 @@ def test_failover_yba_unreachable_proceeds_even_with_fail_policy(fake_state):
         fake_state, yba_responses=[YBAClientError("net down")] * 3,
         threshold_ms=0, lag_wait_timeout_s=30,
     )
-    group.on_phase2_timeout = "fail"
+    group.failback_on_phase2_timeout = "fail"
 
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
 

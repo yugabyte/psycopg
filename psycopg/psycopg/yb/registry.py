@@ -209,7 +209,7 @@ _FAILOVER_GOVERNING_PARAMS = (
     "check_timeout_s",
     "refresh_interval_s",
     "auto_failback_enabled",
-    "on_phase2_timeout",
+    "failback_on_phase2_timeout",
     "replication_name",
     "failback_replication_name",
     "failback_drain_timeout_s",
@@ -663,10 +663,11 @@ class FailoverGroup:
     # from the operator's side). Default True preserves v1 behaviour.
     auto_failback_enabled: bool = True
 
-    # Phase 2 timeout policy. ``"proceed"`` (default) flips once the
-    # lag wait times out. ``"fail"`` keeps routing on the current side
-    # when a FAILBACK lag wait times out; failover always proceeds.
-    on_phase2_timeout: str = "proceed"
+    # Failback Phase 2 timeout policy (yb.failback.onPhase2Timeout).
+    # ``"proceed"`` (default) flips once the lag wait times out.
+    # ``"fail"`` keeps routing on the secondary when a FAILBACK lag wait
+    # times out or YBA stays unreachable; failover always proceeds.
+    failback_on_phase2_timeout: str = "proceed"
 
     # Per-stage timestamps (design doc §3.8). All ``time.monotonic()``
     # floats. Zero means "never fired". Written under ``self.lock`` at
@@ -688,7 +689,7 @@ class FailoverGroup:
     # "transient stale conn" after a PoolTimeout.
     last_no_viable_ts: float = 0.0
     # Set by the drain when a failback Phase 2 lag wait times out and
-    # ``on_phase2_timeout == "fail"`` aborts the flip. Operators can
+    # ``failback_on_phase2_timeout == "fail"`` aborts the flip. Operators can
     # scrape this to detect degraded failover; custom CBs can read it
     # to rate-limit their trip signaling.
     last_phase2_timeout_ts: float = 0.0
@@ -1543,7 +1544,7 @@ class ClusterRegistry:
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,
-                on_phase2_timeout=yb_params.on_phase2_timeout,
+                failback_on_phase2_timeout=yb_params.failback_on_phase2_timeout,
                 bootstrap_params=yb_params,
             )
             self._failover_groups[primary.uuid] = group
@@ -1711,7 +1712,7 @@ class ClusterRegistry:
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,
-                on_phase2_timeout=yb_params.on_phase2_timeout,
+                failback_on_phase2_timeout=yb_params.failback_on_phase2_timeout,
                 bootstrap_params=yb_params,
             )
             self._failover_groups[primary.uuid] = group
