@@ -611,3 +611,52 @@ def test_caught_up_leader_report_converges(fake_state, caplog):
     assert client.calls == 1
     assert "lag wait converged" in caplog.text
     assert "nodes=n1:0.001,n2:0,n3:0.001" in caplog.text
+
+
+def test_outgoing_all_nodes_down_does_not_converge(fake_state, caplog):
+    """Stress phase2_claim (region_outage_with_yba, a_outage_into_limited_b):
+    with every A process stopped, YBA kept returning 1us for all three A
+    nodes after the barrier. The driver had all of them quarantined."""
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.001, "n3": 0.001})],
+    )
+    for n in group.primary.nodes.values():
+        n.is_down = True
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert "every node of the outgoing universe is down" in caplog.text
+    assert "lag wait converged" not in caplog.text
+    assert "lag wait timeout" in caplog.text
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_outgoing_node_up_again_converges(fake_state, caplog):
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.001, "n3": 0.001})], timeout_s=10,
+    )
+    node = next(iter(group.primary.nodes.values()))
+    node.is_down = True
+    group.primary.nodes["p2"] = type(node)(
+        host="p2", public_ip=None, port=5433, placement=node.placement,
+        node_type=node.node_type,
+    )
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert client.calls == 1
+    assert "lag wait converged" in caplog.text
+
+
+def test_failback_outgoing_all_nodes_down_does_not_converge(fake_state, caplog):
+    import logging
+    group, _ = _make_group_with_failback_yba(
+        fake_state, yba_responses=[], failback_timeout_s=2,
+    )
+    group.yba_client = _ReportYBAClient([_report({"n1": 0.001})])
+    for n in group.secondary.nodes.values():
+        n.is_down = True
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    assert "every node of the outgoing universe is down" in caplog.text
+    assert "lag wait converged" not in caplog.text
