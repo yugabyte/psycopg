@@ -362,12 +362,28 @@ def _after_fork_in_child() -> None:
                  conns).
       * RESET:   dispatch_paused — child doesn't inherit parent's drain.
       * RESET:   last_transition_time — child can transition on first tick.
+      * REBUILD: registry-level locks (``_lock``, ``_instance_lock``, the
+                 per-key bootstrap locks and their mutex) and the probe
+                 module's startup-notice lock. A thread mid-connect in the
+                 parent holds its key's bootstrap lock at fork time; the
+                 child would hang on every xCluster connect for that key.
+      * RESET:   per-host ``connection_count`` — the counted conns are the
+                 parent's; the child never closes them.
     """
+    from . import health_probe
+    # Module/class-level locks first: fork-unsafe, and nothing else runs in
+    # the child yet.
+    ClusterRegistry._instance_lock = threading.Lock()
+    health_probe._STARTUP_NOTICE_LOCK = threading.Lock()
     inst = ClusterRegistry._instance
     if inst is None:
         return
-    # Registry-level lock: fork-unsafe.
+    # Registry-level locks: fork-unsafe. The per-key bootstrap locks are
+    # recreated on demand by ``_bootstrap_lock_for``.
     inst._lock = threading.Lock()
+    inst._bootstrap_locks_mutex = threading.Lock()
+    inst._bootstrap_locks = {}
+    inst._async_bootstrap_locks = {}
     # agent-K PR #16:127. Don't wholesale-drop `_clusters` / `_key_to_uuid`
     # — the group's primary/secondary ClusterState objects are the ones
     # the dispatcher routes through, so orphaning them means the next
@@ -837,6 +853,7 @@ class FailoverGroup:
             a locked-but-ownerless lock in the child → deadlock)
           * dispatch_paused flag (child doesn't inherit parent's drain)
           * tracked_conns (parent's conns, not ours)
+          * per-host ``connection_count`` (zeroed: counts parent's conns)
           * control_sync / control_async (fork-shared sockets)
           * primary_probe / secondary_probe references (threads are gone)
           * YBAClient's persistent HTTP connection (fork-shared socket)
@@ -887,6 +904,10 @@ class FailoverGroup:
             state.control_sync = None
             state.control_async = None
             state.force_refresh = True   # next tick re-reads yb_servers()
+            # The counted conns belong to the parent; the child never
+            # closes them, so their counts would never be released.
+            for node in state.nodes.values():
+                node.connection_count = 0
         # YBAClient: drop its persistent HTTP connection AND rebuild
         # ``_lock``. The fork may have landed with the lock held — a
         # Phase-2 lag poll on the parent takes the lock for the whole
