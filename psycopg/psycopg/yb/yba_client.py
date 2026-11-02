@@ -10,7 +10,9 @@ Wire format ported from Bill Chan's tools/yba-python-scripts/xcluster_lags.py:
   * base URL: ``{yba_endpoint}/api/v1``
   * auth header: ``X-AUTH-YW-API-TOKEN: <api_token>``
   * self-signed TLS is common in YBA deployments — ``verify_ssl`` defaults
-    to False to match the field behaviour of that script.
+    to False to match the field behaviour of that script. The DSN turns
+    verification on with ``yb.failover.ybaVerifySsl=true``, optionally
+    against the CA bundle in ``yb.failover.ybaCaFile`` (``cafile``).
 
 Uses only stdlib (``urllib.request``, ``ssl``, ``json``) — no ``requests``
 dependency added to the driver.
@@ -113,10 +115,12 @@ class YBAClient:
         verify_ssl: bool = False,
         connect_timeout_s: float = 2.0,
         read_timeout_s: float = 3.0,
+        cafile: "str | None" = None,
     ) -> None:
         self.endpoint = _normalize_url(endpoint)
         self._api_token = api_token
         self.verify_ssl = verify_ssl
+        self.cafile = cafile
         self.connect_timeout_s = connect_timeout_s
         self.read_timeout_s = read_timeout_s
         self._customer_uuid: str | None = None
@@ -136,7 +140,12 @@ class YBAClient:
         # (not exposed today; construction-time only).
         self._ssl_ctx: ssl.SSLContext | None = None
         if self._is_https:
-            self._ssl_ctx = ssl.create_default_context()
+            try:
+                self._ssl_ctx = ssl.create_default_context(cafile=cafile)
+            except (OSError, ssl.SSLError) as exc:
+                raise YBAClientError(
+                    f"YBAClient: cannot load CA file {cafile!r}: {exc}"
+                ) from exc
             if not verify_ssl:
                 # YBA over self-signed cert is the typical field
                 # deployment; match Bill's script behaviour by default.

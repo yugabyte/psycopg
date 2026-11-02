@@ -379,6 +379,69 @@ def test_yba_api_token_not_in_repr():
     assert "https://yba.example.com" in repr(yb)
 
 
+# ----------------------------------------------------------------- YBA TLS (review #8)
+
+_XC = "host=h1 load_balance_hosts=true yb.failover.secondaryClusterHosts=s1 "
+
+
+def test_yba_tls_defaults_off():
+    yb, _, _ = extract_yb_params(_XC, {})
+    assert yb.yba_verify_ssl is False
+    assert yb.yba_ca_file == ""
+
+
+@pytest.mark.parametrize("key", [
+    "yb.failover.ybaVerifySsl",
+    "yb.failover.yba_verify_ssl",
+    "yb-failover-yba-verify-ssl",
+    "yb_failover_yba_verify_ssl",
+    "YB.FAILOVER.YBAVERIFYSSL",
+])
+@pytest.mark.parametrize("value, expected", [
+    ("true", True), ("1", True), ("on", True), ("yes", True),
+    ("false", False), ("0", False), ("off", False), ("no", False),
+])
+def test_yba_verify_ssl_spellings(key, value, expected):
+    yb, cleaned, _ = extract_yb_params(f"{_XC}{key}={value}", {})
+    assert yb.yba_verify_ssl is expected
+    assert "verify" not in cleaned.lower()
+
+
+@pytest.mark.parametrize("key", [
+    "yb.failover.ybaCaFile",
+    "yb.failover.yba_ca_file",
+    "yb-failover-yba-ca-file",
+    "YB.FAILOVER.YBACAFILE",
+])
+def test_yba_ca_file_spellings(key):
+    yb, cleaned, _ = extract_yb_params(f"{_XC}{key}=/etc/yba/ca.pem", {})
+    assert yb.yba_ca_file == "/etc/yba/ca.pem"
+    assert "ca.pem" not in cleaned
+
+
+@pytest.mark.parametrize("kw", [
+    "yb_failover_ybaVerifySsl", "yb_failover_yba_verify_ssl",
+])
+def test_yba_tls_kwargs(kw):
+    """Kwarg forms are pulled out of kwargs (never reach libpq)."""
+    yb, _, cleaned_kwargs = extract_yb_params(
+        _XC, {kw: "true", "yb_failover_ybaCaFile": "/ca.pem"},
+    )
+    assert yb.yba_verify_ssl is True
+    assert yb.yba_ca_file == "/ca.pem"
+    assert cleaned_kwargs == {}
+
+
+def test_yba_verify_ssl_invalid_raises_only_when_xcluster_enabled():
+    with pytest.raises(ValueError, match="ybaVerifySsl"):
+        extract_yb_params(f"{_XC}yb.failover.ybaVerifySsl=maybe", {})
+    # Non-xCluster DSN: stray key is inert, falls back to the default.
+    yb, _, _ = extract_yb_params(
+        "host=h1 load_balance_hosts=true yb.failover.ybaVerifySsl=maybe", {},
+    )
+    assert yb.yba_verify_ssl is False
+
+
 # ============================================================
 # globalTimeBudgetSecs (P1.1) — Amex ask, design doc §3.7
 # ============================================================
