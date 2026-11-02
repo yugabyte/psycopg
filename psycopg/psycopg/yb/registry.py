@@ -2326,12 +2326,19 @@ class ClusterRegistry:
         if (ni := state.nodes.get(host)) is None:
             return
         ni.connect_timeouts = 0
+        ni.last_timeout_strike_end = 0.0
         if ni.is_down:
             ni.is_down = False
             ni.is_down_since = 0.0
             logger.info("host recovered: %s (uuid=%s)", host, state.uuid)
 
-    def mark_failed(self, uuid: str, host: str, timeout: bool = False) -> None:
+    def mark_failed(
+        self,
+        uuid: str,
+        host: str,
+        timeout: bool = False,
+        attempt_started: "float | None" = None,
+    ) -> None:
         """Quarantine ``host`` after a failed connect.
 
         ``timeout=True`` means the attempt got no answer (connect_timeout
@@ -2341,6 +2348,13 @@ class ClusterRegistry:
         false_quarantine). Timeouts only quarantine after
         _CONNECT_TIMEOUT_STRIKES in a row with no successful connect in
         between; refusals still quarantine at once.
+
+        ``attempt_started`` (``time.monotonic()``) is when the timed-out
+        attempt began. Attempts that overlap the one behind the last
+        counted strike are one strike: r12 218880 c1 had four threads
+        time out on one host within 26 ms after a single ~3 s slow spell,
+        counted as 1/3, 2/3, quarantined, and the host recovered 5 s
+        later.
         """
         state = self._clusters.get(uuid)
         if state is None:
@@ -2349,7 +2363,19 @@ class ClusterRegistry:
             with state.lock:
                 ni = state.nodes.get(host)
                 if ni is not None:
+                    if (
+                        attempt_started is not None
+                        and attempt_started < ni.last_timeout_strike_end
+                    ):
+                        logger.debug(
+                            "connect timeout on %s (uuid=%s) overlaps the "
+                            "attempt behind strike %d/%d; not a new strike",
+                            host, uuid, ni.connect_timeouts,
+                            _CONNECT_TIMEOUT_STRIKES,
+                        )
+                        return
                     ni.connect_timeouts += 1
+                    ni.last_timeout_strike_end = time.monotonic()
                     if ni.connect_timeouts < _CONNECT_TIMEOUT_STRIKES:
                         logger.info(
                             "connect timeout on %s (uuid=%s), %d/%d before "

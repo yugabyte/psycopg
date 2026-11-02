@@ -254,6 +254,7 @@ class AsyncConnection(BaseConnection[Row]):
 
             # Per-host kwargs override the multi-host list in the conninfo.
             per_host_kwargs = {**cleaned_kwargs, "host": node.host, "port": node.port}
+            attempt_started = monotonic()
             try:
                 conn = await cls._aconnect_plain(
                     cleaned_conninfo,
@@ -276,7 +277,10 @@ class AsyncConnection(BaseConnection[Row]):
                 )
                 registry.decrement(state.uuid, node.host)
                 registry.mark_failed(
-                    state.uuid, node.host, timeout="timeout expired" in str(exc)
+                    state.uuid,
+                    node.host,
+                    timeout="timeout expired" in str(exc),
+                    attempt_started=attempt_started,
                 )
                 attempted.add(node.host)
                 last_err = exc
