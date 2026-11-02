@@ -1465,9 +1465,26 @@ def _wait_for_replication_lag(
                 return
             lag_ms = None
             sample_ts = None
-        except Exception:
+        except Exception as exc:
             # Belt-and-braces — never let an unexpected exception in the
-            # YBA client wedge the drain barrier.
+            # YBA client wedge the drain barrier. A failback under
+            # yb.failback.onPhase2Timeout="fail" aborts instead, as in
+            # the unreachable branch above: no lag confirmation means no
+            # failback onto the primary.
+            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
+            if policy == "fail" and is_failback:
+                elapsed = time.monotonic() - started
+                logger.error(
+                    "lag wait: unexpected YBA error after %.1fs "
+                    "(direction=failback) — ABORTING flip; routing stays "
+                    "on current side (set yb.failback.onPhase2Timeout="
+                    "proceed to flip anyway)",
+                    elapsed, exc_info=True,
+                )
+                raise Phase2TimeoutError(
+                    f"unexpected YBA error after {elapsed:.1f}s "
+                    f"(direction=failback): {exc!r}"
+                ) from exc
             logger.warning(
                 "lag wait: unexpected YBA error — proceeding with flip",
                 exc_info=True,
