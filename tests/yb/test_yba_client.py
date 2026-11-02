@@ -284,6 +284,26 @@ def test_get_committed_lag_ms_ignores_not_reported_sentinel(yba_server):
     assert client.get_committed_lag_ms("xcc-1") == pytest.approx(5.5)
 
 
+def test_get_committed_lag_ms_all_sentinel_is_no_data(yba_server):
+    """Every trace carrying the ~1e12 not-reported sentinel is "no data"
+    (None), not caught up (0.0). Pins the behaviour the module comment
+    and docstrings describe (review #15)."""
+    yba_server.routes["/api/v1/session_info"] = {"body": {"customerUUID": "c1"}}
+    yba_server.routes["/api/v1/customers/c1/metrics"] = {
+        "body": {
+            "tserver_async_replication_lag_micros": {
+                "data": [
+                    {"name": "Committed Lag", "y": ["1000000000000"]},
+                    {"name": "Committed Lag", "y": ["1000000000000"]},
+                ],
+            },
+        },
+    }
+    client = YBAClient(yba_server.endpoint, api_token="tok")
+    assert client.get_committed_lag_ms("xcc-1") is None
+    assert client.get_committed_lag_sample("xcc-1") is None
+
+
 # ------------------------------------------------------------- extractor unit tests
 
 def test_extract_returns_none_for_non_dict():

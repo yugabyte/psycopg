@@ -44,9 +44,12 @@ _COMMITTED_LAG_TRACE_NAMES = (
 )
 
 # YBA reports the tserver lag micros divided by 1000, so units are already
-# milliseconds when they come back. When a tablet is caught up, YBA returns
-# a "not reported" sentinel around 1e12 — we treat anything at or above
-# ``_NOT_REPORTED_THRESHOLD_MS`` as "no data" (None).
+# milliseconds when they come back. Values at or above
+# ``_NOT_REPORTED_THRESHOLD_MS`` are YBA's "not reported" sentinel (~1e12):
+# that trace is skipped. If every matching trace is a sentinel, there is
+# no usable sample and the extractors return ``None`` ("no data"), the
+# same as when no trace came back at all. A sentinel is never read as
+# caught up; only values at or below ``_CAUGHT_UP_LAG_MS`` are.
 _NOT_REPORTED_THRESHOLD_MS = 1.0e12
 
 # YBA emits ~1 ms for caught-up tablets due to internal rounding. Anything
@@ -431,8 +434,9 @@ class YBAClient:
         lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
     ) -> float | None:
         """Backward-compatible wrapper around :meth:`get_committed_lag_sample`
-        that returns only the lag value. ``None`` means "no trace at
-        all"; the all-caught-up case returns ``0.0`` (not ``None``).
+        that returns only the lag value. ``None`` means "no data": no
+        matching trace, or only not-reported sentinels / non-finite
+        values. The all-caught-up case returns ``0.0`` (not ``None``).
         Prefer the sample variant when the caller cares about
         staleness (DB-24483)."""
         sample = self.get_committed_lag_sample(xcluster_config_uuid, lookback_s)
@@ -449,17 +453,21 @@ class YBAClient:
         the epoch seconds timestamp YBA stamped on the sample.
 
           * ``lag_ms`` is always a float when a sample is returned.
-            All-caught-up / all-sentinel traces collapse to ``0.0``
-            with the newest matching sample's timestamp.
+            All-caught-up traces (every value at or below
+            ``_CAUGHT_UP_LAG_MS``) collapse to ``0.0`` with the newest
+            matching sample's timestamp.
           * ``sample_epoch_s`` may be ``None`` individually when YBA
             returned no ``x`` axis in the trace (shouldn't happen in
             practice but we handle it). Caller logs sample age as
             unknown in that case.
 
-        The whole result is ``None`` when YBA returned no matching
-        trace at all (config not reporting / error block / malformed
-        payload). Caller distinguishes "no data at all" (None) from
-        "fully caught up" (``(0.0, ts)``). agent-K PR #15:392.
+        The whole result is ``None`` when YBA returned no usable
+        sample: no matching trace (config not reporting / error block /
+        malformed payload), or every matching trace carried only the
+        ~1e12 not-reported sentinel or non-finite values. An
+        all-sentinel trace is "no data", not caught up. Caller
+        distinguishes "no data" (None) from "fully caught up"
+        (``(0.0, ts)``). agent-K PR #15:392.
 
         DB-24483: Shubham observed that YBA's default step (coarse,
         derived from the 300 s window) could return a sample up to
@@ -578,7 +586,8 @@ def _max_lag_from_traces(
 ) -> float | None:
     """Aggregate max committed lag across all traces whose name matches one
     of ``name_hints``. Returns:
-      * ``None`` — no matching trace had a value (metric not being reported)
+      * ``None`` — no matching trace had a usable value (metric not
+        being reported, or only not-reported sentinels)
       * ``0.0`` — all matching traces were at or below the caught-up ceiling
       * positive float — max ms across matching traces
     """
