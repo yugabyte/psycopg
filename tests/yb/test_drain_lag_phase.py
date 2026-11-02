@@ -660,3 +660,55 @@ def test_failback_outgoing_all_nodes_down_does_not_converge(fake_state, caplog):
     trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
     assert "every node of the outgoing universe is down" in caplog.text
     assert "lag wait converged" not in caplog.text
+
+
+# ------------------------------------------------------- unreachable + onPhase2Timeout=fail
+
+def _failback_group(fake_state, responses, policy):
+    group, client = _make_group_with_yba(
+        fake_state, yba_responses=responses, threshold_ms=0, lag_wait_timeout_s=30,
+    )
+    group.primary_status = HealthResult.UNHEALTHY
+    group.failback_xcluster_config_uuid = "xcc-ba"
+    group.failback_lag_wait_timeout_s = 30
+    group.on_phase2_timeout = policy
+    return group, client
+
+
+def test_failback_yba_unreachable_aborts_with_fail_policy(fake_state):
+    """`onPhase2Timeout=fail` means "don't fail back onto a primary we
+    can't confirm has caught up"; an unreachable YBA is that case. The
+    failback aborts, routing stays on the healthy secondary."""
+    group, client = _failback_group(
+        fake_state, [YBAClientError("net down")] * 3, "fail",
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 3
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
+    assert group.dispatch_paused is False
+
+
+def test_failback_yba_unreachable_proceeds_with_proceed_policy(fake_state):
+    group, client = _failback_group(
+        fake_state, [YBAClientError("net down")] * 3, "proceed",
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_failover_yba_unreachable_proceeds_even_with_fail_policy(fake_state):
+    group, client = _make_group_with_yba(
+        fake_state, yba_responses=[YBAClientError("net down")] * 3,
+        threshold_ms=0, lag_wait_timeout_s=30,
+    )
+    group.on_phase2_timeout = "fail"
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.dispatch_paused is False

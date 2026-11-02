@@ -76,7 +76,8 @@ logger = logging.getLogger(__name__)
 
 
 class Phase2TimeoutError(Exception):
-    """Raised by a FAILBACK Phase 2 lag wait when it times out and the
+    """Raised by a FAILBACK Phase 2 lag wait when it times out, or YBA
+    stays unreachable for ``_LAG_UNREACHABLE_STRIKES`` polls, and the
     group's ``on_phase2_timeout`` is ``"fail"`` (opt-in; the default
     is ``"proceed"``).
 
@@ -1012,7 +1013,7 @@ def _drain_and_apply(
         #
         # Wrap in `Phase2TimeoutError` catch. On
         # ``onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
-        # when it times out before converging. We log, record the
+        # when it times out before converging or YBA stays unreachable. We log, record the
         # timeout timestamp, and SKIP the status change — routing
         # stays on the current (known-good) side. Dispatch still
         # resumes in the finally so the app isn't stuck. The probe
@@ -1196,7 +1197,9 @@ def _wait_for_replication_lag(
          data may be un-replicated; that's a known consequence.
       3. ``_LAG_UNREACHABLE_STRIKES`` consecutive YBA errors — fail-open.
          Better to switch without lag confirmation than to wedge failover
-         because the YBA control plane happens to be down.
+         because the YBA control plane happens to be down. A failback
+         with ``onPhase2Timeout="fail"`` aborts instead (stays on the
+         healthy secondary), as on a timeout.
 
     Never blocks failover on YBA availability. Never blocks longer than
     ``lag_wait_timeout_s``. Log at WARNING on entry and exit so operators
@@ -1434,6 +1437,26 @@ def _wait_for_replication_lag(
                 unreachable_streak, _LAG_UNREACHABLE_STRIKES, exc,
             )
             if unreachable_streak >= _LAG_UNREACHABLE_STRIKES:
+                # onPhase2Timeout="fail" means "don't fail back onto a
+                # primary we can't confirm has caught up"; an unreachable
+                # YBA is exactly that case. Staying on the secondary is
+                # safe (it's healthy), so a failback aborts like a
+                # timeout. A failover still proceeds: the current side
+                # was just declared unhealthy.
+                policy = getattr(group, "on_phase2_timeout", "proceed")
+                if policy == "fail" and is_failback:
+                    elapsed = time.monotonic() - started
+                    logger.error(
+                        "lag wait: YBA unreachable %d× after %.1fs "
+                        "(direction=failback) — ABORTING flip; routing "
+                        "stays on current side (set yb.failover."
+                        "onPhase2Timeout=proceed to flip anyway)",
+                        _LAG_UNREACHABLE_STRIKES, elapsed,
+                    )
+                    raise Phase2TimeoutError(
+                        f"YBA unreachable {_LAG_UNREACHABLE_STRIKES}x after "
+                        f"{elapsed:.1f}s (direction=failback)"
+                    )
                 logger.warning(
                     "lag wait: YBA unreachable %d× — proceeding with flip "
                     "(no lag confirmation)",

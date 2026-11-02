@@ -738,7 +738,7 @@ def extract_yb_params(
 
     # Phase 2 timeout policy. 'proceed' (default) flips once the lag
     # wait times out; 'fail' keeps routing on the current side when a
-    # failback times out.
+    # failback times out or YBA stays unreachable during its lag wait.
     on_phase2_timeout_raw = raw.get("yb_failover_on_phase2_timeout")
     if on_phase2_timeout_raw is None:
         on_phase2_timeout = "proceed"
