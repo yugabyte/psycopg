@@ -155,11 +155,8 @@ accepted as separators between tokens):
        can't confirm the primary has caught up. ``proceed`` = fail back
        anyway. ``fail`` = when the lag wait times out, or YBA stays
        unreachable, the failback is aborted: routing stays on the
-       secondary and the probe retries after the cooldown. With ``fail``
-       the lag is also read once before the failback drain starts; if it
-       is over the failback threshold (or YBA can't be read), the
-       failback is aborted the same way without pausing or closing
-       anything. No effect on failover, which always proceeds.
+       secondary and the probe retries after the cooldown. No effect on
+       failover, which always proceeds.
 
 Example (application):
 
