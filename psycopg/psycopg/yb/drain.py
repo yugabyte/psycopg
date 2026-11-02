@@ -473,6 +473,8 @@ def trigger_drain(
             "routing suspended until a cluster recovers",
             which_cluster, new_status.value, group.primary.uuid,
         )
+        with group.lock:
+            group.active_before_no_viable = before_active
         _apply_status_change(group, which_cluster, new_status)
         return
 
@@ -480,10 +482,29 @@ def trigger_drain(
         # Recovery from no-viable. Routing changes (None → after_active),
         # so run a real drain against the OTHER side: it closes anything
         # still open there (e.g. conns that outlived a probe-only
-        # outage) before dispatch resumes onto after_active. Phase 2 is
-        # skipped — the other side was not serving, so there is nothing
-        # in flight to replicate.
+        # outage) before dispatch resumes onto after_active.
+        #
+        # Review #8 (Amogh): the primary recovering is a failback unless
+        # routing was on the primary when no-viable began. A failback
+        # goes through the autoFailbackEnabled gate and the failback
+        # Phase 2 lag wait like any other; only, with no healthy side to
+        # stay on, onPhase2Timeout=fail does not abort it. Otherwise
+        # Phase 2 is skipped: the other side was not serving, so there
+        # is nothing in flight to replicate.
         outgoing = group.secondary if after_active == "primary" else group.primary
+        is_failback = (
+            after_active == "primary"
+            and group.active_before_no_viable != "primary"
+        )
+        if is_failback and not group.auto_failback_enabled:
+            logger.warning(
+                "xCluster failback suppressed: %s CB reported HEALTHY but "
+                "autoFailbackEnabled=false; no viable cluster until the "
+                "secondary recovers or the operator fails back "
+                "(primary_uuid=%s).",
+                which_cluster, group.primary.uuid,
+            )
+            return
         now_start = time.monotonic()
         with group.lock:
             group.last_failover_start_ts = now_start
@@ -494,7 +515,8 @@ def trigger_drain(
             outgoing=outgoing,
             drain_timeout_s=drain_timeout_s,
             is_failback=after_active == "primary",
-            skip_phase2=True,
+            skip_phase2=not is_failback,
+            phase2_may_abort=False,
         )
         return
 
@@ -597,11 +619,15 @@ def _drain_and_apply(
     drain_timeout_s: int,
     is_failback: bool = False,
     skip_phase2: bool = False,
+    phase2_may_abort: bool = True,
 ) -> None:
     """Full barrier-drain-flip sequence. See module docstring.
 
     ``skip_phase2`` is set for recovery from no-viable, where the
-    outgoing side was not serving and there is no lag to wait for."""
+    outgoing side was not serving and there is no lag to wait for.
+    ``phase2_may_abort=False`` (failback out of no-viable) makes the
+    failback lag wait proceed where onPhase2Timeout=fail would abort:
+    there is no healthy side to stay on."""
     # Snapshot the initial tracked-conn count for the log line — the
     # weakref set may shrink under GC during the drain.
     drain_started = time.monotonic()
@@ -1036,10 +1062,14 @@ def _drain_and_apply(
                         outgoing=outgoing,
                     )
                 elif lag_failback and group.failback_xcluster_config_uuid:
+                    # Passed only when set, so stand-ins without the
+                    # parameter keep working.
+                    kw = {} if phase2_may_abort else {"may_abort": False}
                     _wait_for_replication_lag(
                         group, which_cluster, is_failback=True,
                         budget_deadline=phase2_budget,
                         outgoing=outgoing,
+                        **kw,
                     )
             except Phase2TimeoutError as exc:
                 phase2_aborted = True
@@ -1187,6 +1217,7 @@ def _wait_for_replication_lag(
     is_failback: bool = False,
     budget_deadline: "float | None" = None,
     outgoing: "ClusterState | None" = None,
+    may_abort: bool = True,
 ) -> None:
     """Poll YBA for the outgoing side's replication lag every second, exit
     on any of three conditions:
@@ -1211,8 +1242,20 @@ def _wait_for_replication_lag(
     ``outgoing`` is the outgoing cluster's state; while the driver has
     every one of its nodes quarantined, no sample counts toward
     convergence.
+
+    ``may_abort=False`` treats ``onPhase2Timeout=fail`` as ``proceed``
+    (failback out of no-viable: there is no healthy side to stay on).
     """
     from .yba_client import YBAClientError
+
+    policy = getattr(group, "failback_on_phase2_timeout", "proceed")
+    if is_failback and policy == "fail" and not may_abort:
+        logger.warning(
+            "lag wait: yb.failback.onPhase2Timeout=fail not applied — "
+            "failback out of no viable cluster has no healthy side to "
+            "stay on; the flip proceeds on timeout"
+        )
+        policy = "proceed"
 
     if is_failback:
         threshold_ms = float(group.failback_threshold_replication_lag_ms)
@@ -1307,7 +1350,6 @@ def _wait_for_replication_lag(
             # direction regardless of the knob — the knob only matters
             # for the failback case where staying on current side is
             # a safe degraded-mode choice.
-            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=%s, "
@@ -1349,7 +1391,6 @@ def _wait_for_replication_lag(
             # Same "lag wait timeout" prefix as the deadline branch so log
             # consumers see one timeout outcome, not two.
             elapsed = now - started
-            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=failback, "
@@ -1443,7 +1484,6 @@ def _wait_for_replication_lag(
                 # safe (it's healthy), so a failback aborts like a
                 # timeout. A failover still proceeds: the current side
                 # was just declared unhealthy.
-                policy = getattr(group, "failback_on_phase2_timeout", "proceed")
                 if policy == "fail" and is_failback:
                     elapsed = time.monotonic() - started
                     logger.error(
@@ -1471,7 +1511,6 @@ def _wait_for_replication_lag(
             # yb.failback.onPhase2Timeout="fail" aborts instead, as in
             # the unreachable branch above: no lag confirmation means no
             # failback onto the primary.
-            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 elapsed = time.monotonic() - started
                 logger.error(
