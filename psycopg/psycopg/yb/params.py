@@ -104,6 +104,11 @@ _LAG_SCRAPE_HINT_S = 10
 # ExternalSignalCircuitBreaker (or a future force_recheck API).
 DEFAULT_AUTO_FAILBACK_ENABLED = True
 
+# YBA TLS verification. Off by default: YBA behind a self-signed cert is
+# the typical field deployment. ``ybaCaFile`` supplies the CA bundle to
+# verify against when it is turned on.
+DEFAULT_YBA_VERIFY_SSL = False
+
 # Global failover time budget (Amex ask, Aug 2026). When set, derives
 # drainTimeoutSecs and lagWaitTimeoutSecs so the total post-detection
 # failover wall-clock ≤ budget. See design doc §3.7 for the semantics
@@ -143,6 +148,8 @@ _PURE_YB_KEYS = frozenset({
     # YBA lag-wait phase.
     "yb_failover_yba_endpoint",
     "yb_failover_yba_api_token",
+    "yb_failover_yba_verify_ssl",
+    "yb_failover_yba_ca_file",
     "yb_failover_replication_name",
     "yb_failover_threshold_replication_lag_ms",
     "yb_failover_lag_wait_timeout_secs",
@@ -196,6 +203,8 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failover[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
     r"|yb[._-]failover[._-](?:ybaEndpoint|yba[._-]endpoint)"
     r"|yb[._-]failover[._-](?:ybaApiToken|yba[._-]api[._-]token)"
+    r"|yb[._-]failover[._-](?:ybaVerifySsl|yba[._-]verify[._-]ssl)"
+    r"|yb[._-]failover[._-](?:ybaCaFile|yba[._-]ca[._-]file)"
     r"|yb[._-]failover[._-](?:replicationName|replication[._-]name)"
     r"|yb[._-]failover[._-](?:thresholdReplicationLagMs|threshold[._-]replication[._-]lag[._-]ms)"
     r"|yb[._-]failover[._-](?:lagWaitTimeoutSecs|lag[._-]wait[._-]timeout[._-]secs)"
@@ -252,6 +261,8 @@ _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failover_draintimeoutsecs":              "yb_failover_drain_timeout_secs",
     "yb_failover_ybaendpoint":                   "yb_failover_yba_endpoint",
     "yb_failover_ybaapitoken":                   "yb_failover_yba_api_token",
+    "yb_failover_ybaverifyssl":                  "yb_failover_yba_verify_ssl",
+    "yb_failover_ybacafile":                     "yb_failover_yba_ca_file",
     "yb_failover_replicationname":               "yb_failover_replication_name",
     "yb_failover_thresholdreplicationlagms":     "yb_failover_threshold_replication_lag_ms",
     "yb_failover_lagwaittimeoutsecs":            "yb_failover_lag_wait_timeout_secs",
@@ -348,6 +359,11 @@ class YBParams:
     # repr=False: the token is a YBA admin credential; keep it out of any
     # ``%r`` / exception message that formats a YBParams.
     yba_api_token: str = field(default="", repr=False)
+    # TLS verification of the YBA endpoint (review #8). ``False`` keeps
+    # the historical no-verify behaviour; ``yba_ca_file`` is the CA bundle
+    # used when verification is on (empty → system trust store).
+    yba_verify_ssl: bool = DEFAULT_YBA_VERIFY_SSL
+    yba_ca_file: str = ""
     replication_name: str = ""
     threshold_replication_lag_ms: int = DEFAULT_THRESHOLD_REPLICATION_LAG_MS
     lag_wait_timeout_s: int = DEFAULT_LAG_WAIT_TIMEOUT_SEC
@@ -740,6 +756,26 @@ def extract_yb_params(
         else:
             auto_failback_enabled = DEFAULT_AUTO_FAILBACK_ENABLED
 
+    # YBA TLS verification (review #8). Same bool forms and same
+    # "validate only when xCluster is enabled" policy as autoFailbackEnabled.
+    yba_verify_ssl_raw = raw.get("yb_failover_yba_verify_ssl")
+    if yba_verify_ssl_raw is None:
+        yba_verify_ssl = DEFAULT_YBA_VERIFY_SSL
+    else:
+        low = yba_verify_ssl_raw.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            yba_verify_ssl = True
+        elif low in ("false", "0", "no", "off"):
+            yba_verify_ssl = False
+        elif _xcluster_enabled_at_parse:
+            raise ValueError(
+                "yb.failover.ybaVerifySsl must be a boolean "
+                f"(true/false), got {yba_verify_ssl_raw!r}"
+            )
+        else:
+            yba_verify_ssl = DEFAULT_YBA_VERIFY_SSL
+    yba_ca_file = raw.get("yb_failover_yba_ca_file", "").strip()
+
     # Failback Phase 2 timeout policy. 'proceed' (default) flips once
     # the lag wait times out; 'fail' keeps routing on the secondary when
     # a failback times out or YBA stays unreachable during its lag wait.
@@ -933,6 +969,8 @@ def extract_yb_params(
             drain_timeout_s=drain_timeout_raw,
             yba_endpoint=yba_endpoint,
             yba_api_token=yba_api_token,
+            yba_verify_ssl=yba_verify_ssl,
+            yba_ca_file=yba_ca_file,
             replication_name=replication_name,
             threshold_replication_lag_ms=threshold_replication_lag_ms,
             lag_wait_timeout_s=lag_wait_timeout,

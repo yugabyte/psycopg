@@ -114,6 +114,8 @@ def _params():
         yba_api_token="token",
         yba_connect_timeout_s=2.0,
         yba_read_timeout_s=3.0,
+        yba_verify_ssl=False,
+        yba_ca_file="",
         replication_name="a_to_b",
         failback_replication_name="b_to_a",
         threshold_replication_lag_ms=0,
@@ -157,6 +159,27 @@ def test_transient_bootstrap_failure_keeps_params(fake_state, scripted):
 
     assert group.yba_client is None
     assert group.yba_pending_params is params
+
+
+@pytest.mark.parametrize("verify, cafile, expected_cafile", [
+    (False, "", None),
+    (True, "", None),
+    (True, "/etc/yba/ca.pem", "/etc/yba/ca.pem"),
+])
+def test_wire_passes_tls_settings_to_client(
+    fake_state, scripted, verify, cafile, expected_cafile,
+):
+    """Review #8: ybaVerifySsl / ybaCaFile reach the YBAClient."""
+    group = _group(fake_state)
+    params = _params()
+    params.yba_verify_ssl = verify
+    params.yba_ca_file = cafile
+
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, params)
+
+    assert group.yba_client is not None
+    assert group.yba_client.kw["verify_ssl"] is verify
+    assert group.yba_client.kw["cafile"] == expected_cafile
 
 
 def test_permanent_bootstrap_failure_disables_for_good(fake_state, scripted):

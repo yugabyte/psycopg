@@ -272,6 +272,8 @@ _FAILOVER_GOVERNING_PARAMS = (
     # Phase 2 would never run for its traffic. Treat them as governing.
     "yba_endpoint",
     "yba_api_token",
+    "yba_verify_ssl",
+    "yba_ca_file",
     "yba_connect_timeout_s",
     "yba_read_timeout_s",
     "lag_wait_enabled",
@@ -1358,6 +1360,8 @@ class ClusterRegistry:
         client = YBAClient(
             endpoint=yb_params.yba_endpoint,
             api_token=yb_params.yba_api_token,
+            verify_ssl=yb_params.yba_verify_ssl,
+            cafile=yb_params.yba_ca_file or None,
             connect_timeout_s=yb_params.yba_connect_timeout_s,
             read_timeout_s=yb_params.yba_read_timeout_s,
         )

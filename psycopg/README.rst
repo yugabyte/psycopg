@@ -162,6 +162,16 @@ accepted as separators between tokens):
        ``-1`` = wait indefinitely, never force-close;
        ``0`` = force-close in-flight transactions immediately;
        ``N > 0`` = wait up to N seconds then force-close survivors.
+   * - ``yb.failover.ybaVerifySsl``
+     - ``false``
+     - Verify the TLS certificate and hostname of the YBA endpoint used
+       for the replication-lag wait. Off by default because YBA often
+       runs with a self-signed certificate; without verification a
+       man-in-the-middle can capture the YBA API token.
+   * - ``yb.failover.ybaCaFile``
+     - (empty)
+     - Path to a PEM CA bundle to verify the YBA certificate against when
+       ``ybaVerifySsl=true``. Empty uses the system trust store.
 
 Example (application):
 

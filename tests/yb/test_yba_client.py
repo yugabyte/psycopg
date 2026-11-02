@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -302,6 +303,45 @@ def test_get_committed_lag_ms_all_sentinel_is_no_data(yba_server):
     client = YBAClient(yba_server.endpoint, api_token="tok")
     assert client.get_committed_lag_ms("xcc-1") is None
     assert client.get_committed_lag_sample("xcc-1") is None
+
+
+# ------------------------------------------------------------- TLS (review #8)
+
+def test_tls_verification_off_by_default():
+    c = YBAClient("https://yba.example.com", api_token="tok")
+    assert c._ssl_ctx.verify_mode == ssl.CERT_NONE
+    assert c._ssl_ctx.check_hostname is False
+
+
+def test_tls_verify_on_uses_verifying_context():
+    c = YBAClient("https://yba.example.com", api_token="tok", verify_ssl=True)
+    assert c._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+    assert c._ssl_ctx.check_hostname is True
+
+
+def test_tls_cafile_passed_to_context(monkeypatch):
+    seen = {}
+    real = ssl.create_default_context
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return real()
+
+    monkeypatch.setattr(ssl, "create_default_context", spy)
+    c = YBAClient(
+        "https://yba.example.com", api_token="tok",
+        verify_ssl=True, cafile="/etc/yba/ca.pem",
+    )
+    assert seen.get("cafile") == "/etc/yba/ca.pem"
+    assert c._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_tls_missing_cafile_raises_yba_client_error(tmp_path):
+    with pytest.raises(YBAClientError, match="CA file"):
+        YBAClient(
+            "https://yba.example.com", api_token="tok",
+            verify_ssl=True, cafile=str(tmp_path / "missing.pem"),
+        )
 
 
 # ------------------------------------------------------------- extractor unit tests
