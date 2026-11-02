@@ -311,7 +311,10 @@ class AsyncConnection(BaseConnection[Row]):
             # here because the pool already holds strong references
             # (design doc §3.1).
             if failover_group is not None:
-                state.tracked_conns.add(conn)
+                # Under state.lock: the drain iterates a snapshot taken
+                # under the same lock (Review #10).
+                with state.lock:
+                    state.tracked_conns.add(conn)
                 if _barrier_crossed(failover_group, dispatch_gen):
                     # A drain armed while this TCP connect was in progress
                     # and may already have swept tracked_conns; this conn
@@ -322,7 +325,8 @@ class AsyncConnection(BaseConnection[Row]):
                         "(uuid=%s); closing and re-routing",
                         node.host, state.uuid,
                     )
-                    state.tracked_conns.discard(conn)
+                    with state.lock:
+                        state.tracked_conns.discard(conn)
                     await conn.close()
                     await _wait_for_dispatch_async(failover_group)
                     dispatch_gen = _dispatch_generation(failover_group)
