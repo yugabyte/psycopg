@@ -709,6 +709,11 @@ class FailoverGroup:
     # scrape this to detect degraded failover; custom CBs can read it
     # to rate-limit their trip signaling.
     last_phase2_timeout_ts: float = 0.0
+    # Routing target ("primary" / "secondary") just before the last
+    # transition into no-viable (both UNHEALTHY); None if unknown. The
+    # drain uses it to tell whether the primary recovering out of
+    # no-viable is a failback.
+    active_before_no_viable: "str | None" = None
 
     # The YBParams that created this group — stored so a second
     # ``bootstrap_failover_group`` call for the same universe can be
