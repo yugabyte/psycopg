@@ -345,7 +345,9 @@ class YBParams:
     # in YBA's DR page); the driver resolves it to ``customerUUID`` and
     # ``xClusterConfigUUID`` at bootstrap and caches them on the group.
     yba_endpoint: str = ""
-    yba_api_token: str = ""
+    # repr=False: the token is a YBA admin credential; keep it out of any
+    # ``%r`` / exception message that formats a YBParams.
+    yba_api_token: str = field(default="", repr=False)
     replication_name: str = ""
     threshold_replication_lag_ms: int = DEFAULT_THRESHOLD_REPLICATION_LAG_MS
     lag_wait_timeout_s: int = DEFAULT_LAG_WAIT_TIMEOUT_SEC

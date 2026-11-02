@@ -362,6 +362,23 @@ def test_yba_params_stripped_from_cleaned_conninfo():
     assert "host=h1" in cleaned
 
 
+def test_yba_api_token_not_in_repr():
+    """The YBA token is an admin credential; repr() of the parsed params
+    must not contain it (review #7)."""
+    yb, _, _ = extract_yb_params(
+        "host=h1 load_balance_hosts=true "
+        "yb.failover.secondaryClusterHosts=s1 "
+        "yb.failover.ybaEndpoint=https://yba.example.com "
+        "yb.failover.ybaApiToken=secret-tok-98765 "
+        "yb.failover.replicationName=rep-abc",
+        {},
+    )
+    assert yb.yba_api_token == "secret-tok-98765"
+    assert "secret-tok-98765" not in repr(yb)
+    assert "yba_api_token" not in repr(yb)
+    assert "https://yba.example.com" in repr(yb)
+
+
 # ============================================================
 # globalTimeBudgetSecs (P1.1) — Amex ask, design doc §3.7
 # ============================================================
