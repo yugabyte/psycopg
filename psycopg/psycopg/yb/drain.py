@@ -84,6 +84,12 @@ class Phase2TimeoutError(Exception):
 
     Caught by ``_drain_and_apply``, which then SKIPS the status
     transition (does NOT flip routing) and resumes dispatch.
+
+    The message ends up in the "xCluster drain ABORTED at Phase 2" line.
+    It must not repeat the wording of the ERROR line logged just before
+    the raise ("lag wait timeout", "unexpected YBA error"): log consumers
+    classify a line by the first phrase it contains, and the ABORTED line
+    would then read as a second timeout instead of the abort.
     """
 
 # Minimum time between closing the outgoing side's conns and resuming
@@ -1341,7 +1347,7 @@ def _wait_for_replication_lag(
                     elapsed, direction_label, threshold_ms,
                 )
                 raise Phase2TimeoutError(
-                    f"lag wait timeout after {elapsed:.1f}s "
+                    f"lag wait timed out after {elapsed:.1f}s "
                     f"(direction={direction_label}, "
                     f"threshold={threshold_ms:.1f}ms)"
                 )
@@ -1381,7 +1387,7 @@ def _wait_for_replication_lag(
                     elapsed, threshold_ms, deadline - now, _MIN_POLL_BUDGET_S,
                 )
                 raise Phase2TimeoutError(
-                    f"lag wait timeout after {elapsed:.1f}s "
+                    f"lag wait timed out after {elapsed:.1f}s "
                     f"(direction=failback, threshold={threshold_ms:.1f}ms)"
                 )
             logger.warning(
@@ -1503,7 +1509,7 @@ def _wait_for_replication_lag(
                     elapsed, exc_info=True,
                 )
                 raise Phase2TimeoutError(
-                    f"unexpected YBA error after {elapsed:.1f}s "
+                    f"YBA lag read failed after {elapsed:.1f}s "
                     f"(direction=failback): {exc!r}"
                 ) from exc
             logger.warning(
