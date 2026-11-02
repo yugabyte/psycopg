@@ -195,3 +195,116 @@ def test_probe_continues_ticking_after_a_timed_out_check(
         f"expected the probe to keep ticking and eventually apply "
         f"UNHEALTHY, saw {group.primary_status}"
     )
+
+
+# ------------------------------------------------------------ hung check vs exit
+
+_HUNG_CHECK_SCRIPT = r"""
+import sys, threading
+import psycopg.yb.health_probe as hp
+from psycopg.yb.health import HealthResult
+from psycopg.yb.registry import ClusterState, FailoverGroup
+
+def mk(uuid):
+    return ClusterState(uuid=uuid, nodes={}, lock=threading.Lock(), last_refresh=0.0)
+
+group = FailoverGroup(
+    primary=mk("P"), secondary=mk("S"), lock=threading.Lock(),
+    primary_status=HealthResult.HEALTHY, secondary_status=HealthResult.HEALTHY,
+    cooldown_s=0,
+)
+hp.check_primary_cluster = lambda g: threading.Event().wait()   # never returns
+probe = hp.HealthProbe(group, interval_s=60, which_cluster="primary",
+                       check_timeout_s=0.05)
+probe._tick_check()
+print("tick returned", flush=True)
+sys.exit(0)
+"""
+
+
+def test_hung_check_does_not_block_process_exit():
+    """Review #9 (Amogh): executor workers are joined at interpreter exit
+    (before atexit handlers run), so a CB check that never returns hung
+    the process on sys.exit(). A check thread is a daemon now."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    proc = subprocess.run(
+        [sys.executable, "-c", _HUNG_CHECK_SCRIPT],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert "tick returned" in proc.stdout, proc.stderr
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_probe_registers_no_atexit_hook(fake_state, monkeypatch):
+    """One atexit entry per probe leaked for the life of the process."""
+    import atexit
+
+    calls = []
+    monkeypatch.setattr(atexit, "register", lambda *a, **kw: calls.append(a))
+    group = _make_group(fake_state)
+    for _ in range(3):
+        HealthProbe(group, interval_s=60, which_cluster="primary")
+    assert calls == []
+
+
+def test_hung_check_skips_next_tick_without_a_second_thread(
+    fake_state, monkeypatch, caplog,
+):
+    """While a timed-out check is still running, later ticks skip (no
+    second check thread) and the previous status is preserved; once it
+    finishes, the next tick runs a fresh check."""
+    import psycopg.yb.health_probe as hp_mod
+
+    release = threading.Event()
+    calls = []
+
+    def hung_check(group):
+        calls.append(threading.current_thread())
+        release.wait(timeout=10)
+        return HealthResult.UNHEALTHY
+
+    monkeypatch.setattr(hp_mod, "check_primary_cluster", hung_check)
+    group = _make_group(fake_state)
+    probe = HealthProbe(
+        group, interval_s=60, which_cluster="primary", check_timeout_s=0.05,
+    )
+    caplog.set_level(logging.WARNING, logger="psycopg.yb.health_probe")
+
+    probe._tick_check()
+    probe._tick_check()
+
+    assert len(calls) == 1
+    assert calls[0].daemon is True
+    assert group.primary_status == HealthResult.HEALTHY
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("exceeded checkTimeoutSecs" in m for m in msgs), msgs
+    assert any("skipping tick" in m for m in msgs), msgs
+
+    release.set()
+    calls[0].join(timeout=2)
+    monkeypatch.setattr(hp_mod, "check_primary_cluster", lambda g: HealthResult.HEALTHY)
+    probe._tick_check()
+    assert probe.first_check_complete
+
+
+def test_raising_check_is_no_change(fake_state, monkeypatch, caplog):
+    import psycopg.yb.health_probe as hp_mod
+
+    def boom(group):
+        raise RuntimeError("cb bug")
+
+    monkeypatch.setattr(hp_mod, "check_primary_cluster", boom)
+    group = _make_group(fake_state)
+    probe = HealthProbe(group, interval_s=60, which_cluster="primary")
+    caplog.set_level(logging.WARNING, logger="psycopg.yb.health_probe")
+
+    probe._tick_check()
+
+    assert group.primary_status == HealthResult.HEALTHY
+    assert not probe.first_check_complete
+    assert any("CB check raised" in r.getMessage() for r in caplog.records)
