@@ -576,7 +576,7 @@ def trigger_drain(
         # again. Cool-down bounds the log rate.
         return
 
-    if is_failback and not _failback_precheck_passes(group, which_cluster):
+    if is_failback and not _failback_precheck_passes(group, which_cluster, new_status):
         return
 
     # Stamp per-stage timestamps at their boundaries (design doc §3.8).
@@ -615,16 +615,22 @@ def _arm_phase2_abort_cooldown(group: "FailoverGroup", which_cluster: str) -> No
             group.secondary_last_transition_time = abort_now
 
 
-def _failback_precheck_passes(group: "FailoverGroup", which_cluster: str) -> bool:
+def _failback_precheck_passes(
+    group: "FailoverGroup", which_cluster: str, new_status: HealthResult,
+) -> bool:
     """With ``yb.failback.onPhase2Timeout=fail``, read the B→A lag once
     before a failback starts. Review #18 (Amogh): Phase 2 runs after
     Phase 1, so a failback that Phase 2 then aborts has already paused
     dispatch and closed every conn on the secondary, the side that stays
-    active. When the lag is over the failback threshold, or YBA can't
-    be read or has no data, abort here instead: nothing is paused or
-    closed, routing stays on the secondary, and the cooldown is armed as
-    for a Phase 2 abort. True means go ahead (always, under "proceed"
-    or without a B→A lag source)."""
+    active. When the lag is longer than the failback lag wait, or YBA
+    can't be read or has no data, Phase 2 can't succeed, so abort here
+    instead: nothing is paused or closed, routing stays on the
+    secondary, and the cooldown is armed as for a Phase 2 abort. Lag
+    above the threshold but within the wait goes ahead: it is read
+    before the barrier, while the app still writes on the secondary, so
+    it is rarely 0 ms; Phase 2 measures it again after the barrier. True
+    means go ahead (always, under "proceed" or without a B→A lag
+    source)."""
     if getattr(group, "failback_on_phase2_timeout", "proceed") != "fail":
         return True
     client = group.yba_client
@@ -632,6 +638,7 @@ def _failback_precheck_passes(group: "FailoverGroup", which_cluster: str) -> boo
     if client is None or not config_uuid:
         return True
     threshold_ms = float(group.failback_threshold_replication_lag_ms)
+    window_ms = max(threshold_ms, float(group.failback_lag_wait_timeout_s) * 1000.0)
     try:
         if hasattr(client, "get_committed_lag_report"):
             report = client.get_committed_lag_report(config_uuid)
@@ -644,18 +651,29 @@ def _failback_precheck_passes(group: "FailoverGroup", which_cluster: str) -> boo
     except Exception as exc:
         why = f"YBA lag read failed ({exc})"
     else:
-        if lag_ms is not None and lag_ms <= threshold_ms:
+        if lag_ms is not None and lag_ms <= window_ms:
             return True
         why = (
             "no lag data from YBA" if lag_ms is None
-            else f"lag={lag_ms:.1f}ms > threshold={threshold_ms:.1f}ms"
+            else f"lag={lag_ms:.1f}ms is longer than the "
+                 f"{group.failback_lag_wait_timeout_s}s failback lag wait"
         )
     _arm_phase2_abort_cooldown(group, which_cluster)
+    # Same two ERROR lines as an abort inside Phase 2 (reason, then
+    # "xCluster drain ABORTED at Phase 2"), so operators and tests match
+    # one refusal format.
     logger.error(
-        "failback pre-check: %s — not starting the failback drain; "
-        "routing stays on current side, re-arming %s cooldown "
-        "(primary_uuid=%s, yb.failback.onPhase2Timeout=fail)",
-        why, which_cluster, group.primary.uuid,
+        "failback pre-check: %s (direction=failback, threshold=%.1fms) — "
+        "ABORTING flip before Phase 1; routing stays on current side "
+        "(set yb.failback.onPhase2Timeout=proceed to flip anyway)",
+        why, threshold_ms,
+    )
+    logger.error(
+        "xCluster drain ABORTED at Phase 2: failback pre-check: %s "
+        "(direction=failback) (primary_uuid=%s, which=%s, new_status=%s) — routing stays on "
+        "current side, re-arming %s cooldown so probe backs off",
+        why, group.primary.uuid, which_cluster, new_status.value,
+        which_cluster,
     )
     return False
 

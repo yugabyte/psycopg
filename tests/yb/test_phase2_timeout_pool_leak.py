@@ -458,7 +458,8 @@ def _on_secondary(fake_state, yba, policy="fail"):
 
 
 @pytest.mark.parametrize("yba,why", [
-    (_FakeYBAClient(lag_ms=5000.0), "lag=5000.0ms > threshold=0.0ms"),
+    # failback_lag_wait_timeout_s=2 in _make_group: 5000 ms can't drain.
+    (_FakeYBAClient(lag_ms=5000.0), "lag=5000.0ms is longer than the 2s failback lag wait"),
     (_ErrYBAClient(RuntimeError("yba down")), "YBA lag read failed (yba down)"),
     (_ErrYBAClient(None), "no lag data from YBA"),
 ])
@@ -467,8 +468,9 @@ def test_failback_precheck_aborts_before_touching_the_secondary(
 ):
     """Review #18 (Amogh): Phase 2 runs after Phase 1 has closed every
     conn on the secondary, which stays active when Phase 2 aborts. Under
-    "fail" the lag is read once up front; over the threshold (or
-    unreadable, or no data), nothing is paused or closed."""
+    "fail" the lag is read once up front; longer than the lag wait (or
+    unreadable, or no data), nothing is paused or closed. The refusal is
+    logged in the same two lines as a Phase 2 abort."""
     import logging
     group, conn, pauses = _on_secondary(fake_state, yba)
     caplog.set_level(logging.ERROR, logger="psycopg.yb.drain")
@@ -484,11 +486,39 @@ def test_failback_precheck_aborts_before_touching_the_secondary(
     assert group.primary_last_transition_time >= before   # cooldown armed
     assert group.last_failover_start_ts == 0.0
     msgs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any(
-        m.startswith(f"failback pre-check: {why} — not starting the failback "
-                     "drain; routing stays on current side")
-        for m in msgs
+    assert msgs[0].startswith(
+        f"failback pre-check: {why} (direction=failback, threshold=0.0ms) — "
+        "ABORTING flip before Phase 1; routing stays on current side"
     ), msgs
+    assert msgs[1].startswith(
+        f"xCluster drain ABORTED at Phase 2: failback pre-check: {why} "
+        "(direction=failback) (primary_uuid=PRIMARY-A, which=primary, "
+        "new_status=healthy)"
+    ), msgs
+
+
+def test_failback_precheck_lets_live_write_lag_through(
+    fake_state, fresh_registry, caplog,
+):
+    """Stress 218974 / 218971 c10: read before the barrier, while the app
+    still writes on B, the lag was 20-105 ms against a 0 ms threshold,
+    so refusing over the threshold held the failback off for one
+    cooldown after another. Lag within the lag wait goes on to the drain;
+    Phase 2 measures it after the barrier (here it stays high and Phase 2
+    aborts as usual)."""
+    import logging
+    yba = _FakeYBAClient(lag_ms=104.0)
+    group, conn, pauses = _on_secondary(fake_state, yba)
+    caplog.set_level(logging.ERROR, logger="psycopg.yb.drain")
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert pauses == [True]
+    assert yba.calls > 1
+    assert group.primary_status is HealthResult.UNHEALTHY
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert not any(m.startswith("failback pre-check") for m in msgs), msgs
+    assert any(m.startswith("xCluster drain ABORTED at Phase 2: lag wait") for m in msgs), msgs
 
 
 def test_failback_precheck_passes_then_drain_runs(fake_state, fresh_registry):
