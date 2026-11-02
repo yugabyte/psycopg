@@ -797,3 +797,55 @@ def test_xcluster_socket_defaults_never_override_user_values():
     assert "keepalives_idle" not in out          # conninfo value wins
     assert out["tcp_user_timeout"] == 0          # kwarg value wins
     assert out["keepalives_count"] == "3"
+
+
+# ============================================================
+# yb.failback.onPhase2Timeout — the policy only affects failback, so it
+# exists only under the failback namespace.
+# ============================================================
+
+def test_failback_on_phase2_timeout_default_proceed():
+    yb, _, _ = extract_yb_params(_dsn_with_secondary(), {})
+    assert yb.failback_on_phase2_timeout == "proceed"
+
+
+@pytest.mark.parametrize("key_form", [
+    "yb.failback.onPhase2Timeout",
+    "yb_failback_on_phase2_timeout",
+    "yb-failback-on-phase2-timeout",
+    "yb.failback.onphase2timeout",
+    "YB.FAILBACK.ONPHASE2TIMEOUT",
+])
+def test_failback_on_phase2_timeout_key_forms(key_form):
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=fail"), {})
+    assert yb.failback_on_phase2_timeout == "fail"
+    assert "phase2" not in cleaned.lower()
+
+
+def test_failback_on_phase2_timeout_from_kwargs():
+    yb, _, cleaned_kwargs = extract_yb_params(
+        _dsn_with_secondary(), {"yb_failback_on_phase2_timeout": "fail"},
+    )
+    assert yb.failback_on_phase2_timeout == "fail"
+    assert "yb_failback_on_phase2_timeout" not in cleaned_kwargs
+
+
+def test_failback_on_phase2_timeout_invalid_raises():
+    with pytest.raises(ValueError, match="yb.failback.onPhase2Timeout"):
+        extract_yb_params(_dsn_with_secondary("yb.failback.onPhase2Timeout=abort"), {})
+
+
+@pytest.mark.parametrize("key_form", [
+    "yb.failover.onPhase2Timeout",
+    "yb_failover_on_phase2_timeout",
+])
+def test_failover_on_phase2_timeout_is_not_a_driver_key(key_form):
+    """No yb.failover.* alias: the key is left in the conninfo like any
+    other unrecognised yb.failover.* key (libpq then rejects it)."""
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=fail"), {})
+    _, unknown_cleaned, _ = extract_yb_params(
+        _dsn_with_secondary("yb.failover.noSuchKnob=fail"), {},
+    )
+    assert yb.failback_on_phase2_timeout == "proceed"
+    assert f"{key_form}=fail" in cleaned
+    assert "yb.failover.noSuchKnob=fail" in unknown_cleaned
