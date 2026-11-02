@@ -258,3 +258,112 @@ def test_bootstrap_check_no_warn_when_drain_is_wait_forever(caplog):
         if r.name == "psycopg.yb" and r.levelname == "WARNING"
     ]
     assert warnings == []
+
+
+# ---------------------------------------------------------- primary down at bootstrap
+
+def _make_group_primary_down(secondary_conn, secondary_attr="control_sync"):
+    """Primary is a bootstrap placeholder with no control conn (startup_a_down);
+    only the secondary has one."""
+    group = _make_group(control_conn=None)
+    setattr(group.secondary, secondary_attr, secondary_conn)
+    return group
+
+
+def test_bootstrap_check_uses_secondary_when_primary_down(caplog):
+    """startup_a_down: statement_timeout=60000 with drainTimeoutSecs=3 must
+    still warn when only the secondary's control conn exists."""
+    conn = _Conn(next_row=("60000",))
+    group = _make_group_primary_down(conn)
+    caplog.set_level(logging.WARNING, logger="psycopg.yb")
+
+    _warn_statement_timeout_sync(group, drain_timeout_s=3)
+
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "psycopg.yb" and r.levelname == "WARNING"
+    ]
+    assert any("60000" in m and "3s" in m for m in warnings), warnings
+    assert conn.executed, "the secondary's control conn was not queried"
+
+
+def test_bootstrap_check_prefers_primary(caplog):
+    primary = _Conn(next_row=("5000",))
+    secondary = _Conn(next_row=("0",))
+    group = _make_group(primary)
+    group.secondary.control_sync = secondary
+    caplog.set_level(logging.WARNING, logger="psycopg.yb")
+
+    _warn_statement_timeout_sync(group, drain_timeout_s=10)
+
+    assert primary.executed and not secondary.executed
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+
+def test_bootstrap_check_skips_closed_primary(caplog):
+    primary = _Conn(next_row=("5000",))
+    primary.closed = True
+    secondary = _Conn(next_row=("0",))
+    group = _make_group(primary)
+    group.secondary.control_sync = secondary
+    caplog.set_level(logging.WARNING, logger="psycopg.yb")
+
+    _warn_statement_timeout_sync(group, drain_timeout_s=10)
+
+    assert not primary.executed and secondary.executed
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "psycopg.yb" and r.levelname == "WARNING"
+    ]
+    assert any("unbounded" in m for m in warnings), warnings
+
+
+class _ACursor:
+    def __init__(self, conn: "_AConn") -> None:
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def execute(self, sql, *args, **kw):
+        self._conn.executed.append(sql)
+
+    async def fetchone(self):
+        return self._conn._next_row
+
+
+class _AConn:
+    def __init__(self, next_row=None) -> None:
+        self.executed: list[str] = []
+        self.closed = False
+        self._next_row = next_row
+
+    def cursor(self):
+        return _ACursor(self)
+
+    async def commit(self):
+        pass
+
+    async def rollback(self):
+        pass
+
+
+@pytest.mark.anyio
+async def test_async_bootstrap_check_uses_secondary_when_primary_down(caplog):
+    from psycopg.yb import _awarn_statement_timeout_async
+
+    aconn = _AConn(next_row=("60000",))
+    group = _make_group_primary_down(aconn, secondary_attr="control_async")
+    caplog.set_level(logging.WARNING, logger="psycopg.yb")
+
+    await _awarn_statement_timeout_async(group, drain_timeout_s=3)
+
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "psycopg.yb" and r.levelname == "WARNING"
+    ]
+    assert any("60000" in m and "3s" in m for m in warnings), warnings
+    assert aconn.executed
