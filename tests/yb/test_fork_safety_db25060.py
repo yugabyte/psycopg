@@ -446,7 +446,7 @@ def test_after_fork_rebuilds_bootstrap_and_module_locks(fake_state, fresh_regist
     held_mutex = registry._bootstrap_locks_mutex
     held_instance = ClusterRegistry._instance_lock
     held_notice = health_probe._STARTUP_NOTICE_LOCK
-    registry._async_bootstrap_locks["k1"] = object()
+    registry._async_bootstrap_locks[("k1", object())] = object()
     # A parent thread was mid-connect / mid-instance() at fork time.
     # (The notice lock is not held here: the probe restart inside the hook
     # takes it on this same thread.)
