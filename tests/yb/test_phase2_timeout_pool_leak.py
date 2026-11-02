@@ -148,6 +148,60 @@ def test_shubham_cycle7_failback_timeout_does_not_flip(
     )
 
 
+class _RaisingYBAClient:
+    def get_committed_lag_ms(self, uuid):
+        raise RuntimeError("boom")
+
+    def get_committed_lag_sample(self, uuid):
+        raise RuntimeError("boom")
+
+
+# Phrases a log consumer (the stress harness) matches, in its order; a
+# line counts as the first one it contains.
+_LOG_PHRASES = [
+    "xCluster drain-wait start",
+    "lag wait timeout",
+    "unexpected YBA error",
+    "xCluster drain ABORTED at Phase 2",
+]
+
+
+@pytest.mark.parametrize(
+    "yba, reason",
+    [(_FakeYBAClient(lag_ms=5000.0), "lag wait timed out"),
+     (_RaisingYBAClient(), "YBA lag read failed")],
+    ids=["timeout", "yba_error"],
+)
+def test_failback_abort_line_reads_as_abort(
+    fake_state, fresh_registry, caplog, yba, reason,
+):
+    """A refused failback logs drain-wait start, the reason, then one
+    ABORTED line that a first-phrase-wins consumer still reads as the
+    abort, not as a second timeout or YBA error."""
+    group = _make_group(fake_state, yba_client=yba)
+    group.primary_status = HealthResult.UNHEALTHY
+
+    with caplog.at_level("INFO", logger="psycopg.yb"):
+        trigger_drain(
+            group, which_cluster="primary",
+            new_status=HealthResult.HEALTHY, drain_timeout_s=0,
+        )
+
+    assert group.primary_status is HealthResult.UNHEALTHY
+    kinds = [
+        next((p for p in _LOG_PHRASES if p in r.getMessage()), None)
+        for r in caplog.records
+    ]
+    kinds = [k for k in kinds if k]
+    assert kinds[0] == "xCluster drain-wait start", kinds
+    assert kinds[-1] == "xCluster drain ABORTED at Phase 2", kinds
+    aborted = [
+        r.getMessage() for r in caplog.records
+        if "xCluster drain ABORTED at Phase 2" in r.getMessage()
+    ]
+    assert len(aborted) == 1 and reason in aborted[0], aborted
+
+
 def test_default_policy_failback_timeout_proceeds(fake_state, fresh_registry):
     """Default is "proceed": a failback whose lag wait times out still
     flips back to primary (the stress harness expects failback to
