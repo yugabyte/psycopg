@@ -415,3 +415,127 @@ def test_db25060_real_fork_child_can_route_to_active_cluster(
         f"state machine"
     )
     assert payload["pid"] != os.getpid()
+
+
+# ===================================================================
+# Review #16 (Amogh): bootstrap / module locks and per-host counters
+# ===================================================================
+
+
+def _stop_probes(group):
+    for probe in (group.primary_probe, group.secondary_probe):
+        if probe is not None:
+            try:
+                probe.stop(join_timeout=0.5)
+            except Exception:
+                pass
+
+
+def test_after_fork_rebuilds_bootstrap_and_module_locks(fake_state, fresh_registry):
+    """Every lock the parent may hold at fork time is replaced: the
+    per-key bootstrap locks (and their mutex), the async map, the
+    singleton's ``_instance_lock`` and the probe's startup-notice lock."""
+    from psycopg.yb import health_probe
+
+    group, registry = _make_group_with_probes(fake_state)
+    group._probe_interval_s = 60
+    group._probe_check_timeout_s = 1.0
+    group._probe_drain_timeout_s = 10
+
+    held_key_lock = registry._bootstrap_lock_for("k1")
+    held_mutex = registry._bootstrap_locks_mutex
+    held_instance = ClusterRegistry._instance_lock
+    held_notice = health_probe._STARTUP_NOTICE_LOCK
+    registry._async_bootstrap_locks["k1"] = object()
+    # A parent thread was mid-connect / mid-instance() at fork time.
+    # (The notice lock is not held here: the probe restart inside the hook
+    # takes it on this same thread.)
+    for lk in (held_key_lock, held_mutex, held_instance):
+        lk.acquire()
+    try:
+        _after_fork_in_child()
+        _stop_probes(group)
+
+        assert registry._bootstrap_locks_mutex is not held_mutex
+        assert registry._bootstrap_locks == {}
+        assert registry._async_bootstrap_locks == {}
+        assert ClusterRegistry._instance_lock is not held_instance
+        assert health_probe._STARTUP_NOTICE_LOCK is not held_notice
+        # The child can take the key's bootstrap lock and the others.
+        key_lock = registry._bootstrap_lock_for("k1")
+        assert key_lock is not held_key_lock
+        assert key_lock.acquire(timeout=1.0)
+        key_lock.release()
+        assert ClusterRegistry._instance_lock.acquire(timeout=1.0)
+        ClusterRegistry._instance_lock.release()
+        assert health_probe._STARTUP_NOTICE_LOCK.acquire(timeout=1.0)
+        health_probe._STARTUP_NOTICE_LOCK.release()
+    finally:
+        for lk in (held_key_lock, held_mutex, held_instance):
+            lk.release()
+
+
+def test_reset_for_child_zeroes_connection_counts(fake_state, fresh_registry):
+    """The per-host counts are the parent's conns; the child never closes
+    them, so they would never be released and would skew least-loaded
+    picks in the child."""
+    p = fake_state(
+        ("p1", "aws", "us-west", "us-west-1a", "primary", 4),
+        ("p2", "aws", "us-west", "us-west-1b", "primary", 2),
+        uuid="PRIMARY-A",
+    )
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary", 3), uuid="SECONDARY-B")
+    group = FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.HEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0,
+    )
+
+    group._reset_for_child()
+
+    assert [n.connection_count for n in p.nodes.values()] == [0, 0]
+    assert [n.connection_count for n in s.nodes.values()] == [0]
+
+
+def _child_body_bootstrap_lock(_, out_queue):
+    try:
+        _after_fork_in_child()
+        inst = ClusterRegistry._instance
+        lock = inst._bootstrap_lock_for("k1")
+        got = lock.acquire(timeout=2.0)
+        out_queue.put(("ok", {"acquired": got}))
+    except Exception as exc:
+        out_queue.put(("exc", repr(exc)))
+    finally:
+        inst = ClusterRegistry._instance
+        if inst is not None:
+            for g in list(inst._failover_groups.values()):
+                _stop_probes(g)
+
+
+@pytest.mark.skipif(_FORK_UNAVAILABLE, reason="fork not available (Windows?)")
+def test_real_fork_while_bootstrap_lock_held_does_not_hang_child(
+    fake_state, fresh_registry,
+):
+    """A parent thread holds a key's bootstrap lock (mid-connect) when
+    another thread forks; the child's connect for that key must not hang."""
+    group, registry = _make_group_with_probes(fake_state)
+    group._probe_interval_s = 60
+    group._probe_check_timeout_s = 1.0
+    group._probe_drain_timeout_s = 10
+    held = registry._bootstrap_lock_for("k1")
+    held.acquire()
+    try:
+        ctx = mp.get_context("fork")
+        out_queue: mp.Queue = ctx.Queue()
+        child = ctx.Process(target=_child_body_bootstrap_lock, args=(None, out_queue))
+        child.start()
+        child.join(timeout=10.0)
+    finally:
+        held.release()
+
+    assert child.exitcode == 0, f"child exit code {child.exitcode}"
+    status, payload = out_queue.get(timeout=1.0)
+    assert status == "ok", f"child failed: {status}: {payload}"
+    assert payload["acquired"] is True
