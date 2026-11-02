@@ -8,8 +8,8 @@ Verifies:
     or the synchronous fallback fired from the main thread.
   * A stuck / slow CB does not block bootstrap longer than
     ``checkTimeoutSecs`` per probe.
-  * A raising CB still allows the gate to release (the tick counts as
-    "ran" even when it raised).
+  * A raising or timed-out CB releases the gate (it doesn't block),
+    but ``wait_for_first_check`` reports ``False`` for it.
   * Idempotent — calling twice with the first check already complete
     returns immediately.
 """
@@ -119,10 +119,8 @@ def test_first_check_complete_not_set_on_cb_raise(fake_state, monkeypatch):
     and the first connect routed on constructor defaults. Post-fix: the
     event is set only inside the verdict-applied branch of _tick_check.
 
-    Note: the matching registry-level `wait_for_first_check` semantics
-    fix is in PR #10 (it currently returns True unconditionally after
-    the for loop). This probe-level check verifies the piece of the
-    fix that lives in PR #9."""
+    The registry-level `wait_for_first_check` result for this case is
+    covered by `test_wait_for_first_check_false_when_cb_raises`."""
     import psycopg.yb.health_probe as hp_mod
 
     def raising(_g):
@@ -149,6 +147,72 @@ def test_first_check_complete_not_set_on_cb_raise(fake_state, monkeypatch):
         )
         assert group.secondary_probe.first_check_complete is False
     finally:
+        group.primary_probe.stop()
+        group.secondary_probe.stop()
+
+
+def test_wait_for_first_check_false_when_cb_raises(fake_state, monkeypatch):
+    """Review #10: with no deadline, a CB that raises used to make
+    wait_for_first_check return True although no check completed. It
+    must report False, without blocking."""
+    import psycopg.yb.health_probe as hp_mod
+
+    def raising(_g):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hp_mod, "check_primary_cluster", raising)
+    monkeypatch.setattr(
+        hp_mod, "check_secondary_cluster", lambda g: HealthResult.HEALTHY,
+    )
+    group = _make_group(fake_state)
+    group.primary_probe = HealthProbe(
+        group, interval_s=999, which_cluster="primary", check_timeout_s=0.5,
+    )
+    group.secondary_probe = HealthProbe(
+        group, interval_s=999, which_cluster="secondary", check_timeout_s=0.5,
+    )
+    group.primary_probe.start()
+    group.secondary_probe.start()
+    try:
+        assert group.wait_for_first_check() is False
+        assert group.wait_for_first_check(timeout_s=3.0) is False
+        assert group.primary_probe.first_check_complete is False
+        assert group.secondary_probe.first_check_complete is True
+    finally:
+        group.primary_probe.stop()
+        group.secondary_probe.stop()
+
+
+def test_wait_for_first_check_false_when_cb_times_out(fake_state, monkeypatch):
+    """A CB stalling past check_timeout_s returns within the cap, and
+    the result is False rather than True."""
+    import psycopg.yb.health_probe as hp_mod
+
+    stall = threading.Event()
+
+    def slow(_g):
+        stall.wait(timeout=10)
+        return HealthResult.HEALTHY
+
+    monkeypatch.setattr(hp_mod, "check_primary_cluster", slow)
+    monkeypatch.setattr(
+        hp_mod, "check_secondary_cluster", lambda g: HealthResult.HEALTHY,
+    )
+    group = _make_group(fake_state)
+    group.primary_probe = HealthProbe(
+        group, interval_s=999, which_cluster="primary", check_timeout_s=0.2,
+    )
+    group.secondary_probe = HealthProbe(
+        group, interval_s=999, which_cluster="secondary", check_timeout_s=0.2,
+    )
+    group.primary_probe.start()
+    group.secondary_probe.start()
+    try:
+        t0 = time.monotonic()
+        assert group.wait_for_first_check() is False
+        assert time.monotonic() - t0 < 2.0
+    finally:
+        stall.set()
         group.primary_probe.stop()
         group.secondary_probe.stop()
 
