@@ -839,7 +839,9 @@ class FailoverGroup:
         differing verdict normally. If ``timeout_s`` is provided, this
         call gives up after that many seconds and returns ``False``
         (individual probes may still complete afterwards). Returns
-        ``True`` when both first checks have fired.
+        ``True`` only when every probe's first check completed with a
+        verdict; a CB that raised or exceeded ``check_timeout_s``
+        leaves its probe incomplete and the result ``False``.
 
         Idempotent — calling twice with both first-checks already
         complete returns immediately."""
@@ -859,8 +861,10 @@ class FailoverGroup:
             # completes OR the probe's own check_timeout_s cap fires.
             p.run_first_check_synchronously()
             if deadline is not None and _time.monotonic() >= deadline:
-                return all(p.first_check_complete for p in probes)
-        return True
+                break
+        # Review #10: report what happened, not "deadline not passed". A
+        # CB that raised or timed out leaves first_check_complete False.
+        return all(p.first_check_complete for p in probes)
 
     def force_primary_status(self, status: "HealthResult") -> None:
         """TEST HOOK. Manually set ``primary_status``.
