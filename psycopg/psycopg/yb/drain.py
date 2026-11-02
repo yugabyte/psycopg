@@ -158,6 +158,28 @@ class _CloseLockTimeoutError(Exception):
     """
 
 
+# Poll interval while waiting for an async conn's ``asyncio.Lock`` to be
+# released (see ``_wait_async_lock_free``).
+_ASYNC_LOCK_POLL_S = 0.005
+
+
+def _wait_async_lock_free(c, budget: float) -> bool:
+    """Wait until ``c.lock`` (an ``asyncio.Lock``) is not held, up to
+    ``budget`` seconds; ``budget <= 0`` checks once. Returns False if it
+    is still held. Only reads ``locked()`` — never acquires the lock
+    from this (non-event-loop) thread."""
+    lock = getattr(c, "lock", None)
+    locked = getattr(lock, "locked", None)
+    if locked is None:
+        return True
+    deadline = time.monotonic() + max(budget, 0.0)
+    while locked():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_ASYNC_LOCK_POLL_S)
+    return True
+
+
 def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
     """Call close on ``c``; return the exception if it raises, else
     ``None``. Isolates a raising close so it doesn't blow up the
@@ -190,16 +212,42 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
     the budget, return ``_CloseLockTimeoutError`` so the caller
     escalates to the existing hard-fd escape hatch.
 
-    Async conns don't get this treatment: their ``.lock`` is an
-    ``asyncio.Lock`` and acquiring it from the drain thread would be
-    a cross-thread asyncio-lock call (undefined behavior). The
-    residual async finish-race is tracked separately.
+    Async conns get the same guarantee without acquiring their lock:
+    ``.lock`` is an ``asyncio.Lock`` and acquiring it from the drain
+    thread would be a cross-thread asyncio-lock call (undefined
+    behavior). ``AsyncConnection`` holds it around every libpq call
+    (COMMIT included), so the drain thread waits, within the same
+    budget, until ``lock.locked()`` reads False — a plain attribute
+    read, no event-loop interaction — and only then finishes the
+    pgconn. Without the wait, a force-close landing while a COMMIT
+    was on the wire cut it mid-reply: the app saw "connection socket
+    closed", an unknown outcome on the outgoing universe (r12 drain_zero
+    c3 dual_write). Pool-borrowed sync conns take ``Connection.lock``
+    before ``pgconn.finish()`` for the same reason. A statement started
+    between the wait and the finish still fails on the closed socket.
     """
     try:
         # Lazy import — ``..connection_async`` pulls ``.yb.state`` which
         # pulls back into this subpackage; top-level import would cycle.
         from ..connection_async import AsyncConnection
+        # Lock-acquire budget: lock_timeout_s=None means use default
+        # (_SAFE_CLOSE_LOCK_BUDGET_S); lock_timeout_s=0 means
+        # non-blocking (agent-K PR #21:146 — the idle-close path
+        # should NOT stall 1.5 s per conn whose owner is in a long
+        # libpq call like LISTEN/NOTIFY; it just skips and retries
+        # the next tick).
+        budget = (
+            lock_timeout_s
+            if lock_timeout_s is not None
+            else _SAFE_CLOSE_LOCK_BUDGET_S
+        )
         if isinstance(c, AsyncConnection):
+            if not _wait_async_lock_free(c, budget):
+                return _CloseLockTimeoutError(
+                    f"async conn.lock still held after {budget}s — "
+                    f"a statement (possibly COMMIT) is on the wire; "
+                    f"escalate to hard-fd close"
+                )
             try:
                 c.pgconn.finish()
             finally:
@@ -215,31 +263,29 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
         # by calling ``pgconn.finish()`` directly for any conn whose
         # ``_pool`` is set (agent-K PR #13:370). Same pattern H6
         # uses in ``xcluster_check``.
-        if getattr(c, "_pool", None) is not None:
-            try:
-                c.pgconn.finish()
-            finally:
-                _release_registry_count(c)
-            return None
         # Sync branch — acquire the per-conn lock first (DB-25090).
         # Missing lock on a mock / test shim: fall through to the
         # direct close path (what we did pre-fix). Real Connection
         # instances always have one.
+        # Pool-borrowed conn: ``psycopg_pool.ConnectionPool`` patches
+        # ``Connection.close`` with ``close_returns=True`` so that
+        # ``c.close()`` reroutes to ``pool.putconn(c)`` — the conn
+        # ends up back in the idle pool, NOT closed. The next
+        # ``pool.getconn()`` hands the same stale-cluster socket to
+        # another worker and the dual-write window re-opens. Bypass
+        # by calling ``pgconn.finish()`` directly for any conn whose
+        # ``_pool`` is set (agent-K PR #13:370), under the same lock.
         lock = getattr(c, "lock", None)
+        is_pool = getattr(c, "_pool", None) is not None
         if lock is None:
-            c.close()
+            if is_pool:
+                try:
+                    c.pgconn.finish()
+                finally:
+                    _release_registry_count(c)
+            else:
+                c.close()
             return None
-        # Lock-acquire budget: lock_timeout_s=None means use default
-        # (_SAFE_CLOSE_LOCK_BUDGET_S); lock_timeout_s=0 means
-        # non-blocking (agent-K PR #21:146 — the idle-close path
-        # should NOT stall 1.5 s per conn whose owner is in a long
-        # libpq call like LISTEN/NOTIFY; it just skips and retries
-        # the next tick).
-        budget = (
-            lock_timeout_s
-            if lock_timeout_s is not None
-            else _SAFE_CLOSE_LOCK_BUDGET_S
-        )
         if budget <= 0:
             if not lock.acquire(blocking=False):
                 return _CloseLockTimeoutError(
@@ -254,7 +300,13 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
                     f"inside libpq; escalate to hard-fd close (DB-25090)"
                 )
         try:
-            c.close()
+            if is_pool:
+                try:
+                    c.pgconn.finish()
+                finally:
+                    _release_registry_count(c)
+            else:
+                c.close()
         finally:
             lock.release()
         return None
