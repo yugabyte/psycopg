@@ -73,25 +73,17 @@ pytestmark = pytest.mark.yb_unit
 class _FakeYBAClient:
     """Lag-wait sticky-returns stub for the Phase 2 timeout path."""
 
-    def __init__(self, lag_ms: float, first_lag_ms: "float | None" = None):
-        # ``first_lag_ms``: value for the first read only (the failback
-        # pre-check under onPhase2Timeout=fail), so a test can pass the
-        # pre-check and still time out in Phase 2.
+    def __init__(self, lag_ms: float):
         self.lag_ms = lag_ms
-        self.first_lag_ms = first_lag_ms
         self.calls = 0
 
-    def _next(self):
+    def get_committed_lag_ms(self, uuid):
         self.calls += 1
-        if self.calls == 1 and self.first_lag_ms is not None:
-            return self.first_lag_ms
         return self.lag_ms
 
-    def get_committed_lag_ms(self, uuid):
-        return self._next()
-
     def get_committed_lag_sample(self, uuid):
-        return (self._next(), time.time())
+        self.calls += 1
+        return (self.lag_ms, time.time())
 
 
 def _make_group(fake_state, *, yba_client=None, failback_on_phase2_timeout="fail"):
@@ -124,8 +116,7 @@ def test_shubham_cycle7_failback_timeout_does_not_flip(
     """Replica of Shubham's cycle 7: failback lag never converges within
     the window. Under the old code the drain would flip to A despite
     knowing B→A replication was behind. The fix must NOT flip."""
-    # Lag passes the failback pre-check, then sticks above threshold.
-    yba = _FakeYBAClient(lag_ms=5000.0, first_lag_ms=0.0)
+    yba = _FakeYBAClient(lag_ms=5000.0)   # sticky above threshold
     group = _make_group(fake_state, yba_client=yba)
     group.primary_status = HealthResult.UNHEALTHY   # start on secondary
     group.secondary_status = HealthResult.HEALTHY
@@ -371,8 +362,7 @@ def test_db_corruption_window_closed_end_to_end(fake_state, fresh_registry):
       (2) pool-side conns on the outgoing cluster must have been evicted
           during Phase 2 (not served to the app during the wait)
     """
-    # Lag passes the failback pre-check, then sticks above threshold.
-    yba = _FakeYBAClient(lag_ms=5000.0, first_lag_ms=0.0)
+    yba = _FakeYBAClient(lag_ms=5000.0)
     group = _make_group(fake_state, yba_client=yba)
     _install_group_in_registry(fresh_registry, group)
     group.primary_status = HealthResult.UNHEALTHY   # start on secondary
@@ -417,133 +407,3 @@ def test_db_corruption_window_closed_end_to_end(fake_state, fresh_registry):
         "pool watcher never saw an outgoing-side conn evicted during "
         "the Phase 2 pause — the leak that corrupted index in cycle 7"
     )
-
-
-# ===================================================================
-# Failback pre-check (Review #18): abort before Phase 1 under "fail"
-# ===================================================================
-
-
-class _ErrYBAClient:
-    def __init__(self, result):
-        self.result = result
-        self.calls = 0
-
-    def get_committed_lag_sample(self, uuid):
-        self.calls += 1
-        if isinstance(self.result, Exception):
-            raise self.result
-        return self.result
-
-
-class _IdleConn:
-    def __init__(self):
-        self.info = types.SimpleNamespace(transaction_status=TransactionStatus.IDLE)
-        self.closed = False
-
-    def close(self):
-        self.closed = True
-
-
-def _on_secondary(fake_state, yba, policy="fail"):
-    group = _make_group(fake_state, yba_client=yba, failback_on_phase2_timeout=policy)
-    group.primary_status = HealthResult.UNHEALTHY
-    group.secondary_status = HealthResult.HEALTHY
-    conn = _IdleConn()
-    group.secondary.tracked_conns.add(conn)
-    pauses = []
-    orig_pause = group.pause_dispatch
-    group.pause_dispatch = lambda: (pauses.append(True), orig_pause())[1]
-    return group, conn, pauses
-
-
-@pytest.mark.parametrize("yba,why", [
-    # failback_lag_wait_timeout_s=2 in _make_group: 5000 ms can't drain.
-    (_FakeYBAClient(lag_ms=5000.0), "lag=5000.0ms is longer than the 2s failback lag wait"),
-    (_ErrYBAClient(RuntimeError("yba down")), "YBA lag read failed (yba down)"),
-    (_ErrYBAClient(None), "no lag data from YBA"),
-])
-def test_failback_precheck_aborts_before_touching_the_secondary(
-    fake_state, fresh_registry, caplog, yba, why,
-):
-    """Review #18 (Amogh): Phase 2 runs after Phase 1 has closed every
-    conn on the secondary, which stays active when Phase 2 aborts. Under
-    "fail" the lag is read once up front; longer than the lag wait (or
-    unreadable, or no data), nothing is paused or closed. The refusal is
-    logged in the same two lines as a Phase 2 abort."""
-    import logging
-    group, conn, pauses = _on_secondary(fake_state, yba)
-    caplog.set_level(logging.ERROR, logger="psycopg.yb.drain")
-    before = time.monotonic()
-
-    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
-
-    assert yba.calls == 1
-    assert pauses == []
-    assert conn.closed is False
-    assert group.primary_status is HealthResult.UNHEALTHY
-    assert group.last_phase2_timeout_ts >= before
-    assert group.primary_last_transition_time >= before   # cooldown armed
-    assert group.last_failover_start_ts == 0.0
-    msgs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert msgs[0].startswith(
-        f"failback pre-check: {why} (direction=failback, threshold=0.0ms) — "
-        "ABORTING flip before Phase 1; routing stays on current side"
-    ), msgs
-    assert msgs[1].startswith(
-        f"xCluster drain ABORTED at Phase 2: failback pre-check: {why} "
-        "(direction=failback) (primary_uuid=PRIMARY-A, which=primary, "
-        "new_status=healthy)"
-    ), msgs
-
-
-def test_failback_precheck_lets_live_write_lag_through(
-    fake_state, fresh_registry, caplog,
-):
-    """Stress 218974 / 218971 c10: read before the barrier, while the app
-    still writes on B, the lag was 20-105 ms against a 0 ms threshold,
-    so refusing over the threshold held the failback off for one
-    cooldown after another. Lag within the lag wait goes on to the drain;
-    Phase 2 measures it after the barrier (here it stays high and Phase 2
-    aborts as usual)."""
-    import logging
-    yba = _FakeYBAClient(lag_ms=104.0)
-    group, conn, pauses = _on_secondary(fake_state, yba)
-    caplog.set_level(logging.ERROR, logger="psycopg.yb.drain")
-
-    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
-
-    assert pauses == [True]
-    assert yba.calls > 1
-    assert group.primary_status is HealthResult.UNHEALTHY
-    msgs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert not any(m.startswith("failback pre-check") for m in msgs), msgs
-    assert any(m.startswith("xCluster drain ABORTED at Phase 2: lag wait") for m in msgs), msgs
-
-
-def test_failback_precheck_passes_then_drain_runs(fake_state, fresh_registry):
-    yba = _FakeYBAClient(lag_ms=0.0)
-    group, conn, pauses = _on_secondary(fake_state, yba)
-    group.failback_lag_confirmation_samples = 1
-    group.failback_lag_freshness_s = 0
-
-    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
-
-    assert pauses == [True]
-    assert conn.closed is True
-    assert group.primary_status is HealthResult.HEALTHY
-    assert yba.calls == 2     # pre-check + one Phase 2 poll
-
-
-def test_failback_precheck_not_run_under_proceed(fake_state, fresh_registry):
-    """Default "proceed": unchanged flow, no pre-check read; the drain
-    runs and flips after the lag wait times out."""
-    yba = _FakeYBAClient(lag_ms=5000.0)
-    group, conn, pauses = _on_secondary(fake_state, yba, policy="proceed")
-
-    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
-
-    assert pauses == [True]
-    assert conn.closed is True
-    assert group.primary_status is HealthResult.HEALTHY
-    assert group.last_phase2_timeout_ts == 0.0
