@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from . import TRACE, discovery
 from .node import NodeInfo
+from ..errors import OperationalError as _PsycopgOperationalError
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,104 @@ def _register_fork_hook_once() -> None:
             # Windows / embedded Python without fork support — nothing
             # to do.
             _FORK_HOOK_REGISTERED = True
+
+
+# ------------------------------------------------------------------ partial outage
+#
+# DB-25xxx: bootstrap must survive one universe being down at app startup.
+# The whole point of the failover feature is to tolerate an outage; the
+# feature can't require both universes to be reachable at bootstrap. The
+# strategy is to still return a FailoverGroup, with the failed side filled
+# in by a placeholder ClusterState marked UNHEALTHY, and let the probe
+# thread reconnect it on a later tick.
+
+_PLACEHOLDER_UUID_PREFIX = "pending:"
+
+
+class _PartialOutageBootstrapError(_PsycopgOperationalError):
+    """Raised by `get_or_bootstrap_failover_group` only when BOTH primary
+    and secondary are unreachable at bootstrap. Carries both underlying
+    exceptions so the operator can distinguish 'everything is down' from
+    one-side-down.
+
+    Subclasses :class:`psycopg.errors.OperationalError` (agent-K PR
+    #17:107) so applications' generic ``except OperationalError`` or
+    ``except psycopg.Error`` handlers catch it with no code change —
+    the private underscore name is a scope marker, not a signal that
+    callers should catch something exotic.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        primary_exc: "Exception | None" = None,
+        secondary_exc: "Exception | None" = None,
+    ) -> None:
+        super().__init__(message)
+        self.primary_exc = primary_exc
+        self.secondary_exc = secondary_exc
+
+
+def _make_placeholder_state(
+    conninfo: str,
+    kwargs: dict,
+    hosts: "list[str]",
+    tag: str,
+) -> ClusterState:
+    """Build a placeholder ClusterState for a cluster that was unreachable
+    at bootstrap time. The probe thread will try to open control_sync on
+    its next tick via `_ensure_control_sync`, which reads from
+    `bootstrap_conninfo` + `bootstrap_kwargs`; when the cluster comes back
+    online the real control conn + real uuid will replace the placeholder.
+    """
+    import hashlib
+    # Deterministic placeholder uuid so repeated bootstraps don't create
+    # duplicate groups in the registry. Based on the host set because
+    # that's what identifies "this cluster" independent of whether it's
+    # reachable right now.
+    host_signature = ",".join(sorted(hosts))
+    uuid = _PLACEHOLDER_UUID_PREFIX + hashlib.sha1(
+        f"{tag}:{host_signature}".encode()
+    ).hexdigest()[:16]
+    # Seed one NodeInfo per DSN host so the probe has something to try.
+    # Placement is unknown until yb_servers() returns; use empty strings
+    # as sentinels. The policy layer treats these as "match nothing"
+    # when filtering by zone, which is fine — we're UNHEALTHY anyway.
+    nodes: "dict[str, NodeInfo]" = {}
+    placement = __import__(
+        "psycopg.yb.node", fromlist=["Placement"]
+    ).Placement(cloud="", region="", zone="")
+    for host in hosts:
+        if not host:
+            continue
+        nodes[host] = NodeInfo(
+            host=host,
+            public_ip=None,
+            port=int(kwargs.get("port", 5433) or 5433),
+            placement=placement,
+            node_type="primary",
+            connection_count=0,
+            is_down=True,                 # it IS down right now
+            is_down_since=time.monotonic(),
+        )
+    return ClusterState(
+        uuid=uuid,
+        nodes=nodes,
+        lock=threading.Lock(),
+        last_refresh=0.0,                 # never refreshed yet
+        force_refresh=True,               # probe should retry on first tick
+        control_sync=None,
+        control_async=None,
+        bootstrap_conninfo=conninfo,
+        bootstrap_kwargs=dict(kwargs),
+    )
+
+
+def _is_placeholder_uuid(uuid: str) -> bool:
+    """True iff the ClusterState was placeholder-constructed (and should
+    be promoted to real state on the next successful probe tick)."""
+    return uuid.startswith(_PLACEHOLDER_UUID_PREFIX)
 
 
 def _after_fork_in_child() -> None:
@@ -651,6 +750,43 @@ class ClusterRegistry:
         self._key_to_uuid: dict[ClusterKey, str] = {}
         # xCluster failover: keyed by PRIMARY uuid (one group per primary cluster).
         self._failover_groups: dict[str, "FailoverGroup"] = {}
+        # agent-K PR #17:G7 — serialize the full
+        # ``get_or_bootstrap_failover_group`` sequence per primary
+        # ClusterKey. Prevents the one-side-down race where thread A
+        # (primary unreachable → placeholder uuid) and thread B
+        # (primary reachable → real uuid) each install their own
+        # FailoverGroup under different primary.uuid keys for the same
+        # cluster. ``_bootstrap_locks_mutex`` guards the dict itself;
+        # the per-key Lock serializes bootstraps for that cluster
+        # without serializing bootstraps of DIFFERENT clusters.
+        self._bootstrap_locks: dict[ClusterKey, threading.Lock] = {}
+        # Parallel async-side map; keyed the same way. Separate so sync
+        # callers never acquire an asyncio.Lock (which would need a
+        # running loop) and async callers never block their event loop
+        # on a sync Lock held by another thread.
+        self._async_bootstrap_locks: dict[ClusterKey, "object"] = {}
+        self._bootstrap_locks_mutex = threading.Lock()
+
+    def _bootstrap_lock_for(self, key: "ClusterKey") -> threading.Lock:
+        """Return the per-key sync bootstrap lock, creating it on first use.
+        See ``__init__`` for the race this closes (agent-K PR #17:G7)."""
+        with self._bootstrap_locks_mutex:
+            lock = self._bootstrap_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._bootstrap_locks[key] = lock
+            return lock
+
+    def _async_bootstrap_lock_for(self, key: "ClusterKey") -> "object":
+        """Return the per-key async bootstrap lock (asyncio.Lock) for the
+        current loop, creating it on first use. See ``__init__``."""
+        import asyncio
+        with self._bootstrap_locks_mutex:
+            lock = self._async_bootstrap_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._async_bootstrap_locks[key] = lock
+            return lock
 
     @classmethod
     def instance(cls) -> "ClusterRegistry":
@@ -957,34 +1093,132 @@ class ClusterRegistry:
         kwargs: dict[str, object],
     ) -> "FailoverGroup":
         """Sync bootstrap of a primary + secondary `FailoverGroup`. Idempotent
-        on primary uuid. Spec §5 / design §3."""
+        on primary uuid. Spec §5 / design §3.
+
+        **Partial-outage tolerance (DB-25xxx):** if ONE side is unreachable
+        at bootstrap, the group is still created with that side marked
+        UNHEALTHY and backed by a placeholder ``ClusterState``; the probe
+        thread's next tick will reconnect and promote it to the real
+        ClusterState. If BOTH sides are unreachable the call raises — the
+        feature exists to survive outages, not to come up with no cluster.
+        """
         from .health import HealthResult            # late import — health.py imports FailoverGroup forward-ref
 
-        # 1. Bootstrap primary (cached on repeats).
+        # agent-K PR #17:G7 — hold the per-key bootstrap lock for the
+        # full sequence so concurrent calls for the same cluster can't
+        # install competing groups (one placeholder, one real) during
+        # a one-side-down window.
         primary_key = ClusterKey.from_params(
             self._param_dict_for_key(conninfo, kwargs)
         )
-        primary = self.get_or_bootstrap(primary_key, conninfo, kwargs)
-
-        # 2. Already paired?
-        with self._lock:
-            existing = self._failover_groups.get(primary.uuid)
-        if existing is not None:
-            logger.debug(
-                "failover group cache hit: primary_uuid=%s", primary.uuid
+        with self._bootstrap_lock_for(primary_key):
+            return self._do_bootstrap_failover_group(
+                yb_params, conninfo, kwargs, primary_key, HealthResult,
             )
-            return existing
 
-        # 3. Bootstrap secondary.
+    def _do_bootstrap_failover_group(
+        self, yb_params, conninfo, kwargs, primary_key, HealthResult,
+    ) -> "FailoverGroup":
+        # 1. Try primary — tolerate failure.
+        primary: "ClusterState | None" = None
+        primary_exc: "Exception | None" = None
+        try:
+            primary = self.get_or_bootstrap(primary_key, conninfo, kwargs)
+        except Exception as exc:
+            primary_exc = exc
+            logger.warning(
+                "primary bootstrap failed (%s); will try secondary and "
+                "mark primary UNHEALTHY if secondary succeeds",
+                exc,
+            )
+
+        # 2. If primary came up, check for cached pairing.
+        if primary is not None:
+            with self._lock:
+                existing = self._failover_groups.get(primary.uuid)
+            if existing is not None:
+                logger.debug(
+                    "failover group cache hit: primary_uuid=%s", primary.uuid
+                )
+                return existing
+
+        # 3. Try secondary — tolerate failure.
         sec_kwargs = self._make_secondary_kwargs(
             kwargs, yb_params.secondary_cluster_hosts
         )
         secondary_key = ClusterKey.from_params(
             self._param_dict_for_key(conninfo, sec_kwargs)
         )
-        secondary = self.get_or_bootstrap(secondary_key, conninfo, sec_kwargs)
+        secondary: "ClusterState | None" = None
+        secondary_exc: "Exception | None" = None
+        try:
+            secondary = self.get_or_bootstrap(
+                secondary_key, conninfo, sec_kwargs
+            )
+        except Exception as exc:
+            secondary_exc = exc
+            logger.warning(
+                "secondary bootstrap failed (%s); will mark secondary "
+                "UNHEALTHY if primary succeeded",
+                exc,
+            )
 
-        # 4. Install (race-checked).
+        # 4. Both-unreachable → raise. There's nothing to route to.
+        if primary is None and secondary is None:
+            # Prefer the primary error — it's usually what the operator
+            # wants to see first. Chain the secondary error through.
+            raise _PartialOutageBootstrapError(
+                "xCluster bootstrap failed: both primary and secondary "
+                "clusters are unreachable",
+                primary_exc=primary_exc,
+                secondary_exc=secondary_exc,
+            ) from primary_exc
+
+        # 5. Fill in whichever side failed with a placeholder — the probe
+        # thread will reconnect it on a later tick.
+        if primary is None:
+            primary = _make_placeholder_state(
+                conninfo, kwargs,
+                hosts=self._hosts_from_kwargs(kwargs, conninfo=conninfo),
+                tag="primary",
+            )
+            primary_status = HealthResult.UNHEALTHY
+            # agent-K PR #17: register placeholder in _clusters and under
+            # primary_key, so subsequent connects find the SAME
+            # ClusterState object (via the key cache) instead of spawning
+            # a fresh bootstrap. Without this, every connect raced a
+            # second group creation with None CBs → MissingCircuitBreaker
+            # on the next connect.
+            with self._lock:
+                self._clusters[primary.uuid] = primary
+                self._key_to_uuid[primary_key] = primary.uuid
+            logger.warning(
+                "xCluster failover group bootstrapped WITHOUT primary — "
+                "placeholder uuid=%s, status=UNHEALTHY; probe will retry",
+                primary.uuid,
+            )
+        else:
+            primary_status = HealthResult.HEALTHY
+
+        if secondary is None:
+            secondary = _make_placeholder_state(
+                conninfo, sec_kwargs,
+                hosts=list(yb_params.secondary_cluster_hosts),
+                tag="secondary",
+            )
+            secondary_status = HealthResult.UNHEALTHY
+            with self._lock:
+                self._clusters[secondary.uuid] = secondary
+                self._key_to_uuid[secondary_key] = secondary.uuid
+            logger.warning(
+                "xCluster failover group bootstrapped WITHOUT secondary "
+                "— placeholder uuid=%s, status=UNHEALTHY; probe will retry",
+                secondary.uuid,
+            )
+        else:
+            secondary_status = HealthResult.HEALTHY
+
+        # 6. Install (race-checked).
         with self._lock:
             existing = self._failover_groups.get(primary.uuid)
             if existing is not None:
@@ -1002,8 +1236,8 @@ class ClusterRegistry:
                 primary=primary,
                 secondary=secondary,
                 lock=threading.Lock(),
-                primary_status=HealthResult.HEALTHY,
-                secondary_status=HealthResult.HEALTHY,
+                primary_status=primary_status,
+                secondary_status=secondary_status,
                 cooldown_s=yb_params.cooldown_s,
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
@@ -1012,9 +1246,10 @@ class ClusterRegistry:
             self._failover_groups[primary.uuid] = group
 
         logger.info(
-            "failover group bootstrapped: primary_uuid=%s, secondary_uuid=%s, "
-            "secondary_hosts=%s, cooldown_s=%d",
-            primary.uuid, secondary.uuid,
+            "failover group bootstrapped: primary_uuid=%s (%s), "
+            "secondary_uuid=%s (%s), secondary_hosts=%s, cooldown_s=%d",
+            primary.uuid, primary_status.value,
+            secondary.uuid, secondary_status.value,
             ",".join(yb_params.secondary_cluster_hosts),
             yb_params.cooldown_s,
         )
@@ -1034,21 +1269,45 @@ class ClusterRegistry:
     ) -> "FailoverGroup":
         """Async sibling. Same shape, awaits the async primary + secondary
         bootstraps. The probe thread itself is sync regardless of caller
-        (see design doc §10)."""
+        (see design doc §10). Partial-outage tolerance mirrors the sync
+        path (see `get_or_bootstrap_failover_group`)."""
         from .health import HealthResult
 
         primary_key = ClusterKey.from_params(
             self._param_dict_for_key(conninfo, kwargs)
         )
-        primary = await self.aget_or_bootstrap(primary_key, conninfo, kwargs)
-
-        with self._lock:
-            existing = self._failover_groups.get(primary.uuid)
-        if existing is not None:
-            logger.debug(
-                "failover group cache hit (async): primary_uuid=%s", primary.uuid
+        # agent-K PR #17:G7 — per-key async lock, same purpose as sync
+        # side. See ``_async_bootstrap_lock_for``.
+        async with self._async_bootstrap_lock_for(primary_key):  # type: ignore[attr-defined]
+            return await self._ado_bootstrap_failover_group(
+                yb_params, conninfo, kwargs, primary_key, HealthResult,
             )
-            return existing
+
+    async def _ado_bootstrap_failover_group(
+        self, yb_params, conninfo, kwargs, primary_key, HealthResult,
+    ) -> "FailoverGroup":
+        primary: "ClusterState | None" = None
+        primary_exc: "Exception | None" = None
+        try:
+            primary = await self.aget_or_bootstrap(
+                primary_key, conninfo, kwargs
+            )
+        except Exception as exc:
+            primary_exc = exc
+            logger.warning(
+                "primary bootstrap failed (async) (%s); will try secondary",
+                exc,
+            )
+
+        if primary is not None:
+            with self._lock:
+                existing = self._failover_groups.get(primary.uuid)
+            if existing is not None:
+                logger.debug(
+                    "failover group cache hit (async): primary_uuid=%s",
+                    primary.uuid,
+                )
+                return existing
 
         sec_kwargs = self._make_secondary_kwargs(
             kwargs, yb_params.secondary_cluster_hosts
@@ -1056,9 +1315,66 @@ class ClusterRegistry:
         secondary_key = ClusterKey.from_params(
             self._param_dict_for_key(conninfo, sec_kwargs)
         )
-        secondary = await self.aget_or_bootstrap(
-            secondary_key, conninfo, sec_kwargs
-        )
+        secondary: "ClusterState | None" = None
+        secondary_exc: "Exception | None" = None
+        try:
+            secondary = await self.aget_or_bootstrap(
+                secondary_key, conninfo, sec_kwargs
+            )
+        except Exception as exc:
+            secondary_exc = exc
+            logger.warning(
+                "secondary bootstrap failed (async) (%s)",
+                exc,
+            )
+
+        if primary is None and secondary is None:
+            raise _PartialOutageBootstrapError(
+                "xCluster bootstrap failed: both primary and secondary "
+                "clusters are unreachable",
+                primary_exc=primary_exc,
+                secondary_exc=secondary_exc,
+            ) from primary_exc
+
+        if primary is None:
+            primary = _make_placeholder_state(
+                conninfo, kwargs,
+                hosts=self._hosts_from_kwargs(kwargs, conninfo=conninfo),
+                tag="primary",
+            )
+            primary_status = HealthResult.UNHEALTHY
+            # agent-K PR #17 — mirror the sync path: register in
+            # _clusters + _key_to_uuid so the next connect finds the
+            # same ClusterState object (via the key cache) rather than
+            # spawning a fresh bootstrap that races a 2nd group.
+            with self._lock:
+                self._clusters[primary.uuid] = primary
+                self._key_to_uuid[primary_key] = primary.uuid
+            logger.warning(
+                "xCluster failover group bootstrapped (async) WITHOUT "
+                "primary — placeholder uuid=%s, status=UNHEALTHY",
+                primary.uuid,
+            )
+        else:
+            primary_status = HealthResult.HEALTHY
+
+        if secondary is None:
+            secondary = _make_placeholder_state(
+                conninfo, sec_kwargs,
+                hosts=list(yb_params.secondary_cluster_hosts),
+                tag="secondary",
+            )
+            secondary_status = HealthResult.UNHEALTHY
+            with self._lock:
+                self._clusters[secondary.uuid] = secondary
+                self._key_to_uuid[secondary_key] = secondary.uuid
+            logger.warning(
+                "xCluster failover group bootstrapped (async) WITHOUT "
+                "secondary — placeholder uuid=%s, status=UNHEALTHY",
+                secondary.uuid,
+            )
+        else:
+            secondary_status = HealthResult.HEALTHY
 
         with self._lock:
             existing = self._failover_groups.get(primary.uuid)
@@ -1077,8 +1393,8 @@ class ClusterRegistry:
                 primary=primary,
                 secondary=secondary,
                 lock=threading.Lock(),
-                primary_status=HealthResult.HEALTHY,
-                secondary_status=HealthResult.HEALTHY,
+                primary_status=primary_status,
+                secondary_status=secondary_status,
                 cooldown_s=yb_params.cooldown_s,
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
@@ -1087,9 +1403,10 @@ class ClusterRegistry:
             self._failover_groups[primary.uuid] = group
 
         logger.info(
-            "failover group bootstrapped (async): primary_uuid=%s, "
-            "secondary_uuid=%s, secondary_hosts=%s, cooldown_s=%d",
-            primary.uuid, secondary.uuid,
+            "failover group bootstrapped (async): primary_uuid=%s (%s), "
+            "secondary_uuid=%s (%s), secondary_hosts=%s, cooldown_s=%d",
+            primary.uuid, primary_status.value,
+            secondary.uuid, secondary_status.value,
             ",".join(yb_params.secondary_cluster_hosts),
             yb_params.cooldown_s,
         )
@@ -1107,6 +1424,41 @@ class ClusterRegistry:
         full conninfo module at registry import time."""
         from ..conninfo import conninfo_to_dict
         return conninfo_to_dict(conninfo, **kwargs)
+
+    def _hosts_from_kwargs(
+        self, kwargs: dict[str, object], conninfo: str = "",
+    ) -> "list[str]":
+        """Extract the comma-separated host list from psycopg kwargs and/
+        or conninfo string. Used when building a placeholder ClusterState
+        for a cluster that was unreachable at bootstrap (DB-25011
+        partial-outage path).
+
+        Pre-fix (agent-K PR #17:1066) only looked at ``kwargs["host"]``,
+        which is empty when the operator put hosts in the conninfo
+        STRING instead of kwargs. That left the placeholder with zero
+        nodes → probe had no hosts to try → placeholder never recovers
+        even after the cluster comes back online. Now we also parse
+        from the ``conninfo`` string via ``conninfo_to_dict``.
+        """
+        hosts: list[str] = []
+        raw = kwargs.get("host")
+        if raw:
+            hosts.extend(h.strip() for h in str(raw).split(",") if h.strip())
+        if not hosts and conninfo:
+            try:
+                from ..conninfo import conninfo_to_dict  # late import
+                parsed = conninfo_to_dict(str(conninfo))
+                raw2 = parsed.get("host")
+                if raw2:
+                    hosts.extend(
+                        h.strip() for h in str(raw2).split(",") if h.strip()
+                    )
+            except Exception:
+                # Parsing failed — placeholder stays empty, probe will
+                # still raise visibly in logs. Not worth crashing the
+                # bootstrap over.
+                pass
+        return hosts
 
     def _start_probe(
         self,
@@ -1379,6 +1731,28 @@ class ClusterRegistry:
                     state.last_control_connect_error = None  # clear on success
                     logger.info("control conn re-opened on %s for uuid=%s",
                                 node.host, state.uuid)
+                    # agent-K PR #17:G6 — surface placeholder promotion.
+                    # When the state's uuid is still ``pending:<hash>``
+                    # the operator's monitoring will not find this
+                    # group by its real universe uuid. A full in-place
+                    # uuid upgrade would need to swap keys in
+                    # ``_clusters`` / ``_key_to_uuid`` /
+                    # ``_failover_groups`` under lock while the probe
+                    # thread may be mid-tick — bigger surgery than
+                    # this follow-up. Log at WARNING so operators can
+                    # correlate ``pending:...`` lines in their logs
+                    # with the host that promoted them.
+                    if _is_placeholder_uuid(state.uuid):
+                        logger.warning(
+                            "placeholder cluster uuid=%s was promoted "
+                            "via control conn on %s; the uuid stays "
+                            "``pending:...`` for the lifetime of this "
+                            "group. Monitoring tools keyed on the "
+                            "real universe uuid will not find this "
+                            "group — re-bootstrap after both universes "
+                            "are reachable for a clean uuid.",
+                            state.uuid, node.host,
+                        )
                     return conn
                 winner = state.control_sync
             try:
