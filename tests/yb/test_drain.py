@@ -686,6 +686,53 @@ def test_primary_recovery_when_primary_was_last_active_is_not_a_failback(fake_st
     assert group.primary_status == HealthResult.HEALTHY
 
 
+def _down_after_primary(fake_state):
+    """Routing on the primary, the secondary fails, then the primary
+    fails: no viable cluster, last active side = primary."""
+    group = _make_group(fake_state)
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert group.active_before_no_viable == "primary"
+    return group
+
+
+def test_secondary_recovery_after_primary_served_runs_failover_phase2(fake_state):
+    """Review #8 follow-up (Amogh): the primary served until no-viable
+    began, so writes it committed just before may still be replicating.
+    The secondary coming back first runs the A→B lag wait."""
+    group = _down_after_primary(fake_state)
+    yba = _LagYBA(0.0)
+    group.yba_client = yba
+    group.xcluster_config_uuid = "xcc-a2b"
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+    group.lag_freshness_s = 0
+    group.lag_confirmation_samples = 1
+
+    trigger_drain(group, "secondary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert yba.calls == ["xcc-a2b"]
+    assert group.secondary_status == HealthResult.HEALTHY
+    assert group.dispatch_paused is False
+
+
+def test_secondary_recovery_after_primary_served_proceeds_on_timeout(fake_state):
+    """...and, like any failover, flips once the lag wait times out,
+    whatever onPhase2Timeout says."""
+    group = _down_after_primary(fake_state)
+    yba = _LagYBA(5000.0)
+    group.yba_client = yba
+    group.xcluster_config_uuid = "xcc-a2b"
+    group.lag_wait_timeout_s = 1
+    group.lag_freshness_s = 0
+    group.failback_on_phase2_timeout = "fail"
+
+    trigger_drain(group, "secondary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert yba.calls and set(yba.calls) == {"xcc-a2b"}
+    assert group.secondary_status == HealthResult.HEALTHY
+    assert group.last_phase2_timeout_ts == 0.0
+
+
 def test_both_down_sequence_drains_and_flips_to_recovered_secondary(fake_state, caplog):
     """both_down (5379cb5e): A→B drain, B→None (no drain), None→B drain
     against A that flips routing to B. Unchanged by the failback gate."""

@@ -522,20 +522,24 @@ def trigger_drain(
         # still open there (e.g. conns that outlived a probe-only
         # outage) before dispatch resumes onto after_active.
         #
-        # The primary recovering is a failback unless routing was on the
-        # primary when no-viable began. It runs the failback Phase 2 lag
-        # wait like any other, but with no healthy side to stay on,
-        # neither onPhase2Timeout=fail nor autoFailbackEnabled=false
-        # holds it back: both only keep routing on a secondary that is
-        # still serving, and a healthy primary that may not have caught
-        # up beats no cluster at all (same reasoning as failover).
-        # Otherwise Phase 2 is skipped: the other side was not serving,
-        # so there is nothing in flight to replicate.
+        # Phase 2 runs when the other side was the one serving when
+        # no-viable began: writes it committed just before going down
+        # may still be replicating. The primary recovering after the
+        # secondary served is a failback: it runs the failback lag wait,
+        # but with no healthy side to stay on, neither
+        # onPhase2Timeout=fail nor autoFailbackEnabled=false holds it
+        # back: both only keep routing on a secondary that is still
+        # serving, and a healthy primary that may not have caught up
+        # beats no cluster at all (same reasoning as failover). The
+        # secondary recovering after the primary served runs the A→B lag
+        # wait, which like any failover proceeds on timeout. Otherwise
+        # Phase 2 is skipped: the other side was not serving, so there
+        # is nothing in flight to replicate.
         outgoing = group.secondary if after_active == "primary" else group.primary
-        is_failback = (
-            after_active == "primary"
-            and group.active_before_no_viable != "primary"
-        )
+        outgoing_label = "secondary" if after_active == "primary" else "primary"
+        # Unknown (None): assume it served, so the lag wait still runs.
+        outgoing_served = group.active_before_no_viable in (outgoing_label, None)
+        is_failback = after_active == "primary" and outgoing_served
         if is_failback and not group.auto_failback_enabled:
             logger.warning(
                 "xCluster failback despite autoFailbackEnabled=false: %s CB "
@@ -553,7 +557,7 @@ def trigger_drain(
             outgoing=outgoing,
             drain_timeout_s=drain_timeout_s,
             is_failback=after_active == "primary",
-            skip_phase2=not is_failback,
+            skip_phase2=not outgoing_served,
             phase2_may_abort=False,
         )
         return
@@ -1033,7 +1037,9 @@ def _drain_and_apply(
         # resumes in the finally so the app isn't stuck. The probe
         # will try again on its next tick.
         phase2_aborted = False
-        lag_failback = new_status == HealthResult.HEALTHY
+        # Direction of the drain, not of the CB report: recovery from
+        # no-viable to the secondary is a HEALTHY report but drains A→B.
+        lag_failback = is_failback
         phase2_budget = _budget_deadline(
             group.failback_global_time_budget_secs if lag_failback
             else group.global_time_budget_secs,
