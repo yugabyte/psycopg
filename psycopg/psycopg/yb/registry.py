@@ -791,9 +791,10 @@ class FailoverGroup:
         write must set-and-notify together, so we expose this as a
         method rather than relying on callers to remember the notify.
 
-        DB-24483: stamp ``barrier_ts`` under the same lock so Phase 2's
-        freshness gate can compare YBA sample timestamps against the
-        exact moment the barrier was armed. ``time.time()`` (wall-clock)
+        DB-24483: stamp ``barrier_ts`` under the same lock. The drain
+        re-stamps it when Phase 1 completes, so Phase 2's freshness gate
+        compares YBA sample timestamps against the last commit on the
+        outgoing side. ``time.time()`` (wall-clock)
         matches YBA's Prometheus timestamp units; ``time.monotonic``
         would need a conversion on every poll.
         """
@@ -936,13 +937,10 @@ class FailoverGroup:
         # nothing in the child would ever clear it.
         self.drain_in_progress = False
         self.async_dispatch_waiters = []
-        # DB-24483 — zero the barrier so the child's first drain stamps
-        # its own `time.time()` rather than reusing the parent's. The
-        # parent's monotonic-domain cooldown stamps survive fork (same
-        # host), but barrier_ts is wall-clock and compared only against
-        # YBA sample timestamps from the same wall-clock domain, so
-        # zeroing it is safe and avoids false "stale" readings if the
-        # child ever ran Phase 2 before pause_dispatch re-stamped.
+        # DB-24483 — the parent's barrier belongs to the parent's drain.
+        # Every drain re-stamps it (pause_dispatch, then Phase 1 end)
+        # before Phase 2 reads it, so the value here is never used;
+        # zero it like the rest of the drain state.
         self.barrier_ts = 0.0
         # agent-K PR #16:515. KEEP the parent's cool-down timestamps.
         # ``time.monotonic()`` is shared across fork on the same host,

@@ -4,17 +4,18 @@ DB-24483 — Phase 2 freshness + liveness gate.
 Covers the full driver-only fix laid out in the design doc:
 
   * Freshness gate rejects any YBA sample whose ``sample_ts`` is older
-    than ``barrier_ts + lag_freshness_s`` (default 25s). A sample that
-    predates the barrier cannot describe post-barrier replication.
+    than ``barrier_ts + lag_freshness_s`` (default 25s). ``barrier_ts``
+    is re-stamped when Phase 1 ends, after the last outgoing commit.
   * Liveness gate requires ``lag_confirmation_samples`` (default 2)
-    distinct post-barrier samples at ``lag ≤ threshold`` before the
-    drain flips routing. One pass is not enough: YBA replays its last
-    sample for ~5min after the primary dies.
+    post-barrier samples at ``lag ≤ threshold``, each one scrape
+    interval after the previous counted one, before the drain flips
+    routing. One pass is not enough: YBA replays its last sample for
+    ~5min after the primary dies.
   * Opt-outs: ``lag_freshness_s=0`` disables the freshness gate;
     ``lag_confirmation_samples=1`` disables the liveness gate.
-  * Bootstrap floor: when both gates are enabled,
-    ``lag_wait_timeout_s`` must fit ``freshness + N × scrape_hint``;
-    otherwise bootstrap raises ``ValueError``.
+  * Bootstrap floor: when both gates are enabled and
+    ``lag_wait_timeout_s`` doesn't fit ``freshness + N × scrape_hint``,
+    bootstrap logs a warning.
 
 Tests parametrise the fake YBA client so each tick can return a
 (lag_ms, sample_ts) pair the suite controls, which lets the gate's
@@ -73,7 +74,8 @@ class _ScriptedYBAClient:
         lag, ts = self._next()
         if lag is None:
             return None
-        # Match the real client contract: never returns a None timestamp.
+        # A None in the script means "now". The real client can return a
+        # None timestamp; test_missing_sample_ts_* covers that path.
         return (lag, ts if ts is not None else time.time())
 
     def get_committed_lag_ms(self, xcluster_uuid: str) -> float | None:
@@ -206,6 +208,55 @@ def test_liveness_gate_requires_two_distinct_samples(fake_state):
 
     # Three polls needed because the middle one was a replay.
     assert len(client.calls) == 3
+
+
+def test_liveness_counts_only_samples_a_scrape_apart(fake_state):
+    """YBA's ``x`` follows the request time, so consecutive 1 s polls
+    return timestamps 1 s apart even when they read the same scrape. A
+    confirmation counts only one scrape interval (10 s) after the last."""
+    ts = time.time() + 10_000.0
+    client = _ScriptedYBAClient(script=[
+        (0.0, ts),          # counted 1/2
+        (0.0, ts + 1.0),    # same scrape window
+        (0.0, ts + 9.0),    # same scrape window
+        (0.0, ts + 10.0),   # counted 2/2
+    ])
+    group = _make_group(
+        fake_state, client,
+        lag_wait_timeout_s=10,
+        lag_freshness_s=25,
+        lag_confirmation_samples=2,
+    )
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 4
+
+
+def test_missing_sample_ts_counts_every_pass_and_warns_once(fake_state, caplog):
+    """A sample with no timestamp can't be gated; every ≤ threshold poll
+    counts, and the lag wait says so once."""
+
+    class _NoTsClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_committed_lag_sample(self, xcluster_uuid):
+            self.calls += 1
+            return (0.0, None)
+
+    client = _NoTsClient()
+    group = _make_group(
+        fake_state, client,  # type: ignore[arg-type]
+        lag_wait_timeout_s=10,
+        lag_freshness_s=25,
+        lag_confirmation_samples=2,
+    )
+    with caplog.at_level("WARNING", logger="psycopg.yb"):
+        trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert client.calls == 2
+    warned = [r for r in caplog.records if "without a timestamp" in r.getMessage()]
+    assert len(warned) == 1
 
 
 def test_liveness_replay_pathology_never_converges(fake_state):
@@ -446,6 +497,34 @@ def test_pause_dispatch_stamps_barrier_ts(fake_state):
     stamped = group.barrier_ts
     group.resume_dispatch()
     assert group.barrier_ts == stamped
+
+
+def test_phase1_end_restamps_barrier_ts(fake_state):
+    """In-flight work keeps committing on the outgoing side until Phase 1
+    ends, so Phase 2's freshness anchor is the end of Phase 1, not the
+    moment pause_dispatch armed the barrier."""
+    seen: list[float] = []
+
+    class _Client(_ScriptedYBAClient):
+        def get_committed_lag_sample(self, xcluster_uuid):
+            seen.append(group.barrier_ts)
+            return super().get_committed_lag_sample(xcluster_uuid)
+
+    client = _Client(script=[(0.0, time.time() + 10_000.0)])
+    group = _make_group(
+        fake_state, client, lag_wait_timeout_s=10, lag_confirmation_samples=1,
+    )
+    original_pause = group.pause_dispatch
+
+    def pause_with_old_stamp() -> None:
+        original_pause()
+        group.barrier_ts = 1.0  # stands in for "armed long before Phase 1 ended"
+
+    group.pause_dispatch = pause_with_old_stamp  # type: ignore[method-assign]
+    before_drain = time.time()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert seen and seen[0] >= before_drain
 
 
 

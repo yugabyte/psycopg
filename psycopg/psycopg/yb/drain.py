@@ -1025,6 +1025,12 @@ def _drain_and_apply(
             )
         with group.lock:
             group.last_phase1_complete_ts = now
+            # Re-stamp the freshness anchor now that the outgoing side
+            # has stopped committing. Phase 1 only stops new opens; work
+            # in flight kept committing until here, and Phase 2 has to
+            # see those commits replicated, not just the ones before
+            # pause_dispatch.
+            group.barrier_ts = time.time()
         closed_any = bool(survivors) or total_idle_closed > 0 or children_live > 0
         closed_at = time.monotonic()
 
@@ -1163,9 +1169,11 @@ _LAG_POLL_INTERVAL_S = 1.0
 _LAG_UNREACHABLE_STRIKES = 3
 
 # DB-24483 — Prometheus scrape interval YBA uses, matched to the YBA
-# default (reference.conf:985). Used by the liveness gate to tell
-# whether two "post-barrier" samples came from different scrapes (good)
-# or the same one (YBA's replay pathology).
+# default (reference.conf:985). A YBA sample's ``x`` is the range-query
+# evaluation step, which follows the request time, not the scrape time.
+# The liveness gate therefore counts a confirmation only when it is at
+# least one scrape interval after the previous one, so N confirmations
+# span N distinct scrapes.
 _LAG_SCRAPE_HINT_S = 10.0
 
 # Time kept back from ``globalTimeBudgetSecs`` for the work after the lag
@@ -1272,11 +1280,11 @@ def _wait_for_replication_lag(
         required_samples = int(getattr(group, "lag_confirmation_samples", 1))
         direction_label = "failover"
 
-    # DB-24483 — snapshot the barrier timestamp set by ``pause_dispatch``.
-    # Zero means "no barrier armed" — a fail-open path (shouldn't happen
-    # inside a drain, but defensive): if we have no barrier, the
-    # freshness gate degrades to "any sample is fresh" and the liveness
-    # gate still runs on sample identity.
+    # DB-24483 — snapshot the freshness anchor: stamped by
+    # ``pause_dispatch`` and re-stamped when Phase 1 completes, so it
+    # marks the last commit on the outgoing side. Zero means "no barrier
+    # armed" — a fail-open path (shouldn't happen inside a drain, but
+    # defensive): the freshness gate then treats any sample as fresh.
     barrier_ts = float(getattr(group, "barrier_ts", 0.0))
 
     logger.warning(
@@ -1306,9 +1314,10 @@ def _wait_for_replication_lag(
     # DB-24483 — liveness tracking: consecutive distinct post-barrier
     # samples at ≤ threshold.
     confirmed_count = 0
-    # Dedupe repeated YBA replays of the same sample. Any sample_ts
-    # equal to the previous one does NOT advance the liveness count.
+    # A sample_ts less than one scrape interval after the last counted
+    # one does NOT advance the liveness count.
     last_counted_sample_ts: float | None = None
+    warned_no_sample_ts = False
 
     # agent-K PR #8:430: the deadline is checked only BEFORE each poll,
     # but a YBA request can take up to ~`max(connect, read)`×2 (reconnect
@@ -1537,10 +1546,17 @@ def _wait_for_replication_lag(
             # freshness_s`` grace window) cannot have observed writes
             # that landed before ``pause_dispatch``. Trusting it is the
             # exact bug that let the driver flip to a 17s-behind B.
-            # Legacy YBA clients that don't return ``sample_ts`` fall
-            # back to the pre-fix single-sample convergence — the
-            # operator opted out of the gate by not giving us the
-            # timestamp. ``freshness_s == 0`` likewise opts out.
+            # A sample with no ``sample_ts`` (YBA sent no ``x`` axis)
+            # skips both this gate and the liveness spacing below: every
+            # ≤ threshold poll counts. That is logged once per lag wait.
+            # ``freshness_s == 0`` opts out of this gate.
+            if sample_ts is None and not warned_no_sample_ts:
+                warned_no_sample_ts = True
+                logger.warning(
+                    "lag wait: YBA returned a lag sample without a "
+                    "timestamp — the freshness and liveness gates can't "
+                    "run; counting every poll at or below the threshold",
+                )
             if freshness_s > 0 and sample_ts is not None and barrier_ts > 0:
                 min_fresh_ts = barrier_ts + freshness_s
                 if sample_ts < min_fresh_ts:
@@ -1565,8 +1581,9 @@ def _wait_for_replication_lag(
             # DB-24483 — liveness gate. YBA replays its last sample for
             # ~5min after the primary dies (DB-24852-adjacent). A single
             # ``lag=0`` is not enough to tell "standby really caught up"
-            # from "same stale replay reused". Require N distinct
-            # ``sample_ts`` values at ≤ threshold before flipping.
+            # from "same stale replay reused". Require N samples at
+            # ≤ threshold, each at least one scrape interval after the
+            # previous counted one, before flipping.
             if (
                 sample_ts is not None
                 and barrier_ts > 0
@@ -1619,13 +1636,18 @@ def _wait_for_replication_lag(
                 )
                 confirmed_count = 0
                 last_counted_sample_ts = None
-            elif sample_ts is not None and sample_ts == last_counted_sample_ts:
+            elif (
+                sample_ts is not None
+                and last_counted_sample_ts is not None
+                and sample_ts < last_counted_sample_ts + _LAG_SCRAPE_HINT_S
+            ):
                 logger.info(
                     "lag wait: lag=%.1fms ≤ threshold but sample_ts %.3f "
-                    "unchanged since last pass — YBA replay suspected, "
-                    "not counting (confirmations=%d/%d, elapsed=%.1fs / %ds)",
-                    lag_ms, sample_ts, confirmed_count, required_samples,
-                    elapsed, timeout_s,
+                    "is within one scrape interval (%.0fs) of the last "
+                    "counted sample — not counting (confirmations=%d/%d, "
+                    "elapsed=%.1fs / %ds)",
+                    lag_ms, sample_ts, _LAG_SCRAPE_HINT_S, confirmed_count,
+                    required_samples, elapsed, timeout_s,
                 )
             else:
                 confirmed_count += 1
