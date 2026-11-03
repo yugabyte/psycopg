@@ -32,10 +32,12 @@ No row for a group_id means "no signal, return HEALTHY" — the default
 state for fresh deployments.
 
 Two instances per ``FailoverGroup`` (one per cluster). Each reads from
-its own cluster's ``control_sync`` connection, which is how per-slot
-isolation is provided today. (A former ``which_cluster`` column that
-also filtered rows per slot was reverted here — see ``_SIGNAL_TABLE_DDL``
-for the rationale and the follow-up with the yb-stress-test harness.)
+its own cluster's ``control_sync`` connection, which is the only per-slot
+isolation, so ``yb_failover_signals`` must live in a database that
+xCluster does not replicate. If it is replicated, a row written on one
+cluster reaches the other, both CBs trip, and every connect raises
+``NoViableClusterError``. (A former ``which_cluster`` column that also
+filtered rows per slot was reverted here — see ``_SIGNAL_TABLE_DDL``.)
 
 Usage:
 

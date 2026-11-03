@@ -237,6 +237,12 @@ Reference implementations under ``demo/samples/``:
       INSERT INTO yb_failover_signals (group_id, target_status, reason)
       VALUES ('<primary-uuid>', 'UNHEALTHY', 'planned maintenance');
 
+  Each CB reads the table through its own cluster's control connection,
+  so ``yb_failover_signals`` must live in a database that xCluster does
+  not replicate. If it is replicated, a row written on one cluster
+  reaches the other, both CBs trip, and every connect raises
+  ``NoViableClusterError``.
+
 Ships in ``psycopg.yb.circuit_breaker``:
 
 * ``CircuitBreaker`` — the Protocol every CB implements.
