@@ -274,7 +274,46 @@ def _state_with_bootstrap(reg: ClusterRegistry, hosts: list[str], down: set[str]
     state.control_sync = None
     for h in down:
         state.nodes[h].is_down = True
+        state.nodes[h].is_down_since = time.monotonic()
     return state
+
+
+def test_alias_bootstrap_never_adopts_caller_conn_as_control(
+    fresh_registry, monkeypatch
+):
+    """DB-25060: the cluster was bootstrapped on the control dbname and
+    then lost its control conn (fork reset, or the conn dropped). The next
+    connect with a different dbname aliases to the same uuid; its conn
+    must be closed, not adopted, so the reopen uses the control dbname."""
+    state = _state_with_bootstrap(fresh_registry, ["h1"])
+    state.bootstrap_kwargs = {"dbname": "driver_ctl", "user": "yugabyte"}
+    fresh_registry._key_to_uuid[
+        ClusterKey.from_params({"host": "h1", "dbname": "driver_ctl"})
+    ] = "X"
+
+    opened: list[tuple[_FakeConn, object]] = []
+
+    def fake_connect(conninfo, **kwargs):
+        conn = _FakeConn(kwargs["host"])
+        opened.append((conn, kwargs.get("dbname")))
+        return conn
+
+    from psycopg.connection import Connection
+    from psycopg.yb import discovery
+    monkeypatch.setattr(Connection, "_connect_plain", classmethod(lambda cls, *a, **k: fake_connect(*a, **k)))
+    monkeypatch.setattr(discovery, "fetch_servers_sync", lambda conn: (list(state.nodes.values()), "X"))
+
+    app_key = ClusterKey.from_params({"host": "h1", "dbname": "xcf_app"})
+    got = fresh_registry.get_or_bootstrap(app_key, "", {"host": "h1", "dbname": "xcf_app"})
+
+    assert got is state
+    assert state.control_sync is None
+    app_conn, _ = opened[0]
+    assert app_conn.closed
+
+    ctrl = fresh_registry._ensure_control_sync(state)
+    assert ctrl is opened[1][0]
+    assert opened[1][1] == "driver_ctl"
 
 
 def test_ensure_control_sync_returns_existing_when_present(fresh_registry):
@@ -712,3 +751,109 @@ def test_merge_clears_force_refresh(fresh_registry):
     fresh_registry._merge_new_nodes(state, [_make_node("h1")])
 
     assert state.force_refresh is False
+
+
+# ------------------------------------------------------- node recovery
+
+def test_mark_up_clears_down_flag(fresh_registry):
+    """node_recovery (stress, every outage cycle): nothing ever cleared
+    is_down, so a node that failed one connect stayed "down" for the life
+    of the process. A successful connect must clear it."""
+    state = _install_state(fresh_registry, ["h1"])
+    fresh_registry.mark_failed("X", "h1")
+    assert state.nodes["h1"].is_down is True
+
+    fresh_registry.mark_up("X", "h1")
+
+    assert state.nodes["h1"].is_down is False
+    assert state.nodes["h1"].is_down_since == 0.0
+
+
+def test_merge_clears_down_flag_once_listed_past_grace(fresh_registry):
+    """The inactive universe gets no app connects, so refresh is the
+    recovery signal there: still listed by yb_servers() and down for
+    longer than the reconnect TTL → recovered."""
+    from psycopg.yb.registry import _DOWN_RECOVERY_GRACE_S
+    state = _install_state(fresh_registry, ["h1", "h2"])
+    state.nodes["h2"].is_down = True
+    state.nodes["h2"].is_down_since = time.monotonic() - (_DOWN_RECOVERY_GRACE_S + 1)
+
+    fresh_registry._merge_new_nodes(state, [_make_node("h1"), _make_node("h2")])
+
+    assert state.nodes["h2"].is_down is False
+
+
+def test_merge_keeps_unlisted_down_node_down_past_grace(fresh_registry):
+    """Recovery via refresh needs the host to be listed again."""
+    from psycopg.yb.registry import _DOWN_RECOVERY_GRACE_S
+    state = _install_state(fresh_registry, ["h1", "h2"])
+    state.nodes["h2"].is_down = True
+    state.nodes["h2"].is_down_since = time.monotonic() - (_DOWN_RECOVERY_GRACE_S + 1)
+
+    fresh_registry._merge_new_nodes(state, [_make_node("h1")])
+
+    assert state.nodes["h2"].is_down is True
+
+
+# ------------------------------------------------------- connect-timeout strikes
+
+def test_single_connect_timeout_does_not_quarantine(fresh_registry):
+    """false_quarantine (stress 64a57bb5 cycle 1): one connect timeout to
+    a live node quarantined it. Timeouts need consecutive strikes."""
+    from psycopg.yb.registry import _CONNECT_TIMEOUT_STRIKES
+    state = _install_state(fresh_registry, ["h1"])
+
+    for _ in range(_CONNECT_TIMEOUT_STRIKES - 1):
+        fresh_registry.mark_failed("X", "h1", timeout=True)
+    assert state.nodes["h1"].is_down is False
+
+    fresh_registry.mark_failed("X", "h1", timeout=True)
+    assert state.nodes["h1"].is_down is True
+
+
+def test_successful_connect_resets_timeout_strikes(fresh_registry):
+    from psycopg.yb.registry import _CONNECT_TIMEOUT_STRIKES
+    state = _install_state(fresh_registry, ["h1"])
+
+    for _ in range(_CONNECT_TIMEOUT_STRIKES - 1):
+        fresh_registry.mark_failed("X", "h1", timeout=True)
+    fresh_registry.mark_up("X", "h1")
+    fresh_registry.mark_failed("X", "h1", timeout=True)
+
+    assert state.nodes["h1"].is_down is False
+
+
+def test_refused_connect_still_quarantines_immediately(fresh_registry):
+    state = _install_state(fresh_registry, ["h1"])
+
+    fresh_registry.mark_failed("X", "h1")
+
+    assert state.nodes["h1"].is_down is True
+
+
+def test_overlapping_connect_timeouts_count_as_one_strike(fresh_registry):
+    """false_quarantine (r12 218880 c1): four threads timed out on one
+    host within 26 ms after a single ~3 s slow spell and the driver
+    counted 1/3, 2/3, quarantined. Attempts that overlap the one behind
+    the last counted strike are the same slow spell."""
+    state = _install_state(fresh_registry, ["h1"])
+    started = time.monotonic() - 3.0   # every attempt began ~3 s ago
+
+    for _ in range(4):
+        fresh_registry.mark_failed("X", "h1", timeout=True, attempt_started=started)
+
+    assert state.nodes["h1"].is_down is False
+    assert state.nodes["h1"].connect_timeouts == 1
+
+
+def test_non_overlapping_connect_timeouts_still_quarantine(fresh_registry):
+    """A real outage: each attempt starts after the previous one timed
+    out, so every timeout is a new strike."""
+    from psycopg.yb.registry import _CONNECT_TIMEOUT_STRIKES
+    state = _install_state(fresh_registry, ["h1"])
+
+    for _ in range(_CONNECT_TIMEOUT_STRIKES):
+        started = time.monotonic()
+        fresh_registry.mark_failed("X", "h1", timeout=True, attempt_started=started)
+
+    assert state.nodes["h1"].is_down is True

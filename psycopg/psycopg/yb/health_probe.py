@@ -374,6 +374,19 @@ class HealthProbe:
                     group.cooldown_s - (now - getattr(group, transition_attr)),
                 )
                 return
+        # DB-25011: a cluster that was unreachable at bootstrap stays
+        # UNHEALTHY until the driver has reached it. A CB can report
+        # HEALTHY before then (no signal row, or a failure count still
+        # under its threshold); applying that would route the app to a
+        # universe no connection can reach and fail over again later.
+        if result is HealthResult.HEALTHY and self._never_reached():
+            logger.info(
+                "%s probe: CB reported HEALTHY but the driver has not "
+                "reached this cluster since bootstrap found it down; "
+                "keeping UNHEALTHY (primary_uuid=%s)",
+                self._which, group.primary.uuid,
+            )
+            return
         # agent-K PR #9:313: don't start a new drain while another
         # cluster's probe is already running one. The two probes are
         # independent threads; without this gate, the secondary probe
@@ -398,6 +411,17 @@ class HealthProbe:
             new_status=result,
             drain_timeout_s=self._drain_timeout_s,
         )
+
+    def _never_reached(self) -> bool:
+        """True while this cluster is a bootstrap placeholder with no open
+        control connection, i.e. the driver has not reached it yet."""
+        from .registry import _is_placeholder_uuid  # late import; cycle-safe
+        state = getattr(self._group, self._which)
+        if state is None or not _is_placeholder_uuid(state.uuid):
+            return False
+        with state.lock:
+            conn = state.control_sync
+        return conn is None or conn.closed
 
     # ---------- topology refresh
     def _tick_refresh_topology(self) -> None:

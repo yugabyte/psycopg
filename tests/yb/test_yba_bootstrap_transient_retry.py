@@ -1,0 +1,240 @@
+"""
+A transient YBA failure at bootstrap must not turn Phase 2 off for good.
+
+r12 218917 (startup_a_down, 4 of 4 cycles): A was down when the app
+started, YBA timed out answering the xCluster config lookup
+("GET /customers/.../xcluster_configs/... timeout: The read operation
+timed out") and the bootstrap probe disabled the lag phase for the life
+of the group. After A healed, the failback ran without a lag wait and
+the stress suite failed driver_path ("Phase 2 enabled in the DSN but the
+driver never started a lag wait").
+
+Fix: ``YBAClientError.transient`` marks timeouts, connection errors and
+5xx. A transient bootstrap failure keeps the params on the group, and the
+drain retries the probe before its next lag wait, inside the lag-wait
+timeout. Auth errors and unknown replication names stay permanent.
+"""
+
+# Copyright (C) 2026 Yugabyte
+
+from __future__ import annotations
+
+import threading
+import time
+import types
+
+import pytest
+
+from psycopg.pq import TransactionStatus
+from psycopg.yb import drain as drain_mod
+from psycopg.yb import yba_client as yba_mod
+from psycopg.yb.drain import _retry_pending_yba, trigger_drain
+from psycopg.yb.health import HealthResult
+from psycopg.yb.registry import ClusterRegistry, FailoverGroup
+from psycopg.yb.yba_client import YBAClient, YBAClientError
+
+
+pytestmark = pytest.mark.yb_unit
+
+
+# ------------------------------------------------------- error classification
+
+class _FakeHTTP:
+    def __init__(self, exc=None, status=200, body=b"{}"):
+        self.exc, self.status, self.body = exc, status, body
+        self.timeout = None
+        self.sock = None
+
+    def request(self, *a, **kw):
+        if self.exc is not None:
+            raise self.exc
+
+    def getresponse(self):
+        return types.SimpleNamespace(read=lambda: self.body, status=self.status)
+
+    def close(self):
+        pass
+
+
+def _client_with(http) -> YBAClient:
+    c = YBAClient("http://yba.invalid", "token")
+    c._conn = http
+    return c
+
+
+@pytest.mark.parametrize("http, transient", [
+    (_FakeHTTP(exc=TimeoutError("The read operation timed out")), True),
+    (_FakeHTTP(status=503, body=b"unavailable"), True),
+    (_FakeHTTP(status=500, body=b"Too many attempts"), True),
+    (_FakeHTTP(status=401, body=b"bad token"), False),
+    (_FakeHTTP(status=404, body=b"not found"), False),
+])
+def test_yba_error_transient_classification(http, transient):
+    with pytest.raises(YBAClientError) as ei:
+        _client_with(http)._request("GET", "/session_info")
+    assert ei.value.transient is transient
+
+
+def test_unknown_replication_name_is_permanent():
+    c = YBAClient("http://yba.invalid", "token")
+    c._customer_uuid = "cid"
+    c._request = lambda *a, **kw: []   # no universes → no candidates
+    with pytest.raises(YBAClientError) as ei:
+        c.resolve_xcluster_config_uuid("missing")
+    assert ei.value.transient is False
+
+
+# ------------------------------------------------------- registry bootstrap + retry
+
+class _ScriptedClient:
+    """Stands in for ``YBAClient``: ``outcomes`` is shared across
+    instances; each probe pops the next one (an exception or None)."""
+
+    outcomes: list = []
+    probes = 0
+
+    def __init__(self, **kw):
+        self.kw = kw
+
+    def get_session_info(self, deadline=None):
+        type(self).probes += 1
+        outcome = type(self).outcomes.pop(0) if type(self).outcomes else None
+        if outcome is not None:
+            raise outcome
+        return "cid-1"
+
+    def resolve_xcluster_config_uuid(self, name, deadline=None):
+        return {"a_to_b": "xcc-ab", "b_to_a": "xcc-ba"}[name]
+
+
+def _params():
+    return types.SimpleNamespace(
+        lag_wait_enabled=True,
+        yba_endpoint="http://yba.invalid",
+        yba_api_token="token",
+        yba_connect_timeout_s=2.0,
+        yba_read_timeout_s=3.0,
+        replication_name="a_to_b",
+        failback_replication_name="b_to_a",
+        threshold_replication_lag_ms=0,
+        lag_wait_timeout_s=30,
+        lag_freshness_s=0,
+        lag_confirmation_samples=1,
+        failback_threshold_replication_lag_ms=0,
+        failback_lag_wait_timeout_s=30,
+        failback_lag_freshness_s=0,
+        failback_lag_confirmation_samples=1,
+        global_time_budget_secs=None,
+        failback_global_time_budget_secs=None,
+    )
+
+
+def _group(fake_state, **kw) -> FailoverGroup:
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    return FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.HEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0, **kw,
+    )
+
+
+@pytest.fixture
+def scripted(monkeypatch):
+    _ScriptedClient.outcomes = []
+    _ScriptedClient.probes = 0
+    monkeypatch.setattr(yba_mod, "YBAClient", _ScriptedClient)
+    return _ScriptedClient
+
+
+def test_transient_bootstrap_failure_keeps_params(fake_state, scripted):
+    scripted.outcomes = [YBAClientError("timeout", transient=True)]
+    group = _group(fake_state)
+    params = _params()
+
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, params)
+
+    assert group.yba_client is None
+    assert group.yba_pending_params is params
+
+
+def test_permanent_bootstrap_failure_disables_for_good(fake_state, scripted):
+    scripted.outcomes = [YBAClientError("HTTP 401", transient=False)]
+    group = _group(fake_state)
+
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    assert group.yba_client is None
+    assert group.yba_pending_params is None
+
+
+def test_retry_enables_phase2_once_yba_answers(fake_state, scripted):
+    scripted.outcomes = [YBAClientError("timeout", transient=True), None]
+    group = _group(fake_state)
+    reg = ClusterRegistry.instance()
+    reg._wire_yba_lag_phase(group, _params())
+
+    reg.retry_yba_lag_phase(group, deadline=time.monotonic() + 5)
+
+    assert group.yba_client is not None
+    assert group.yba_pending_params is None
+    assert group.xcluster_config_uuid == "xcc-ab"
+    assert group.failback_xcluster_config_uuid == "xcc-ba"
+
+
+def test_retry_with_permanent_failure_stops_retrying(fake_state, scripted):
+    scripted.outcomes = [
+        YBAClientError("timeout", transient=True),
+        YBAClientError("HTTP 403", transient=False),
+    ]
+    group = _group(fake_state)
+    reg = ClusterRegistry.instance()
+    reg._wire_yba_lag_phase(group, _params())
+
+    reg.retry_yba_lag_phase(group, deadline=time.monotonic() + 5)
+
+    assert group.yba_client is None
+    assert group.yba_pending_params is None
+
+
+# ------------------------------------------------------- drain integration
+
+def test_retry_pending_shares_the_lag_wait_timeout(fake_state, scripted):
+    scripted.outcomes = [YBAClientError("timeout", transient=True), None]
+    group = _group(fake_state, lag_wait_timeout_s=7)
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+    group.lag_wait_timeout_s = 7
+
+    before = time.monotonic()
+    deadline = _retry_pending_yba(group, is_failback=False, budget_deadline=None)
+
+    assert group.yba_client is not None
+    assert deadline is not None and before + 7 - 0.5 <= deadline <= time.monotonic() + 7
+
+
+def test_retry_pending_is_a_no_op_without_pending_params(fake_state, scripted):
+    group = _group(fake_state)
+    assert _retry_pending_yba(group, is_failback=True, budget_deadline=123.0) == 123.0
+    assert scripted.probes == 0
+
+
+def test_failback_after_transient_bootstrap_runs_the_lag_wait(fake_state, scripted, monkeypatch):
+    """startup_a_down end to end at drain level: the bootstrap probe timed
+    out, A healed, the failback drain retries the probe and runs Phase 2."""
+    scripted.outcomes = [YBAClientError("timeout", transient=True), None]
+    group = _group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+    waits = []
+    monkeypatch.setattr(
+        drain_mod, "_wait_for_replication_lag",
+        lambda g, which, is_failback=False, budget_deadline=None, outgoing=None:
+            waits.append((is_failback, budget_deadline)),
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert waits and waits[0][0] is True, "failback ran without a lag wait"
+    assert waits[0][1] is not None
+    assert group.primary_status == HealthResult.HEALTHY

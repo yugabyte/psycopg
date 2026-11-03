@@ -66,7 +66,7 @@ import time
 import weakref
 from typing import TYPE_CHECKING
 
-from . import TRACE
+from . import TRACE, fork_follow
 from .health import HealthResult
 
 if TYPE_CHECKING:
@@ -76,8 +76,9 @@ logger = logging.getLogger(__name__)
 
 
 class Phase2TimeoutError(Exception):
-    """Raised by a FAILBACK Phase 2 lag wait when it times out and the
-    group's ``on_phase2_timeout`` is ``"fail"`` (opt-in; the default
+    """Raised by a FAILBACK Phase 2 lag wait when it times out, or YBA
+    stays unreachable for ``_LAG_UNREACHABLE_STRIKES`` polls, and the
+    group's ``failback_on_phase2_timeout`` is ``"fail"`` (opt-in; the default
     is ``"proceed"``).
 
     Caught by ``_drain_and_apply``, which then SKIPS the status
@@ -158,6 +159,28 @@ class _CloseLockTimeoutError(Exception):
     """
 
 
+# Poll interval while waiting for an async conn's ``asyncio.Lock`` to be
+# released (see ``_wait_async_lock_free``).
+_ASYNC_LOCK_POLL_S = 0.005
+
+
+def _wait_async_lock_free(c, budget: float) -> bool:
+    """Wait until ``c.lock`` (an ``asyncio.Lock``) is not held, up to
+    ``budget`` seconds; ``budget <= 0`` checks once. Returns False if it
+    is still held. Only reads ``locked()`` — never acquires the lock
+    from this (non-event-loop) thread."""
+    lock = getattr(c, "lock", None)
+    locked = getattr(lock, "locked", None)
+    if locked is None:
+        return True
+    deadline = time.monotonic() + max(budget, 0.0)
+    while locked():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_ASYNC_LOCK_POLL_S)
+    return True
+
+
 def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
     """Call close on ``c``; return the exception if it raises, else
     ``None``. Isolates a raising close so it doesn't blow up the
@@ -190,16 +213,42 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
     the budget, return ``_CloseLockTimeoutError`` so the caller
     escalates to the existing hard-fd escape hatch.
 
-    Async conns don't get this treatment: their ``.lock`` is an
-    ``asyncio.Lock`` and acquiring it from the drain thread would be
-    a cross-thread asyncio-lock call (undefined behavior). The
-    residual async finish-race is tracked separately.
+    Async conns get the same guarantee without acquiring their lock:
+    ``.lock`` is an ``asyncio.Lock`` and acquiring it from the drain
+    thread would be a cross-thread asyncio-lock call (undefined
+    behavior). ``AsyncConnection`` holds it around every libpq call
+    (COMMIT included), so the drain thread waits, within the same
+    budget, until ``lock.locked()`` reads False — a plain attribute
+    read, no event-loop interaction — and only then finishes the
+    pgconn. Without the wait, a force-close landing while a COMMIT
+    was on the wire cut it mid-reply: the app saw "connection socket
+    closed", an unknown outcome on the outgoing universe (r12 drain_zero
+    c3 dual_write). Pool-borrowed sync conns take ``Connection.lock``
+    before ``pgconn.finish()`` for the same reason. A statement started
+    between the wait and the finish still fails on the closed socket.
     """
     try:
         # Lazy import — ``..connection_async`` pulls ``.yb.state`` which
         # pulls back into this subpackage; top-level import would cycle.
         from ..connection_async import AsyncConnection
+        # Lock-acquire budget: lock_timeout_s=None means use default
+        # (_SAFE_CLOSE_LOCK_BUDGET_S); lock_timeout_s=0 means
+        # non-blocking (agent-K PR #21:146 — the idle-close path
+        # should NOT stall 1.5 s per conn whose owner is in a long
+        # libpq call like LISTEN/NOTIFY; it just skips and retries
+        # the next tick).
+        budget = (
+            lock_timeout_s
+            if lock_timeout_s is not None
+            else _SAFE_CLOSE_LOCK_BUDGET_S
+        )
         if isinstance(c, AsyncConnection):
+            if not _wait_async_lock_free(c, budget):
+                return _CloseLockTimeoutError(
+                    f"async conn.lock still held after {budget}s — "
+                    f"a statement (possibly COMMIT) is on the wire; "
+                    f"escalate to hard-fd close"
+                )
             try:
                 c.pgconn.finish()
             finally:
@@ -215,31 +264,29 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
         # by calling ``pgconn.finish()`` directly for any conn whose
         # ``_pool`` is set (agent-K PR #13:370). Same pattern H6
         # uses in ``xcluster_check``.
-        if getattr(c, "_pool", None) is not None:
-            try:
-                c.pgconn.finish()
-            finally:
-                _release_registry_count(c)
-            return None
         # Sync branch — acquire the per-conn lock first (DB-25090).
         # Missing lock on a mock / test shim: fall through to the
         # direct close path (what we did pre-fix). Real Connection
         # instances always have one.
+        # Pool-borrowed conn: ``psycopg_pool.ConnectionPool`` patches
+        # ``Connection.close`` with ``close_returns=True`` so that
+        # ``c.close()`` reroutes to ``pool.putconn(c)`` — the conn
+        # ends up back in the idle pool, NOT closed. The next
+        # ``pool.getconn()`` hands the same stale-cluster socket to
+        # another worker and the dual-write window re-opens. Bypass
+        # by calling ``pgconn.finish()`` directly for any conn whose
+        # ``_pool`` is set (agent-K PR #13:370), under the same lock.
         lock = getattr(c, "lock", None)
+        is_pool = getattr(c, "_pool", None) is not None
         if lock is None:
-            c.close()
+            if is_pool:
+                try:
+                    c.pgconn.finish()
+                finally:
+                    _release_registry_count(c)
+            else:
+                c.close()
             return None
-        # Lock-acquire budget: lock_timeout_s=None means use default
-        # (_SAFE_CLOSE_LOCK_BUDGET_S); lock_timeout_s=0 means
-        # non-blocking (agent-K PR #21:146 — the idle-close path
-        # should NOT stall 1.5 s per conn whose owner is in a long
-        # libpq call like LISTEN/NOTIFY; it just skips and retries
-        # the next tick).
-        budget = (
-            lock_timeout_s
-            if lock_timeout_s is not None
-            else _SAFE_CLOSE_LOCK_BUDGET_S
-        )
         if budget <= 0:
             if not lock.acquire(blocking=False):
                 return _CloseLockTimeoutError(
@@ -254,7 +301,13 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
                     f"inside libpq; escalate to hard-fd close (DB-25090)"
                 )
         try:
-            c.close()
+            if is_pool:
+                try:
+                    c.pgconn.finish()
+                finally:
+                    _release_registry_count(c)
+            else:
+                c.close()
         finally:
             lock.release()
         return None
@@ -514,6 +567,8 @@ def _apply_status_change(
         previous = getattr(group, status_attr)
         setattr(group, status_attr, new_status)
         setattr(group, transition_attr, now)
+    if fork_follow.is_leader(group):
+        group._follow.publish_statuses(group.primary_status, group.secondary_status)
     if after_drain:
         logger.info(
             "xCluster %s status transition: %s → %s "
@@ -549,6 +604,7 @@ def _drain_and_apply(
     outgoing side was not serving and there is no lag to wait for."""
     # Snapshot the initial tracked-conn count for the log line — the
     # weakref set may shrink under GC during the drain.
+    drain_started = time.monotonic()
     initial_tracked = len(outgoing.tracked_conns)
     initial_in_flight = len(_in_flight_conns(outgoing.tracked_conns))
     initial_drained = initial_tracked - initial_in_flight
@@ -569,6 +625,12 @@ def _drain_and_apply(
 
     # 1. Pause dispatch (new opens block on the Condition).
     group.pause_dispatch()
+    # DB-25060 — forked workers pause with us and report their in-flight
+    # transactions back (fork_follow.py).
+    follow = group._follow if fork_follow.is_leader(group) else None
+    gen = group.barrier_generation
+    if follow is not None:
+        follow.publish_pause(gen, outgoing is group.primary)
 
     try:
         # 2. Compute deadline from the sentinel.
@@ -600,7 +662,10 @@ def _drain_and_apply(
             )
             total_idle_closed += idle_closed
             in_txn = _in_flight_conns(outgoing.tracked_conns)
-            if not in_txn:
+            children_in_txn = (
+                follow.children_in_flight(gen) if follow is not None else 0
+            )
+            if not in_txn and not children_in_txn:
                 drained_naturally = True
                 logger.debug(
                     "drain: all in-flight txns completed on %s "
@@ -633,6 +698,10 @@ def _drain_and_apply(
             c for c in list(outgoing.tracked_conns)
             if c is not None and not getattr(c, "closed", False)
         ]
+        children_live = 0
+        if follow is not None:
+            children_live = follow.live_children()
+            follow.publish_kill(gen)
 
         # 4. Kill at timeout (step 3 in design doc §3). Force-close
         # any conns still in-flight at the deadline. Only reached with
@@ -880,6 +949,15 @@ def _drain_and_apply(
         #   (c) deadline hit — force-closed every tracked conn still
         #       alive at the deadline (in-flight + idle). The in-flight
         #       count at the deadline moment is reported separately.
+        if follow is not None and children_live:
+            pending = follow.wait_children_killed(gen, _KILL_AT_TIMEOUT_BUDGET_S)
+            if pending:
+                logger.warning(
+                    "xCluster drain: %d forked worker(s) did not confirm "
+                    "closing their conns on %s within %ss",
+                    pending, outgoing.uuid, _KILL_AT_TIMEOUT_BUDGET_S,
+                )
+
         now = time.monotonic()
         phase1_elapsed = now - (
             group.last_failover_start_ts or now
@@ -923,7 +1001,7 @@ def _drain_and_apply(
             )
         with group.lock:
             group.last_phase1_complete_ts = now
-        closed_any = bool(survivors) or total_idle_closed > 0
+        closed_any = bool(survivors) or total_idle_closed > 0 or children_live > 0
         closed_at = time.monotonic()
 
         # 4b. Phase 2 — YBA replication-lag wait. Direction-aware:
@@ -934,22 +1012,35 @@ def _drain_and_apply(
         # semantics as YBA being unreachable.
         #
         # Wrap in `Phase2TimeoutError` catch. On
-        # ``onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
-        # when it times out before converging. We log, record the
+        # ``yb.failback.onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
+        # when it times out before converging or YBA stays unreachable. We log, record the
         # timeout timestamp, and SKIP the status change — routing
         # stays on the current (known-good) side. Dispatch still
         # resumes in the finally so the app isn't stuck. The probe
         # will try again on its next tick.
         phase2_aborted = False
+        lag_failback = new_status == HealthResult.HEALTHY
+        phase2_budget = _budget_deadline(
+            group.failback_global_time_budget_secs if lag_failback
+            else group.global_time_budget_secs,
+            drain_started,
+        )
+        if not skip_phase2:
+            phase2_budget = _retry_pending_yba(group, lag_failback, phase2_budget)
         if group.yba_client is not None and not skip_phase2:
             try:
-                if new_status == HealthResult.UNHEALTHY and group.xcluster_config_uuid:
-                    _wait_for_replication_lag(group, which_cluster, is_failback=False)
-                elif (
-                    new_status == HealthResult.HEALTHY
-                    and group.failback_xcluster_config_uuid
-                ):
-                    _wait_for_replication_lag(group, which_cluster, is_failback=True)
+                if not lag_failback and group.xcluster_config_uuid:
+                    _wait_for_replication_lag(
+                        group, which_cluster, is_failback=False,
+                        budget_deadline=phase2_budget,
+                        outgoing=outgoing,
+                    )
+                elif lag_failback and group.failback_xcluster_config_uuid:
+                    _wait_for_replication_lag(
+                        group, which_cluster, is_failback=True,
+                        budget_deadline=phase2_budget,
+                        outgoing=outgoing,
+                    )
             except Phase2TimeoutError as exc:
                 phase2_aborted = True
                 abort_now = time.monotonic()
@@ -1008,6 +1099,8 @@ def _drain_and_apply(
     finally:
         # 6. Resume dispatch — release waiters.
         group.resume_dispatch()
+        if follow is not None:
+            follow.publish_resume(group.primary_status, group.secondary_status)
         # Record the direction-appropriate completion timestamp — but
         # only when the flip actually happened. agent-K PR #18:612:
         # debounced CBs read ``last_failover_complete_ts`` as "the
@@ -1039,11 +1132,61 @@ _LAG_POLL_INTERVAL_S = 1.0
 # lag confirmation and proceeds with the routing flip. Amogh's flow.
 _LAG_UNREACHABLE_STRIKES = 3
 
+# DB-24483 — Prometheus scrape interval YBA uses, matched to the YBA
+# default (reference.conf:985). Used by the liveness gate to tell
+# whether two "post-barrier" samples came from different scrapes (good)
+# or the same one (YBA's replay pathology).
+_LAG_SCRAPE_HINT_S = 10.0
+
+# Time kept back from ``globalTimeBudgetSecs`` for the work after the lag
+# wait returns (status change, dispatch resume). Stress budget_split
+# measured drain start → drain complete at 20.0s against a 20s budget:
+# the 40/60 split leaves no room for Phase 1's force-close or the flip.
+_BUDGET_FLIP_MARGIN_S = 0.25
+
+
+def _budget_deadline(budget_secs: "int | None", drain_started: float) -> "float | None":
+    """Monotonic time by which the lag wait must return so that the whole
+    drain fits ``globalTimeBudgetSecs``; None without a budget."""
+    if budget_secs is None:
+        return None
+    return drain_started + budget_secs - _BUDGET_FLIP_MARGIN_S
+
+
+def _retry_pending_yba(
+    group: "FailoverGroup", is_failback: bool, budget_deadline: "float | None",
+) -> "float | None":
+    """Retry a bootstrap YBA probe that failed transiently (see
+    ``ClusterRegistry._wire_yba_lag_phase``) before this drain's lag wait.
+
+    The probe and the lag wait share one lag-wait timeout: the probe is
+    capped at ``lag_wait_timeout_s`` from now (and the global budget), and
+    when it enables Phase 2 the returned deadline makes the lag wait end
+    there too. Otherwise ``budget_deadline`` comes back unchanged."""
+    if group.yba_client is not None or getattr(group, "yba_pending_params", None) is None:
+        return budget_deadline
+    timeout_s = group.failback_lag_wait_timeout_s if is_failback else group.lag_wait_timeout_s
+    limit = time.monotonic() + timeout_s
+    if budget_deadline is not None:
+        limit = min(limit, budget_deadline)
+    from .registry import ClusterRegistry      # late import; cycle-safe
+    ClusterRegistry.instance().retry_yba_lag_phase(group, deadline=limit)
+    return limit if group.yba_client is not None else budget_deadline
+
+
+def _all_nodes_down(state: "ClusterState") -> bool:
+    """True when the registry has every node of ``state`` quarantined."""
+    with state.lock:
+        nodes = list(state.nodes.values())
+    return bool(nodes) and all(n.is_down for n in nodes)
+
 
 def _wait_for_replication_lag(
     group: "FailoverGroup",
     which_cluster: str,
     is_failback: bool = False,
+    budget_deadline: "float | None" = None,
+    outgoing: "ClusterState | None" = None,
 ) -> None:
     """Poll YBA for the outgoing side's replication lag every second, exit
     on any of three conditions:
@@ -1054,7 +1197,9 @@ def _wait_for_replication_lag(
          data may be un-replicated; that's a known consequence.
       3. ``_LAG_UNREACHABLE_STRIKES`` consecutive YBA errors — fail-open.
          Better to switch without lag confirmation than to wedge failover
-         because the YBA control plane happens to be down.
+         because the YBA control plane happens to be down. A failback
+         with ``yb.failback.onPhase2Timeout="fail"`` aborts instead (stays on the
+         healthy secondary), as on a timeout.
 
     Never blocks failover on YBA availability. Never blocks longer than
     ``lag_wait_timeout_s``. Log at WARNING on entry and exit so operators
@@ -1062,6 +1207,10 @@ def _wait_for_replication_lag(
 
     ``is_failback`` picks between the A→B config + failover knobs
     (default) and the B→A config + failback knobs (see design doc §3.5.1).
+
+    ``outgoing`` is the outgoing cluster's state; while the driver has
+    every one of its nodes quarantined, no sample counts toward
+    convergence.
     """
     from .yba_client import YBAClientError
 
@@ -1069,22 +1218,54 @@ def _wait_for_replication_lag(
         threshold_ms = float(group.failback_threshold_replication_lag_ms)
         timeout_s = group.failback_lag_wait_timeout_s
         xcluster_uuid = group.failback_xcluster_config_uuid
+        freshness_s = float(getattr(group, "failback_lag_freshness_s", 0))
+        required_samples = int(getattr(group, "failback_lag_confirmation_samples", 1))
         direction_label = "failback"
     else:
         threshold_ms = float(group.threshold_replication_lag_ms)
         timeout_s = group.lag_wait_timeout_s
         xcluster_uuid = group.xcluster_config_uuid
+        freshness_s = float(getattr(group, "lag_freshness_s", 0))
+        required_samples = int(getattr(group, "lag_confirmation_samples", 1))
         direction_label = "failover"
+
+    # DB-24483 — snapshot the barrier timestamp set by ``pause_dispatch``.
+    # Zero means "no barrier armed" — a fail-open path (shouldn't happen
+    # inside a drain, but defensive): if we have no barrier, the
+    # freshness gate degrades to "any sample is fresh" and the liveness
+    # gate still runs on sample identity.
+    barrier_ts = float(getattr(group, "barrier_ts", 0.0))
 
     logger.warning(
         "lag wait start: direction=%s outgoing=%s xcluster_config=%s "
-        "threshold=%.1fms timeout=%ds",
+        "threshold=%.1fms timeout=%ds freshness=%.1fs confirmations=%d "
+        "barrier_ts=%.3f",
         direction_label, which_cluster, xcluster_uuid, threshold_ms, timeout_s,
+        freshness_s, required_samples, barrier_ts,
     )
 
     started = time.monotonic()
     deadline = started + timeout_s
+    if budget_deadline is not None and budget_deadline < deadline:
+        # Phase 1 ran past its share of globalTimeBudgetSecs; the lag
+        # wait gets what is left of the budget, not its full share.
+        logger.info(
+            "lag wait: %.1fs left of the global time budget (lag wait "
+            "timeout %ds)", max(0.0, budget_deadline - started), timeout_s,
+        )
+        deadline = budget_deadline
+    # A YBA call made under a budget is cut at the deadline as well.
+    from .yba_client import YBAClient
+    pass_deadline = (
+        budget_deadline is not None and isinstance(group.yba_client, YBAClient)
+    )
     unreachable_streak = 0
+    # DB-24483 — liveness tracking: consecutive distinct post-barrier
+    # samples at ≤ threshold.
+    confirmed_count = 0
+    # Dedupe repeated YBA replays of the same sample. Any sample_ts
+    # equal to the previous one does NOT advance the liveness count.
+    last_counted_sample_ts: float | None = None
 
     # agent-K PR #8:430: the deadline is checked only BEFORE each poll,
     # but a YBA request can take up to ~`max(connect, read)`×2 (reconnect
@@ -1126,12 +1307,12 @@ def _wait_for_replication_lag(
             # direction regardless of the knob — the knob only matters
             # for the failback case where staying on current side is
             # a safe degraded-mode choice.
-            policy = getattr(group, "on_phase2_timeout", "proceed")
+            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=%s, "
                     "threshold=%.1fms) — ABORTING flip; routing stays "
-                    "on current side (set yb.failover.onPhase2Timeout="
+                    "on current side (set yb.failback.onPhase2Timeout="
                     "proceed to flip anyway)",
                     elapsed, direction_label, threshold_ms,
                 )
@@ -1143,7 +1324,7 @@ def _wait_for_replication_lag(
             if policy == "fail" and not is_failback:
                 logger.warning(
                     "lag wait timeout after %.1fs — proceeding with flip "
-                    "despite on_phase2_timeout='fail' (direction=failover; "
+                    "despite failback_on_phase2_timeout='fail' (direction=failover; "
                     "the current side was just marked UNHEALTHY so "
                     "staying on it is worse than flipping to a lagged "
                     "target)", elapsed,
@@ -1159,7 +1340,7 @@ def _wait_for_replication_lag(
             # Not enough budget left to safely run one more poll
             # without overshooting the lag_wait_timeout. Agent-K PR
             # #18:G3 — this branch is a timeout equivalent, so it
-            # must honour the on_phase2_timeout="fail" policy for the
+            # must honour the failback_on_phase2_timeout="fail" policy for the
             # FAILBACK direction (same reasoning as the deadline-hit
             # branch above). Previously this branch just returned,
             # bypassing the abort and silently flipping onto a
@@ -1168,7 +1349,7 @@ def _wait_for_replication_lag(
             # Same "lag wait timeout" prefix as the deadline branch so log
             # consumers see one timeout outcome, not two.
             elapsed = now - started
-            policy = getattr(group, "on_phase2_timeout", "proceed")
+            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=failback, "
@@ -1188,6 +1369,7 @@ def _wait_for_replication_lag(
             return
 
         poll_started = time.monotonic()
+        report = None
         try:
             # DB-24483: prefer the sample-returning variant so we can
             # log how old the YBA data was. Custom lag sources that
@@ -1197,7 +1379,14 @@ def _wait_for_replication_lag(
             # lag wait (agent-K PR #15:698). We still trust YBA as the
             # lag source of truth; surfacing the age gives operators a
             # concrete number to reason about after a flip.
-            if hasattr(group.yba_client, "get_committed_lag_sample"):
+            if hasattr(group.yba_client, "get_committed_lag_report"):
+                kw = {"deadline": deadline} if pass_deadline else {}
+                report = group.yba_client.get_committed_lag_report(
+                    xcluster_uuid, **kw,
+                )
+                lag_ms = None if report is None else report["lag_ms"]
+                sample_ts = None if report is None else report["sample_ts"]
+            elif hasattr(group.yba_client, "get_committed_lag_sample"):
                 sample = group.yba_client.get_committed_lag_sample(xcluster_uuid)
                 lag_ms = None if sample is None else sample[0]
                 sample_ts = None if sample is None else sample[1]
@@ -1216,6 +1405,14 @@ def _wait_for_replication_lag(
                 age_str = f" sample_age={sample_age_s:.1f}s"
             else:
                 age_str = ""
+            if report is not None:
+                # Per producer node, so a converge on a universe whose
+                # nodes stopped reporting can be read off the log.
+                age_str += " nodes=" + ",".join(
+                    f"{node}:{value:g}" for node, value in report["values"].items()
+                )
+                if report["stale"]:
+                    age_str += f" stale={','.join(report['stale'])}"
             if lag_ms is None:
                 logger.info(
                     "lag wait poll: no data reported by YBA "
@@ -1230,12 +1427,36 @@ def _wait_for_replication_lag(
                 )
         except YBAClientError as exc:
             slowest_poll_s = max(slowest_poll_s, time.monotonic() - poll_started)
+            if pass_deadline and time.monotonic() >= deadline:
+                # Cut at the budget deadline: a timeout, not a strike.
+                logger.info("lag wait: YBA call cut at the budget deadline: %s", exc)
+                continue
             unreachable_streak += 1
             logger.warning(
                 "lag wait: YBA unreachable (%d/%d): %s",
                 unreachable_streak, _LAG_UNREACHABLE_STRIKES, exc,
             )
             if unreachable_streak >= _LAG_UNREACHABLE_STRIKES:
+                # yb.failback.onPhase2Timeout="fail" means "don't fail back onto a
+                # primary we can't confirm has caught up"; an unreachable
+                # YBA is exactly that case. Staying on the secondary is
+                # safe (it's healthy), so a failback aborts like a
+                # timeout. A failover still proceeds: the current side
+                # was just declared unhealthy.
+                policy = getattr(group, "failback_on_phase2_timeout", "proceed")
+                if policy == "fail" and is_failback:
+                    elapsed = time.monotonic() - started
+                    logger.error(
+                        "lag wait: YBA unreachable %d× after %.1fs "
+                        "(direction=failback) — ABORTING flip; routing "
+                        "stays on current side (set yb.failback."
+                        "onPhase2Timeout=proceed to flip anyway)",
+                        _LAG_UNREACHABLE_STRIKES, elapsed,
+                    )
+                    raise Phase2TimeoutError(
+                        f"YBA unreachable {_LAG_UNREACHABLE_STRIKES}x after "
+                        f"{elapsed:.1f}s (direction=failback)"
+                    )
                 logger.warning(
                     "lag wait: YBA unreachable %d× — proceeding with flip "
                     "(no lag confirmation)",
@@ -1255,18 +1476,140 @@ def _wait_for_replication_lag(
 
         if lag_ms is not None and lag_ms <= threshold_ms:
             elapsed = time.monotonic() - started
-            # Log sample age at convergence so a post-mortem can tell
-            # whether we trusted a fresh or stale "caught-up" reading.
-            if sample_ts is not None:
-                age_str = f", sample_age={max(0.0, time.time() - sample_ts):.1f}s"
+            # DB-24483 — freshness gate. A YBA sample whose ``sample_ts``
+            # predates the barrier (or sits in the ``barrier_ts +
+            # freshness_s`` grace window) cannot have observed writes
+            # that landed before ``pause_dispatch``. Trusting it is the
+            # exact bug that let the driver flip to a 17s-behind B.
+            # Legacy YBA clients that don't return ``sample_ts`` fall
+            # back to the pre-fix single-sample convergence — the
+            # operator opted out of the gate by not giving us the
+            # timestamp. ``freshness_s == 0`` likewise opts out.
+            if freshness_s > 0 and sample_ts is not None and barrier_ts > 0:
+                min_fresh_ts = barrier_ts + freshness_s
+                if sample_ts < min_fresh_ts:
+                    stale_by = min_fresh_ts - sample_ts
+                    logger.info(
+                        "lag wait: sample at %.3f is %.1fs older than the "
+                        "freshness floor (barrier=%.3f + %.1fs) — not "
+                        "counting (elapsed=%.1fs / %ds)",
+                        sample_ts, stale_by, barrier_ts, freshness_s,
+                        elapsed, timeout_s,
+                    )
+                    # Reset liveness: a stale sample is not a true pass.
+                    confirmed_count = 0
+                    last_counted_sample_ts = None
+                    sleep_s = min(
+                        _LAG_POLL_INTERVAL_S,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    continue
+            # DB-24483 — liveness gate. YBA replays its last sample for
+            # ~5min after the primary dies (DB-24852-adjacent). A single
+            # ``lag=0`` is not enough to tell "standby really caught up"
+            # from "same stale replay reused". Require N distinct
+            # ``sample_ts`` values at ≤ threshold before flipping.
+            if (
+                sample_ts is not None
+                and barrier_ts > 0
+                and sample_ts <= barrier_ts
+            ):
+                # A point collected before the barrier cannot show that
+                # writes acknowledged before the barrier have arrived
+                # (stress phase2_claim: converged on such a sample while
+                # B was still missing batches). Applies at any
+                # confirmation count: with one, it is the only guard.
+                logger.info(
+                    "lag wait: lag=%.1fms sample at %.3f predates the "
+                    "barrier %.3f — not counting (confirmations=%d/%d, "
+                    "elapsed=%.1fs / %ds)",
+                    lag_ms, sample_ts, barrier_ts, confirmed_count,
+                    required_samples, elapsed, timeout_s,
+                )
+            elif report is not None and (report["stale"] or not report["leader_reported"]):
+                # A producer whose tablets lost their leaders reports 0
+                # from the nodes still up, and nothing from the nodes
+                # down (stress phase2_claim, a_majority_down: converged
+                # on lag=0 two seconds after the barrier while a batch
+                # could not leave A). Neither is a caught-up universe.
+                why = (
+                    f"node(s) {','.join(report['stale'])} stopped reporting"
+                    if report["stale"] else "no tablet leader reporting (all 0)"
+                )
+                logger.info(
+                    "lag wait: lag=%.1fms but %s — not counting "
+                    "(confirmations=%d/%d, elapsed=%.1fs / %ds)",
+                    lag_ms, why, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
+                confirmed_count = 0
+                last_counted_sample_ts = None
+            elif outgoing is not None and _all_nodes_down(outgoing):
+                # Every outgoing node refused the driver, so no producer
+                # tserver can have produced this sample: YBA keeps
+                # returning the last value scraped before they went down
+                # (stress phase2_claim, region_outage_with_yba and
+                # a_outage_into_limited_b: all three A nodes at 1us ten
+                # seconds after their processes were stopped, batches
+                # committed before the stop still missing on B).
+                logger.info(
+                    "lag wait: lag=%.1fms but every node of the outgoing "
+                    "universe is down — not counting (confirmations=%d/%d, "
+                    "elapsed=%.1fs / %ds)",
+                    lag_ms, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
+                confirmed_count = 0
+                last_counted_sample_ts = None
+            elif sample_ts is not None and sample_ts == last_counted_sample_ts:
+                logger.info(
+                    "lag wait: lag=%.1fms ≤ threshold but sample_ts %.3f "
+                    "unchanged since last pass — YBA replay suspected, "
+                    "not counting (confirmations=%d/%d, elapsed=%.1fs / %ds)",
+                    lag_ms, sample_ts, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
             else:
-                age_str = ""
-            logger.warning(
-                "lag wait converged in %.1fs (lag=%.1fms ≤ threshold=%.1fms"
-                "%s) — switching now",
-                elapsed, lag_ms, threshold_ms, age_str,
-            )
-            return
+                confirmed_count += 1
+                last_counted_sample_ts = sample_ts
+                logger.info(
+                    "lag wait: lag=%.1fms ≤ threshold=%.1fms counted "
+                    "(confirmations=%d/%d, elapsed=%.1fs / %ds)",
+                    lag_ms, threshold_ms, confirmed_count, required_samples,
+                    elapsed, timeout_s,
+                )
+                if confirmed_count >= required_samples:
+                    # Log sample age at convergence so a post-mortem
+                    # can tell whether we trusted a fresh reading.
+                    if sample_ts is not None:
+                        age_str = (
+                            f", sample_age="
+                            f"{max(0.0, time.time() - sample_ts):.1f}s"
+                        )
+                    else:
+                        age_str = ""
+                    logger.warning(
+                        "lag wait converged in %.1fs "
+                        "(lag=%.1fms ≤ threshold=%.1fms, confirmations="
+                        "%d/%d%s) — switching now",
+                        elapsed, lag_ms, threshold_ms,
+                        confirmed_count, required_samples, age_str,
+                    )
+                    return
+        else:
+            # Lag back above threshold (or we have no data this tick).
+            # Reset the liveness counter so a next convergence has to
+            # earn the full N consecutive passes.
+            if confirmed_count > 0:
+                logger.info(
+                    "lag wait: liveness reset — lag no longer ≤ threshold "
+                    "(had confirmed %d/%d)",
+                    confirmed_count, required_samples,
+                )
+            confirmed_count = 0
+            last_counted_sample_ts = None
 
         # Poll again in ~1s. If the remaining budget is smaller, sleep
         # only that much so we don't overshoot the deadline.

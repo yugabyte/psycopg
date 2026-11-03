@@ -19,6 +19,11 @@ How this CB works (the tracker-table strategy):
      consecutive failures, return UNHEALTHY.
   5. Reset the failure counter after the same number of consecutive
      successes (symmetric hysteresis).
+  6. In the same tick, read ``pg_db_role_setting`` (a shared catalog, so
+     the control database can see it) for the application's databases.
+     One set to ``default_transaction_read_only`` rejects every app
+     write while the tracker table, in its own database, still works;
+     that counts as a failure too.
 
 Usage:
 
@@ -54,7 +59,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from psycopg import errors as e
 from psycopg.yb.health import HealthResult
@@ -93,6 +98,31 @@ _HEALTH_CHECK_SQL = (
 # 10 seconds: ~3× margin over the election window while keeping
 # detection under ~10s.
 _UPDATE_STATEMENT_TIMEOUT_MS = 10000
+
+# Database-level settings (setrole = 0) of the given databases.
+_DB_SETTINGS_SQL = (
+    "SELECT d.datname, s.setconfig FROM pg_db_role_setting s "
+    "JOIN pg_database d ON d.oid = s.setdatabase "
+    "WHERE s.setrole = 0 AND d.datname = ANY(%s)"
+)
+
+
+def _is_true_setting(value: str) -> bool:
+    """PostgreSQL boolean GUC spelling: on, true, yes, 1 and unique
+    prefixes of true / yes."""
+    v = value.strip().strip("'\"").lower()
+    return v in ("on", "1") or (v != "" and ("true".startswith(v) or "yes".startswith(v)))
+
+
+def _read_only_dbs(rows) -> list[str]:
+    out = []
+    for datname, setconfig in rows:
+        for item in setconfig or ():
+            name, _, value = item.partition("=")
+            if name.strip().lower() == "default_transaction_read_only" and _is_true_setting(value):
+                out.append(datname)
+                break
+    return sorted(out)
 
 
 def _insert_sql(row_ids: list[int]) -> str:
@@ -180,6 +210,7 @@ class TrackerTableCircuitBreaker:
         which_cluster: str = "primary",
         tracker_table_tablets: int = 9,
         max_update_failures_allowed: int = 0,
+        app_databases: "Iterable[str] | None" = None,
     ) -> None:
         if which_cluster not in ("primary", "secondary"):
             raise ValueError(
@@ -189,6 +220,9 @@ class TrackerTableCircuitBreaker:
         self.which_cluster = which_cluster
         self.tracker_table_tablets = max(1, tracker_table_tablets)
         self.max_update_failures_allowed = max(0, max_update_failures_allowed)
+        # Databases checked for default_transaction_read_only. None: the
+        # ones the application has connected to (from the registry).
+        self.app_databases = None if app_databases is None else set(app_databases)
         # Both counters are reset on the OPPOSITE outcome — see _record_*.
         self._consecutive_failures = 0
         self._consecutive_successes = 0
@@ -280,11 +314,34 @@ class TrackerTableCircuitBreaker:
                         "(%s_uuid=%s)", self.which_cluster, state.uuid,
                     )
                     self._seed_rows(conn)
+                read_only = self._read_only_app_dbs(group, conn, cur)
             conn.commit()
         except Exception as exc:
             return self._handle_exception(group, conn, exc)
 
+        if read_only:
+            return self._record_failure(
+                f"application database(s) {', '.join(read_only)} set to "
+                "default_transaction_read_only: every app write is rejected"
+            )
         return self._record_success()
+
+    def _read_only_app_dbs(self, group: "FailoverGroup", conn, cur) -> list[str]:
+        if self.app_databases is not None:
+            dbnames = set(self.app_databases)
+        else:
+            from psycopg.yb.registry import ClusterRegistry
+            registry = ClusterRegistry.instance()
+            dbnames = set()
+            for side in (group.primary, group.secondary):
+                if side is not None:
+                    dbnames |= registry.dbnames_for(side.uuid)
+        # The tracker's own database is covered by the tracker query.
+        dbnames.discard(conn.info.dbname)
+        if not dbnames:
+            return []
+        cur.execute(_DB_SETTINGS_SQL, (sorted(dbnames),))
+        return _read_only_dbs(cur.fetchall())
 
     # ------------------------------------------------------------- table setup
 

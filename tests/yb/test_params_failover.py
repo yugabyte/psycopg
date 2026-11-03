@@ -289,7 +289,7 @@ def test_yba_params_default_lag_wait_disabled():
     assert yb.yba_api_token == ""
     assert yb.replication_name == ""
     assert yb.threshold_replication_lag_ms == 0
-    assert yb.lag_wait_timeout_s == 30
+    assert yb.lag_wait_timeout_s == 30       # DEFAULT_LAG_WAIT_TIMEOUT_SEC
 
 
 def test_yba_params_full_camel_case():
@@ -321,6 +321,10 @@ def test_yba_params_snake_and_kebab_forms():
         "yb_failover_yba_api_token=t "
         "yb.failover.replication_name=repname "
         "yb-failover-threshold-replication-lag-ms=100 "
+        # DB-24483 — opt out of the freshness gate so the 15s wait fits
+        # under the floor. This test exercises key normalisation, not
+        # Phase 2 semantics.
+        "yb.failover.lag_freshness_secs=0 "
         "yb.failover.lag_wait_timeout_secs=15",
         {},
     )
@@ -768,3 +772,80 @@ def test_failback_params_stripped_from_cleaned_conninfo():
     assert "failback" not in cleaned.lower()
     assert "rep-b-to-a" not in cleaned
 
+
+
+# ------------------------------------------------------- xCluster socket defaults
+
+def test_xcluster_socket_defaults_fill_missing_keys():
+    """hung_workers (stress 64a57bb5 cycle 1, nat_idle_drop): with no
+    keepalives or tcp_user_timeout a NAT-dropped socket blocked its owner
+    until the workload stopped."""
+    from psycopg.yb.params import (
+        XCLUSTER_SOCKET_DEFAULTS, with_xcluster_socket_defaults,
+    )
+
+    assert with_xcluster_socket_defaults("host=a", {}) == XCLUSTER_SOCKET_DEFAULTS
+
+
+def test_xcluster_socket_defaults_never_override_user_values():
+    from psycopg.yb.params import with_xcluster_socket_defaults
+
+    out = with_xcluster_socket_defaults(
+        "host=a keepalives_idle=30", {"tcp_user_timeout": 0},
+    )
+
+    assert "keepalives_idle" not in out          # conninfo value wins
+    assert out["tcp_user_timeout"] == 0          # kwarg value wins
+    assert out["keepalives_count"] == "3"
+
+
+# ============================================================
+# yb.failback.onPhase2Timeout — the policy only affects failback, so it
+# exists only under the failback namespace.
+# ============================================================
+
+def test_failback_on_phase2_timeout_default_proceed():
+    yb, _, _ = extract_yb_params(_dsn_with_secondary(), {})
+    assert yb.failback_on_phase2_timeout == "proceed"
+
+
+@pytest.mark.parametrize("key_form", [
+    "yb.failback.onPhase2Timeout",
+    "yb_failback_on_phase2_timeout",
+    "yb-failback-on-phase2-timeout",
+    "yb.failback.onphase2timeout",
+    "YB.FAILBACK.ONPHASE2TIMEOUT",
+])
+def test_failback_on_phase2_timeout_key_forms(key_form):
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=fail"), {})
+    assert yb.failback_on_phase2_timeout == "fail"
+    assert "phase2" not in cleaned.lower()
+
+
+def test_failback_on_phase2_timeout_from_kwargs():
+    yb, _, cleaned_kwargs = extract_yb_params(
+        _dsn_with_secondary(), {"yb_failback_on_phase2_timeout": "fail"},
+    )
+    assert yb.failback_on_phase2_timeout == "fail"
+    assert "yb_failback_on_phase2_timeout" not in cleaned_kwargs
+
+
+def test_failback_on_phase2_timeout_invalid_raises():
+    with pytest.raises(ValueError, match="yb.failback.onPhase2Timeout"):
+        extract_yb_params(_dsn_with_secondary("yb.failback.onPhase2Timeout=abort"), {})
+
+
+@pytest.mark.parametrize("key_form", [
+    "yb.failover.onPhase2Timeout",
+    "yb_failover_on_phase2_timeout",
+])
+def test_failover_on_phase2_timeout_is_not_a_driver_key(key_form):
+    """No yb.failover.* alias: the key is left in the conninfo like any
+    other unrecognised yb.failover.* key (libpq then rejects it)."""
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=fail"), {})
+    _, unknown_cleaned, _ = extract_yb_params(
+        _dsn_with_secondary("yb.failover.noSuchKnob=fail"), {},
+    )
+    assert yb.failback_on_phase2_timeout == "proceed"
+    assert f"{key_form}=fail" in cleaned
+    assert "yb.failover.noSuchKnob=fail" in unknown_cleaned

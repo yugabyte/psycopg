@@ -168,6 +168,11 @@ class AsyncConnection(BaseConnection[Row]):
                 dispatch_generation as _dispatch_generation,
                 wait_for_dispatch_async as _wait_for_dispatch_async,
             )
+            from .yb.params import with_xcluster_socket_defaults
+
+            cleaned_kwargs = with_xcluster_socket_defaults(
+                cleaned_conninfo, cleaned_kwargs
+            )
             failover_group = await registry.aget_or_bootstrap_failover_group(
                 yb_params, cleaned_conninfo, cleaned_kwargs
             )
@@ -249,6 +254,7 @@ class AsyncConnection(BaseConnection[Row]):
 
             # Per-host kwargs override the multi-host list in the conninfo.
             per_host_kwargs = {**cleaned_kwargs, "host": node.host, "port": node.port}
+            attempt_started = monotonic()
             try:
                 conn = await cls._aconnect_plain(
                     cleaned_conninfo,
@@ -270,7 +276,12 @@ class AsyncConnection(BaseConnection[Row]):
                     node.host, state.uuid, exc,
                 )
                 registry.decrement(state.uuid, node.host)
-                registry.mark_failed(state.uuid, node.host)
+                registry.mark_failed(
+                    state.uuid,
+                    node.host,
+                    timeout="timeout expired" in str(exc),
+                    attempt_started=attempt_started,
+                )
                 attempted.add(node.host)
                 last_err = exc
                 continue
@@ -287,6 +298,7 @@ class AsyncConnection(BaseConnection[Row]):
                 registry.decrement(state.uuid, node.host)
                 raise
 
+            registry.mark_up(state.uuid, node.host)
             conn._yb_uuid = state.uuid
             conn._yb_host = node.host
             # `active_cluster` is "primary"/"secondary" iff we routed via a

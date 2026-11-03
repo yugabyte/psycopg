@@ -155,31 +155,27 @@ def test_signal_strips_whitespace():
 
 # ------------------------------------------------------------ SELECT filters signal row
 
-def test_select_filters_by_group_id_and_which_cluster():
-    """The SELECT must bind BOTH the group_id (primary.uuid) and the
-    which_cluster for the CB's own slot. Otherwise the signal written
-    for one slot would be observed by both, so e.g. a single
-    'primary UNHEALTHY' signal would also trip the secondary slot and
-    produce NoViableClusterError on the next connect. agent-K PR #12:33.
-    """
+def test_select_filters_by_group_id():
+    """The SELECT binds the group_id (primary.uuid). Per-slot isolation
+    is provided by each CB reading its own cluster's ``control_sync``,
+    not by a row-level filter."""
     conn = _Conn(next_row=None)
     group = _make_group(primary_conn=conn)
     cb = ExternalSignalCircuitBreaker(which_cluster="primary")
     cb.check(group)
-    # Find the SELECT execution and verify its args.
     selects = [
         (sql, args) for sql, args in conn.executed if sql.startswith("SELECT")
     ]
     assert len(selects) == 1
     sql, args = selects[0]
-    assert "which_cluster = %s" in sql
+    assert "which_cluster" not in sql
     # The mock records ``*args`` so the inner tuple is the one passed
     # to ``cur.execute(SQL, params)``.
-    assert args == ((group.primary.uuid, "primary"),)
+    assert args == ((group.primary.uuid,),)
 
 
-def test_secondary_slot_filters_by_secondary():
-    """Same SELECT path from the secondary CB binds ``which_cluster='secondary'``."""
+def test_secondary_slot_reads_from_secondary_control_sync():
+    """Secondary CB reads from the secondary cluster's control conn."""
     conn = _Conn(next_row=None)
     group = _make_group(secondary_conn=conn)
     cb = ExternalSignalCircuitBreaker(which_cluster="secondary")
@@ -189,7 +185,7 @@ def test_secondary_slot_filters_by_secondary():
     ]
     assert len(selects) == 1
     _, args = selects[0]
-    assert args == ((group.primary.uuid, "secondary"),)
+    assert args == ((group.primary.uuid,),)
 
 
 # ------------------------------------------------------------ error paths
@@ -215,14 +211,13 @@ def test_missing_table_creates_it_and_returns_healthy():
     #   3. Handler recovers: rollback, mark table setup pending, re-run _setup_table
     conn = _Conn(next_row=None)
 
-    # Set the exception to fire on the SELECT (second execute).
-    # We do this by patching execute directly to track which call it is.
     original_execute = _Cursor.execute
-    call_count = {"n": 0}
 
     def sequenced_execute(self, sql, *args, **kw):
-        call_count["n"] += 1
-        if call_count["n"] == 2 and sql.startswith("SELECT"):
+        if sql.startswith("SELECT") and not getattr(
+            sequenced_execute, "_select_tripped", False
+        ):
+            sequenced_execute._select_tripped = True
             raise _undefined_table_exc()
         original_execute(self, sql, *args, **kw)
 
