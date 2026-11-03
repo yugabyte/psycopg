@@ -156,6 +156,78 @@ def test_reset_failover_group_flips_to_healthy(fresh_registry, fake_state):
     assert group.primary_status == HealthResult.HEALTHY
 
 
+
+class _ResetConn:
+    """Tracked conn stand-in: readable transaction status and close()."""
+
+    def __init__(self) -> None:
+        from psycopg.pq import TransactionStatus
+        self.info = type("I", (), {"transaction_status": TransactionStatus.IDLE})()
+        self.closed = False
+
+    def close(self) -> None:
+        from psycopg.pq import TransactionStatus
+        self.closed = True
+        self.info.transaction_status = TransactionStatus.UNKNOWN
+
+
+def test_reset_failover_group_runs_the_failback_drain(fresh_registry, fake_state):
+    """Review #10 (Amogh): an operator failback goes through the same
+    drain as an automatic one: barrier, the secondary's conns closed,
+    then the flip. autoFailbackEnabled=false does not block it."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group.auto_failback_enabled = False
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    conn_on_b = _ResetConn()
+    s.tracked_conns.add(conn_on_b)
+    generation = group.barrier_generation
+
+    assert fresh_registry.reset_failover_group("P") is True
+
+    assert group.primary_status == HealthResult.HEALTHY
+    assert group.barrier_generation == generation + 1
+    assert conn_on_b.closed is True
+    assert group.dispatch_paused is False
+    assert group.drain_in_progress is False
+
+
+def test_reset_failover_group_refused_while_a_drain_runs(fresh_registry, fake_state):
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    group.drain_in_progress = True
+
+    assert fresh_registry.reset_failover_group("P") is False
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_reset_failover_group_honours_fail_on_lag_timeout(fresh_registry, fake_state):
+    """Same Phase 2 rules as an automatic failback: under
+    onPhase2Timeout=fail an unconfirmed lag keeps routing on the
+    secondary."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+
+    class _Behind:
+        def get_committed_lag_sample(self, uuid):
+            return (5000.0, time.time())
+
+    group.yba_client = _Behind()
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+    group.failback_lag_wait_timeout_s = 1
+    group.failback_on_phase2_timeout = "fail"
+
+    assert fresh_registry.reset_failover_group("P") is True
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
+
 def test_get_failover_status_returns_state_and_timestamp(fresh_registry, fake_state):
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
