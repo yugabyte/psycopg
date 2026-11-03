@@ -641,6 +641,11 @@ class FailoverGroup:
     # drain sequence flips it back to False. Existing conns are NOT
     # affected — only new opens gate on this. Written under ``lock``.
     dispatch_paused: bool = False
+    # True from the moment a probe claims a transition until its
+    # trigger_drain returns. Checked and set under ``lock`` in one step,
+    # so two probes can't both start a drain (dispatch_paused is set
+    # only later, inside the drain). Written under ``lock``.
+    drain_in_progress: bool = False
     # Condition bound to ``lock`` for pause/resume notify. Constructed in
     # ``__post_init__`` so it wraps whatever lock was passed in (or
     # created by default). Used by sync ``wait_for_dispatch`` callers.

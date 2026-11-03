@@ -216,3 +216,41 @@ def test_stopping_a_probe_halts_only_that_probe(fake_state, monkeypatch):
     assert tick_counts["S"] > snapshot["S"]
     # Primary hasn't advanced.
     assert tick_counts["P"] == snapshot["P"]
+
+
+def test_two_probes_cannot_start_drains_at_once(fake_state, monkeypatch):
+    """Review #9 (Amogh): the "drain already running" check used to be
+    separate from the point where the drain paused dispatch, so both
+    probes could pass it together. While the first probe's drain is
+    running, the second probe's transition is deferred."""
+    import psycopg.yb.drain as drain_mod
+
+    group = _make_group(fake_state)
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def fake_trigger_drain(group, which_cluster, new_status, drain_timeout_s):
+        calls.append(which_cluster)
+        entered.set()
+        release.wait(5)
+
+    monkeypatch.setattr(drain_mod, "trigger_drain", fake_trigger_drain)
+    p_probe = HealthProbe(group, interval_s=60, which_cluster="primary")
+    s_probe = HealthProbe(group, interval_s=60, which_cluster="secondary")
+
+    t = threading.Thread(
+        target=p_probe._maybe_apply, args=(HealthResult.UNHEALTHY,),
+    )
+    t.start()
+    try:
+        assert entered.wait(5)
+        assert group.dispatch_paused is False   # the old check would pass
+        s_probe._maybe_apply(HealthResult.UNHEALTHY)
+        assert calls == ["primary"]
+    finally:
+        release.set()
+        t.join(5)
+    assert group.drain_in_progress is False
+    s_probe._maybe_apply(HealthResult.UNHEALTHY)
+    assert calls == ["primary", "secondary"]
