@@ -908,7 +908,8 @@ class FailoverGroup:
           * threading.Lock + Condition (parent's hold-state is nonsense in
             the child, so a locked lock in the parent at fork time becomes
             a locked-but-ownerless lock in the child → deadlock)
-          * dispatch_paused flag (child doesn't inherit parent's drain)
+          * dispatch_paused and drain_in_progress flags (child doesn't
+            inherit parent's drain)
           * tracked_conns (parent's conns, not ours)
           * per-host ``connection_count`` (zeroed: counts parent's conns)
           * control_sync / control_async (fork-shared sockets)
@@ -931,6 +932,9 @@ class FailoverGroup:
         self.lock = threading.Lock()
         self.dispatch_paused_condition = threading.Condition(self.lock)
         self.dispatch_paused = False
+        # Review #9 (Amogh): the drain that set it runs in the parent, so
+        # nothing in the child would ever clear it.
+        self.drain_in_progress = False
         self.async_dispatch_waiters = []
         # DB-24483 — zero the barrier so the child's first drain stamps
         # its own `time.time()` rather than reusing the parent's. The
@@ -1953,6 +1957,11 @@ class ClusterRegistry:
         ``onPhase2Timeout=fail`` (``get_failover_status`` shows the
         result). Returns False if no group exists for ``primary_uuid``, or
         if a drain is already running (call again once it has finished).
+
+        Blocks the calling thread for the whole drain and lag wait, up to
+        ``drainTimeoutSecs`` + ``lagWaitTimeoutSecs``. From async code, run
+        it off the event loop:
+        ``await asyncio.to_thread(registry.reset_failover_group, uuid)``.
         """
         from .drain import trigger_drain
         from .health import HealthResult
