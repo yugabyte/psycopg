@@ -153,9 +153,15 @@ def test_signal_strips_whitespace():
     assert cb.check(group) == HealthResult.UNHEALTHY
 
 
-# ------------------------------------------------------------ SELECT uses group_id
+# ------------------------------------------------------------ SELECT filters signal row
 
-def test_select_uses_primary_uuid_as_group_id():
+def test_select_filters_by_group_id_and_which_cluster():
+    """The SELECT must bind BOTH the group_id (primary.uuid) and the
+    which_cluster for the CB's own slot. Otherwise the signal written
+    for one slot would be observed by both, so e.g. a single
+    'primary UNHEALTHY' signal would also trip the secondary slot and
+    produce NoViableClusterError on the next connect. agent-K PR #12:33.
+    """
     conn = _Conn(next_row=None)
     group = _make_group(primary_conn=conn)
     cb = ExternalSignalCircuitBreaker(which_cluster="primary")
@@ -165,10 +171,25 @@ def test_select_uses_primary_uuid_as_group_id():
         (sql, args) for sql, args in conn.executed if sql.startswith("SELECT")
     ]
     assert len(selects) == 1
+    sql, args = selects[0]
+    assert "which_cluster = %s" in sql
+    # The mock records ``*args`` so the inner tuple is the one passed
+    # to ``cur.execute(SQL, params)``.
+    assert args == ((group.primary.uuid, "primary"),)
+
+
+def test_secondary_slot_filters_by_secondary():
+    """Same SELECT path from the secondary CB binds ``which_cluster='secondary'``."""
+    conn = _Conn(next_row=None)
+    group = _make_group(secondary_conn=conn)
+    cb = ExternalSignalCircuitBreaker(which_cluster="secondary")
+    cb.check(group)
+    selects = [
+        (sql, args) for sql, args in conn.executed if sql.startswith("SELECT")
+    ]
+    assert len(selects) == 1
     _, args = selects[0]
-    # The CB calls ``cur.execute(SQL, (uuid,))``; our mock records
-    # ``*args`` so what we see here is ``((uuid,),)``.
-    assert args == ((group.primary.uuid,),)
+    assert args == ((group.primary.uuid, "secondary"),)
 
 
 # ------------------------------------------------------------ error paths

@@ -116,6 +116,14 @@ class ClusterState:
     control_async: "AsyncConnection | None" = None
     bootstrap_conninfo: str = ""
     bootstrap_kwargs: dict = field(default_factory=dict)
+    # agent-K PR #12:46. Last exception observed while opening a control
+    # connection, so CB callbacks can distinguish "control conn failed to
+    # open due to misconfig (auth / missing DB / TLS)" from "cluster
+    # genuinely unreachable". ``_ensure_control_sync`` / its async
+    # sibling stamp this; CBs read it in their ``conn is None`` branch
+    # and apply the same SQLSTATE filter they already use in
+    # ``_handle_exception``. Cleared on a successful connect.
+    last_control_connect_error: "Exception | None" = None
     # Weakref set of direct-connect conns opened against this cluster
     # (Phase D — see design doc §3.1). Populated by the dispatcher on
     # every successful ``psycopg.connect(dsn)``; pool-borrowed conns are
@@ -1086,6 +1094,7 @@ class ClusterRegistry:
             "control conn re-open: trying %d candidate(s) for uuid=%s",
             len(candidates), state.uuid,
         )
+        last_exc: "Exception | None" = None
         for node in candidates:
             per_host = {
                 **state.bootstrap_kwargs,
@@ -1098,6 +1107,7 @@ class ClusterRegistry:
             except Exception as exc:
                 logger.log(TRACE, "control conn re-open: %s refused (%s)",
                            node.host, exc)
+                last_exc = exc
                 # We just discovered this host refuses connections. Mark it
                 # failed so the dispatcher's next pick doesn't waste a real
                 # connect attempt on it.
@@ -1106,6 +1116,7 @@ class ClusterRegistry:
             with state.lock:
                 if state.control_sync is None:
                     state.control_sync = conn
+                    state.last_control_connect_error = None  # clear on success
                     logger.info("control conn re-opened on %s for uuid=%s",
                                 node.host, state.uuid)
                     return conn
@@ -1116,6 +1127,11 @@ class ClusterRegistry:
                 pass
             logger.debug("control conn re-open race lost; closing our duplicate")
             return winner
+        # Every candidate refused — stamp the last error so CB callbacks
+        # can distinguish misconfig (auth / missing DB / TLS) from a real
+        # outage before counting this toward the failure threshold.
+        with state.lock:
+            state.last_control_connect_error = last_exc
         logger.warning(
             "control conn re-open: every non-down candidate refused for uuid=%s; "
             "smart driver going blind until next refresh attempt", state.uuid,
@@ -1156,6 +1172,7 @@ class ClusterRegistry:
             "control conn re-open (async): trying %d non-down candidate(s) for uuid=%s",
             len(candidates), state.uuid,
         )
+        last_exc: "Exception | None" = None
         for node in candidates:
             per_host = {
                 **state.bootstrap_kwargs,
@@ -1170,6 +1187,7 @@ class ClusterRegistry:
             except Exception as exc:
                 logger.log(TRACE, "control conn re-open (async): %s refused (%s)",
                            node.host, exc)
+                last_exc = exc
                 # Refusing host → mark it failed so the dispatcher's next
                 # pick skips it for the TTL window.
                 self.mark_failed(state.uuid, node.host)
@@ -1177,6 +1195,7 @@ class ClusterRegistry:
             with state.lock:
                 if state.control_async is None:
                     state.control_async = conn
+                    state.last_control_connect_error = None  # clear on success
                     logger.info("control conn re-opened (async) on %s for uuid=%s",
                                 node.host, state.uuid)
                     return conn
@@ -1189,6 +1208,8 @@ class ClusterRegistry:
                 "control conn re-open (async) race lost; closing our duplicate"
             )
             return winner
+        with state.lock:
+            state.last_control_connect_error = last_exc
         logger.warning(
             "control conn re-open (async): every non-down candidate refused for "
             "uuid=%s; smart driver going blind until next refresh attempt",
