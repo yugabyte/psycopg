@@ -52,6 +52,10 @@ _CONNECT_TIMEOUT_STRIKES = 3
 # HealthProbe itself keeps its 1 ms floor so unit tests can tick fast.
 _MIN_PROBE_INTERVAL_S = 1
 
+# How often an async bootstrap re-tries the per-key threading.Lock held by
+# another thread or a sync caller (see aget_or_bootstrap_failover_group).
+_ASYNC_BOOTSTRAP_LOCK_POLL_S = 0.01
+
 
 # ------------------------------------------------------------------- fork safety
 #
@@ -1677,13 +1681,24 @@ class ClusterRegistry:
         primary_key = ClusterKey.from_params(
             self._param_dict_for_key(conninfo, kwargs)
         )
-        # agent-K PR #17:G7 — per-key async lock, same purpose as sync
-        # side. See ``_async_bootstrap_lock_for``.
+        # agent-K PR #17:G7 — the per-(key, loop) asyncio.Lock queues
+        # coroutines on this loop; the per-key threading.Lock it then
+        # takes is the one the sync path uses, so loops on other threads
+        # and sync callers are excluded too. It is polled rather than
+        # acquired in a worker thread: a cancelled waiter must not leave
+        # a thread that acquires the lock later and never releases it.
         async with self._async_bootstrap_lock_for(primary_key):  # type: ignore[attr-defined]
-            return await self._ado_bootstrap_failover_group(
-                yb_params, conninfo, kwargs, primary_key, HealthResult,
-                strict_param_check=strict_param_check,
-            )
+            import asyncio
+            lock = self._bootstrap_lock_for(primary_key)
+            while not lock.acquire(blocking=False):
+                await asyncio.sleep(_ASYNC_BOOTSTRAP_LOCK_POLL_S)
+            try:
+                return await self._ado_bootstrap_failover_group(
+                    yb_params, conninfo, kwargs, primary_key, HealthResult,
+                    strict_param_check=strict_param_check,
+                )
+            finally:
+                lock.release()
 
     async def _ado_bootstrap_failover_group(
         self, yb_params, conninfo, kwargs, primary_key, HealthResult,
@@ -1820,7 +1835,9 @@ class ClusterRegistry:
             yb_params.cooldown_s,
         )
 
-        self._wire_yba_lag_phase(group, yb_params)
+        # YBA HTTP calls (session info, universe walk): off the event loop.
+        import asyncio
+        await asyncio.to_thread(self._wire_yba_lag_phase, group, yb_params)
         self._start_probe(group, yb_params.refresh_interval_s, yb_params.check_timeout_s, yb_params.drain_timeout_s)
         return group
 
@@ -2621,6 +2638,8 @@ class ClusterRegistry:
             self._clusters.clear()
             self._key_to_uuid.clear()
             groups = self._drain_failover_groups()
+        with self._bootstrap_locks_mutex:
+            self._async_bootstrap_locks = {}
         # Probes stopped OUTSIDE the registry lock (see _stop_probes_best_effort).
         self._stop_probes_best_effort(groups)
         for state in clusters:
@@ -2648,6 +2667,8 @@ class ClusterRegistry:
             self._clusters.clear()
             self._key_to_uuid.clear()
             groups = self._drain_failover_groups()
+        with self._bootstrap_locks_mutex:
+            self._async_bootstrap_locks = {}
         self._stop_probes_best_effort(groups)
         for state in clusters:
             if state.control_sync is not None:

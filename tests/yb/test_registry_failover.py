@@ -26,7 +26,7 @@ from psycopg.yb.health import (
 )
 from psycopg.yb.health_probe import HealthProbe
 from psycopg.yb.params import YBParams
-from psycopg.yb.registry import ClusterRegistry, ClusterState, FailoverGroup
+from psycopg.yb.registry import ClusterKey, ClusterRegistry, ClusterState, FailoverGroup
 
 
 # ----------------------------------------------------------------- helpers
@@ -570,6 +570,80 @@ def test_aget_or_bootstrap_failover_group_across_event_loops(fresh_registry, mon
 
     assert asyncio.run(main()) == [sentinel] * 3
     assert asyncio.run(main()) == [sentinel] * 3
+
+
+def test_async_bootstraps_on_two_threads_never_overlap(fresh_registry, monkeypatch):
+    """Review #17 (Amogh): one asyncio.Lock per (key, loop) let loops on
+    two threads bootstrap the same group at once, the race the lock exists
+    to prevent. The per-key threading.Lock now excludes them."""
+    import asyncio
+
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+
+    async def fake_ado(*a, **kw):
+        nonlocal active, max_active
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+        await asyncio.sleep(0.05)
+        with counter_lock:
+            active -= 1
+        return "group"
+
+    monkeypatch.setattr(fresh_registry, "_ado_bootstrap_failover_group", fake_ado)
+    params = YBParams()
+
+    def run():
+        async def main():
+            await asyncio.gather(*(
+                fresh_registry.aget_or_bootstrap_failover_group(params, "host=h1", {})
+                for _ in range(3)
+            ))
+        asyncio.run(main())
+
+    threads = [threading.Thread(target=run) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert max_active == 1
+
+
+def test_async_bootstrap_waits_for_a_sync_bootstrap(fresh_registry, monkeypatch):
+    """A sync bootstrap of the same cluster on another thread holds the
+    async one off until it finishes."""
+    import asyncio
+
+    key = ClusterKey.from_params(fresh_registry._param_dict_for_key("host=h1", {}))
+    lock = fresh_registry._bootstrap_lock_for(key)
+    entered = []
+
+    async def fake_ado(*a, **kw):
+        entered.append(time.monotonic())
+        return "group"
+
+    monkeypatch.setattr(fresh_registry, "_ado_bootstrap_failover_group", fake_ado)
+    lock.acquire()
+    released_at = []
+
+    def release_later():
+        time.sleep(0.2)
+        released_at.append(time.monotonic())
+        lock.release()
+
+    threading.Thread(target=release_later).start()
+    asyncio.run(fresh_registry.aget_or_bootstrap_failover_group(YBParams(), "host=h1", {}))
+    assert entered and released_at and entered[0] >= released_at[0]
+    assert not lock.locked()
+
+
+def test_clear_resets_async_bootstrap_locks(fresh_registry):
+    _contend(fresh_registry, "k1")
+    assert fresh_registry._async_bootstrap_locks
+    fresh_registry.clear()
+    assert fresh_registry._async_bootstrap_locks == {}
 
 
 # ----------------------------------------------------------------- probe interval floor
