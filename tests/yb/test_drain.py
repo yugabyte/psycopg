@@ -570,3 +570,37 @@ def test_recovery_from_no_viable_skips_phase2(fake_state):
     trigger_drain(group, "secondary", HealthResult.HEALTHY, drain_timeout_s=0)
 
     assert group.secondary_status == HealthResult.HEALTHY
+
+
+# ------------------------------------------------------- close fence
+
+def test_flip_waits_close_fence_after_closing_outgoing_conns(fake_state, monkeypatch):
+    """two_leaders (a7932f37 cycle 1): the old leader's session was closed
+    0.24s before the new leader acquired the advisory lock on the other
+    universe, but its owner only noticed on its next 1s heartbeat. The
+    drain holds dispatch for the close fence after closing conns."""
+    from psycopg.yb import drain as drain_mod
+    monkeypatch.setattr(drain_mod, "_CLOSE_FENCE_S", 1.0)
+    group = _make_group(fake_state)
+    conn = _FakeConn(TransactionStatus.IDLE)   # keep a ref: tracked_conns is weak
+    group.primary.tracked_conns.add(conn)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    assert conn.closed is True
+    assert elapsed >= 0.95
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.dispatch_paused is False
+
+
+def test_flip_skips_close_fence_when_nothing_was_closed(fake_state, monkeypatch):
+    from psycopg.yb import drain as drain_mod
+    monkeypatch.setattr(drain_mod, "_CLOSE_FENCE_S", 1.0)
+    group = _make_group(fake_state)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert time.monotonic() - t0 < 0.5
