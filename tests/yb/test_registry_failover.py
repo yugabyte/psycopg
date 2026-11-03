@@ -634,7 +634,9 @@ def test_async_bootstrap_waits_for_a_sync_bootstrap(fresh_registry, monkeypatch)
         lock.release()
 
     threading.Thread(target=release_later).start()
-    asyncio.run(fresh_registry.aget_or_bootstrap_failover_group(YBParams(), "host=h1", {}))
+    asyncio.run(
+        fresh_registry.aget_or_bootstrap_failover_group(YBParams(), "host=h1", {})
+    )
     assert entered and released_at and entered[0] >= released_at[0]
     assert not lock.locked()
 

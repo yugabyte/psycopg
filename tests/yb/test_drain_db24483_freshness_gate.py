@@ -389,7 +389,7 @@ def test_bootstrap_floor_warning_names_the_budget_when_derived(
         {},
     )
     assert yb.lag_wait_timeout_s == 30
-    msgs = [r.getMessage() for r in caplog.records if "below the floor" in r.getMessage()]
+    msgs = [m for m in (r.getMessage() for r in caplog.records) if "below the floor" in m]
     assert len(msgs) == 1
     assert "yb.failover.globalTimeBudgetSecs=50" in msgs[0]
     assert "lagWaitTimeoutSecs=30" not in msgs[0]
