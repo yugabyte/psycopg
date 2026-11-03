@@ -367,6 +367,49 @@ def test_bootstrap_warns_when_timeout_below_floor(caplog):
     ), caplog.records
 
 
+@pytest.fixture(autouse=True)
+def fresh_floor_warnings(monkeypatch):
+    # Floor warnings are logged once per process; each test starts clean.
+    from psycopg.yb import params
+    monkeypatch.setattr(params, "_warned_once", set())
+
+
+def test_bootstrap_floor_warning_names_the_budget_when_derived(
+    caplog, fresh_floor_warnings,
+):
+    """A lag wait derived from globalTimeBudgetSecs is blamed on the
+    budget, not on a lagWaitTimeoutSecs the operator never set."""
+    caplog.set_level("WARNING", logger="psycopg.yb.params")
+    yb, _, _ = extract_yb_params(
+        _dsn(
+            "yb.failover.globalTimeBudgetSecs=50",    # lag wait 30 < 45
+            "yb.failover.lagFreshnessSecs=25",
+            "yb.failover.lagConfirmationSamples=2",
+        ),
+        {},
+    )
+    assert yb.lag_wait_timeout_s == 30
+    msgs = [r.getMessage() for r in caplog.records if "below the floor" in r.getMessage()]
+    assert len(msgs) == 1
+    assert "yb.failover.globalTimeBudgetSecs=50" in msgs[0]
+    assert "lagWaitTimeoutSecs=30" not in msgs[0]
+
+
+def test_bootstrap_floor_warning_logged_once_across_connects(
+    caplog, fresh_floor_warnings,
+):
+    """extract_yb_params runs on every connect; the same config warns once."""
+    caplog.set_level("WARNING", logger="psycopg.yb.params")
+    dsn = _dsn(
+        "yb.failover.lagWaitTimeoutSecs=20",
+        "yb.failover.lagFreshnessSecs=25",
+        "yb.failover.lagConfirmationSamples=2",
+    )
+    for _ in range(3):
+        extract_yb_params(dsn, {})
+    assert sum("below the floor" in r.getMessage() for r in caplog.records) == 1
+
+
 def test_bootstrap_accepts_timeout_at_floor():
     """``lag_wait_timeout_s`` exactly at the floor is allowed —
     operators who want the minimum should not need to pad."""

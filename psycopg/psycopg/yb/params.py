@@ -31,6 +31,16 @@ from .node import Placement
 
 logger = logging.getLogger(__name__)
 
+# extract_yb_params runs on every connect; a config warning is logged
+# once per distinct message rather than on each connection.
+_warned_once: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _warned_once:
+        _warned_once.add(msg)
+        logger.warning("%s", msg)
+
 
 # Mirror pgjdbc-yb's clamps. See design doc §3.2.4.
 DEFAULT_REFRESH_INTERVAL_SEC = 300
@@ -657,6 +667,15 @@ def extract_yb_params(
         lag_wait_timeout = _clamp_lo(
             round(global_time_budget_secs * _BUDGET_LAG_WAIT_RATIO), 0,
         )
+        # Named in the floor warning, so it blames the knob actually set.
+        lag_wait_source = (
+            f"{round(_BUDGET_LAG_WAIT_RATIO * 100)}% of "
+            f"yb.failover.globalTimeBudgetSecs={global_time_budget_secs}"
+        )
+        lag_wait_fix = (
+            "yb.failover.globalTimeBudgetSecs, or set "
+            "yb.failover.lagWaitTimeoutSecs explicitly,"
+        )
     else:
         lag_wait_timeout = _clamp_lo(
             int(raw.get(
@@ -665,6 +684,11 @@ def extract_yb_params(
             )),
             0,
         )
+        lag_wait_source = (
+            "yb.failover.lagWaitTimeoutSecs" if lag_wait_user_set
+            else "the default"
+        )
+        lag_wait_fix = "yb.failover.lagWaitTimeoutSecs"
 
     # When a budget is set, each phase knob has an implicit share of the
     # budget (drain: 40%, lag_wait: 60%). If the user explicitly sets a
@@ -726,15 +750,16 @@ def extract_yb_params(
             # harnesses do this), and the Phase 2 timeout + abort policy
             # already handles the result safely. Operators who want strict
             # rejection can treat this logger at ERROR.
-            logger.warning(
-                "yb.failover.lagWaitTimeoutSecs=%d is below the floor %ds "
-                "imposed by lagFreshnessSecs=%d + lagConfirmationSamples=%d × "
-                "scrapeIntervalSecs=%d — Phase 2 will time out on every "
-                "planned failover under this config. Raise lagWaitTimeoutSecs "
-                "to ≥%d, lower lagFreshnessSecs/lagConfirmationSamples, or "
-                "disable the gate with lagFreshnessSecs=0.",
-                lag_wait_timeout, needed, lag_freshness_s,
-                lag_confirmation_samples, _LAG_SCRAPE_HINT_S, needed,
+            _warn_once(
+                f"The failover lag wait of {lag_wait_timeout}s "
+                f"({lag_wait_source}) is below the floor {needed}s imposed "
+                f"by lagFreshnessSecs={lag_freshness_s} + "
+                f"lagConfirmationSamples={lag_confirmation_samples} × "
+                f"scrapeIntervalSecs={_LAG_SCRAPE_HINT_S} — Phase 2 will "
+                f"time out on every planned failover under this config. "
+                f"Raise {lag_wait_fix} so the lag wait is ≥{needed}s, lower "
+                f"lagFreshnessSecs/lagConfirmationSamples, or disable the "
+                f"gate with lagFreshnessSecs=0."
             )
 
     # Auto-failback toggle. Default true (backward-compatible). Accepts
@@ -914,16 +939,33 @@ def extract_yb_params(
         if failback_lag_wait_timeout_s < fb_needed:
             # Downgraded to a WARNING; see the failover-side comment above
             # for rationale.
-            logger.warning(
-                "yb.failback.lagWaitTimeoutSecs=%d is below the floor %ds "
-                "imposed by lagFreshnessSecs=%d + lagConfirmationSamples=%d × "
-                "scrapeIntervalSecs=%d — failback Phase 2 will time out on "
-                "every planned failback under this config. Raise "
-                "yb.failback.lagWaitTimeoutSecs to ≥%d, lower the failback "
-                "freshness/confirmation knobs, or disable the gate with "
-                "yb.failback.lagFreshnessSecs=0.",
-                failback_lag_wait_timeout_s, fb_needed, failback_lag_freshness_s,
-                failback_lag_confirmation_samples, _LAG_SCRAPE_HINT_S, fb_needed,
+            if failback_lag_wait_user_set:
+                fb_source = "yb.failback.lagWaitTimeoutSecs"
+                fb_fix = "yb.failback.lagWaitTimeoutSecs"
+            elif failback_budget_raw is not None:
+                fb_source = (
+                    f"{round(_BUDGET_LAG_WAIT_RATIO * 100)}% of "
+                    f"yb.failback.globalTimeBudgetSecs="
+                    f"{failback_global_time_budget_secs}"
+                )
+                fb_fix = (
+                    "yb.failback.globalTimeBudgetSecs, or set "
+                    "yb.failback.lagWaitTimeoutSecs explicitly,"
+                )
+            else:
+                fb_source = f"inherited from the failover lag wait, {lag_wait_source}"
+                fb_fix = f"yb.failback.lagWaitTimeoutSecs or {lag_wait_fix}"
+            _warn_once(
+                f"The failback lag wait of {failback_lag_wait_timeout_s}s "
+                f"({fb_source}) is below the floor {fb_needed}s imposed by "
+                f"lagFreshnessSecs={failback_lag_freshness_s} + "
+                f"lagConfirmationSamples={failback_lag_confirmation_samples} "
+                f"× scrapeIntervalSecs={_LAG_SCRAPE_HINT_S} — failback "
+                f"Phase 2 will time out on every planned failback under "
+                f"this config. Raise {fb_fix} so the lag wait is "
+                f"≥{fb_needed}s, lower the failback freshness/confirmation "
+                f"knobs, or disable the gate with "
+                f"yb.failback.lagFreshnessSecs=0."
             )
 
     # YBA client inner timeouts. Scale down when a budget is set on
