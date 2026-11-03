@@ -168,8 +168,7 @@ class AsyncConnection(BaseConnection[Row]):
             from .yb.state import (
                 active_cluster as _active_cluster,
                 barrier_crossed as _barrier_crossed,
-                dispatch_generation as _dispatch_generation,
-                wait_for_dispatch_async as _wait_for_dispatch_async,
+                wait_for_dispatch_generation_async as _wait_for_dispatch_generation_async,
             )
             from .yb.params import with_xcluster_socket_defaults
 
@@ -203,8 +202,7 @@ class AsyncConnection(BaseConnection[Row]):
             # entire drain window, stalling every other coroutine
             # (handlers, timers, pool timeouts) alongside — DB-24838
             # observed a 129.93 s stall on one failback.
-            await _wait_for_dispatch_async(failover_group)
-            dispatch_gen = _dispatch_generation(failover_group)
+            dispatch_gen = await _wait_for_dispatch_generation_async(failover_group)
             which = _active_cluster(failover_group)
             if which is None:
                 raise NoViableClusterError(
@@ -331,8 +329,7 @@ class AsyncConnection(BaseConnection[Row]):
                     with state.lock:
                         state.tracked_conns.discard(conn)
                     await conn.close()
-                    await _wait_for_dispatch_async(failover_group)
-                    dispatch_gen = _dispatch_generation(failover_group)
+                    dispatch_gen = await _wait_for_dispatch_generation_async(failover_group)
                     which = _active_cluster(failover_group)
                     if which is None:
                         raise NoViableClusterError(
