@@ -696,8 +696,10 @@ class FailoverGroup:
     # ``time.time()`` stamp at the moment ``pause_dispatch`` fires; the
     # drain's lag loop uses it to compare each YBA ``sample_ts`` and
     # reject samples that cannot reflect post-barrier replication.
-    lag_freshness_s: int = 25
-    lag_confirmation_samples: int = 2
+    # Defaults match the DSN defaults (gate off, one confirmation), so a
+    # group built without these knobs behaves like an unconfigured DSN.
+    lag_freshness_s: int = 0
+    lag_confirmation_samples: int = 1
     barrier_ts: float = 0.0
 
     # Failback-direction (B→A) Phase 2 config (design doc §3.5.1).
@@ -710,8 +712,8 @@ class FailoverGroup:
     failback_threshold_replication_lag_ms: int = 0
     failback_lag_wait_timeout_s: int = 30
     # DB-24483 — same gates in the failback direction.
-    failback_lag_freshness_s: int = 25
-    failback_lag_confirmation_samples: int = 2
+    failback_lag_freshness_s: int = 0
+    failback_lag_confirmation_samples: int = 1
 
     # ``globalTimeBudgetSecs`` per direction (None = no budget). The
     # drain derives its two phase timeouts from it, and also caps the
