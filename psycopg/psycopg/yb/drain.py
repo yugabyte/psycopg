@@ -1248,7 +1248,7 @@ def _wait_for_replication_lag(
     """
     from .yba_client import YBAClientError
 
-    policy = getattr(group, "failback_on_phase2_timeout", "fail")
+    policy = getattr(group, "failback_on_phase2_timeout", "proceed")
     if is_failback and policy == "fail" and not may_abort:
         logger.warning(
             "lag wait: yb.failback.onPhase2Timeout=fail not applied — "

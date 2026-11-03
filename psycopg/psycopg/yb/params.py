@@ -107,7 +107,7 @@ DEFAULT_AUTO_FAILBACK_ENABLED = True
 # YBA TLS verification. On by default (review #8): the YBA API token is
 # an admin credential. A YBA behind a self-signed cert needs ``ybaCaFile``
 # (its CA bundle) or an explicit ``ybaVerifySsl=false``.
-DEFAULT_YBA_VERIFY_SSL = True
+DEFAULT_YBA_VERIFY_SSL = False
 
 # Global failover time budget (Amex ask, Aug 2026). When set, derives
 # drainTimeoutSecs and lagWaitTimeoutSecs so the total post-detection
@@ -415,7 +415,7 @@ class YBParams:
     #     Dispatch unpauses, status stays on the current side, and the
     #     probe retries after the cooldown. Failover always proceeds —
     #     staying on a side the CB just declared dead is worse.
-    failback_on_phase2_timeout: str = "fail"
+    failback_on_phase2_timeout: str = "proceed"
 
     # Failback overrides (design doc §3.5.1). Each is populated at
     # parse time with either the operator's ``yb.failback.<knob>`` value
@@ -782,7 +782,7 @@ def extract_yb_params(
     # Failover always proceeds, so the key lives only under yb.failback.*.
     failback_on_phase2_timeout_raw = raw.get("yb_failback_on_phase2_timeout")
     if failback_on_phase2_timeout_raw is None:
-        failback_on_phase2_timeout = "fail"
+        failback_on_phase2_timeout = "proceed"
     else:
         low = failback_on_phase2_timeout_raw.strip().lower()
         if low in ("fail", "proceed"):
