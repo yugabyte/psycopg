@@ -307,8 +307,14 @@ def test_get_committed_lag_ms_all_sentinel_is_no_data(yba_server):
 
 # ------------------------------------------------------------- TLS (review #8)
 
-def test_tls_verification_off_by_default():
+def test_tls_verification_on_by_default():
     c = YBAClient("https://yba.example.com", api_token="tok")
+    assert c._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+    assert c._ssl_ctx.check_hostname is True
+
+
+def test_tls_verify_off_skips_verification():
+    c = YBAClient("https://yba.example.com", api_token="tok", verify_ssl=False)
     assert c._ssl_ctx.verify_mode == ssl.CERT_NONE
     assert c._ssl_ctx.check_hostname is False
 
@@ -794,3 +800,20 @@ def test_extract_committed_lag_ms_nan_only_is_none():
         {"name": "Committed Lag", "y": ["NaN"], "x": ["1000000"]},
     ]}}
     assert _extract_committed_lag_ms(resp) is None
+
+
+def test_cert_verification_failure_is_permanent(monkeypatch):
+    """With ybaVerifySsl on by default, a YBA behind a self-signed cert
+    fails verification on every call. That is permanent, not transient:
+    bootstrap disables the lag phase and the error names the fix,
+    instead of every lag wait counting YBA as unreachable."""
+    def fail_verify(self, *a, **k):
+        raise ssl.SSLCertVerificationError(1, "self-signed certificate")
+
+    monkeypatch.setattr(http.client.HTTPSConnection, "connect", fail_verify)
+    client = YBAClient("https://yba.example.com", api_token="tok")
+    with pytest.raises(YBAClientError) as ei:
+        client.get_session_info()
+    assert ei.value.transient is False
+    assert "ybaCaFile" in str(ei.value)
+    assert client._conn is None

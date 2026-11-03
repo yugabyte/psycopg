@@ -150,12 +150,12 @@ accepted as separators between tokens):
        ``0`` = force-close in-flight transactions immediately;
        ``N > 0`` = wait up to N seconds then force-close survivors.
    * - ``yb.failback.onPhase2Timeout``
-     - ``proceed``
+     - ``fail``
      - What a failback does when its replication-lag wait (Phase 2)
-       can't confirm the primary has caught up. ``proceed`` = fail back
-       anyway. ``fail`` = when the lag wait times out, or YBA stays
-       unreachable, the failback is aborted: routing stays on the
-       secondary and the probe retries after the cooldown. No effect on
+       can't confirm the primary has caught up. ``fail`` = when the lag
+       wait times out, or YBA stays unreachable, the failback is
+       aborted: routing stays on the secondary and the probe retries
+       after the cooldown. ``proceed`` = fail back anyway. No effect on
        failover, which always proceeds. ``fail`` applies only while the
        secondary is healthy: when the secondary is down, the failback
        proceeds on timeout, since a primary that may not have caught up
@@ -166,6 +166,12 @@ accepted as separators between tokens):
        primary recovers, until an operator fails back. Applies only
        while the secondary is healthy: when the secondary goes down, the
        driver fails back to a healthy primary anyway.
+   * - ``yb.failover.ybaVerifySsl``
+     - ``true``
+     - Verify the YBA endpoint's TLS certificate. A YBA behind a
+       self-signed certificate needs ``yb.failover.ybaCaFile`` (path to
+       its CA bundle) or ``ybaVerifySsl=false``; otherwise the lag-wait
+       phase is disabled at bootstrap.
 
 Example (application):
 
