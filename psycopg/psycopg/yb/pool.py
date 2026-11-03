@@ -80,6 +80,16 @@ def _decide_eviction(conn) -> tuple[bool, str, str, bool]:
       * ``no_viable`` — True iff both CBs report UNHEALTHY (§4 state
         machine row: no viable target). Callers translate this into
         ``NoViableClusterError`` instead of the plain routing error.
+
+    DB-corruption fix: during ``group.dispatch_paused`` (drain in
+    progress) the "active" cluster is the OUTGOING side (status hasn't
+    flipped yet; the flip happens at the end of Phase 2). Pool conns on
+    the outgoing cluster must be evicted during that window — not
+    served to the app — otherwise they commit on the universe we're
+    about to leave. Shubham's cycle 7 traced the index-corruption window
+    back to a pooled conn that committed on B 60 s into the failback
+    lag wait, then got asked to delete the same rows on A after routing
+    flipped.
     """
     uuid = getattr(conn, "_yb_uuid", None)
     if uuid is None:
@@ -93,7 +103,21 @@ def _decide_eviction(conn) -> tuple[bool, str, str, bool]:
         # which cluster it came from — and signal to the caller.
         return True, "", "", True
     active_state = group.primary if which == "primary" else group.secondary
-    return uuid != active_state.uuid, active_state.uuid, which, False
+    # Normal (non-paused) path: evict iff the conn is on a different
+    # cluster than the one the state machine routes to.
+    if not getattr(group, "dispatch_paused", False):
+        return uuid != active_state.uuid, active_state.uuid, which, False
+    # Dispatch is paused — drain is in flight. agent-K PR #18:94
+    # revisit: evict EVERY pool conn, not just outgoing-side ones.
+    # Phase 2 is a lag wait on the INCOMING target; serving an idle
+    # pool conn on the incoming side during that window means the app
+    # commits on a target that hasn't caught up yet — exactly the
+    # DB-25008 index-corruption window. Idle inactive-side conns are
+    # common because they're only evicted on checkout; one left over
+    # from a prior failover would get served through the full Phase 2
+    # lag wait of the next drain. Any post-barrier replacement conn
+    # will be routed via ``active_cluster`` once dispatch resumes.
+    return True, active_state.uuid, which, False
 
 
 def xcluster_check(conn) -> None:
@@ -121,10 +145,29 @@ def xcluster_check(conn) -> None:
         conn._yb_uuid, active_uuid or "—", active_label or "—", no_viable,
     )
     # Close BEFORE raising — see docstring for why.
+    #
+    # agent-K finding on PR #10: when the pool uses close_returns=True,
+    # Connection.close() is rerouted to pool.putconn() which puts the
+    # stale conn back in the pool. The check then raises, the pool
+    # catches it and calls _putconn again — the stale conn ends up
+    # queued twice and NEVER actually evicted. Call pgconn.finish()
+    # directly to bypass the pool-aware close path.
     try:
-        conn.close()
+        conn.pgconn.finish()
     except Exception:
         pass
+    try:
+        conn._closed = True
+    except Exception:
+        pass
+    # agent-K PR #18:130 — pgconn.finish() bypasses Connection.close()
+    # which normally calls ClusterRegistry.decrement(). Without an
+    # explicit decrement the per-host counter leaks every time the
+    # pool evicts a stale-cluster conn, which happens on every pool
+    # check during a drain. Over many failovers the dispatcher's
+    # least-loaded policy would starve the heaviest-leaked host.
+    from .drain import _release_registry_count
+    _release_registry_count(conn)
     if no_viable:
         _stamp_no_viable(conn)
         raise NoViableClusterError(
@@ -201,10 +244,25 @@ async def xcluster_check_async(conn) -> None:
         "no_viable=%s",
         conn._yb_uuid, active_uuid or "—", active_label or "—", no_viable,
     )
+    # agent-K finding: `await conn.close()` on an AsyncConnection
+    # whose `_pool` was set by `_getconn_unchecked` routes through
+    # `pool.putconn()` with close_returns=True, putting the stale
+    # conn right back into the pool. Call pgconn.finish() directly
+    # to bypass. Same workaround as the sync xcluster_check above
+    # and as PR-H1's async-close fix in drain._safe_close.
     try:
-        await conn.close()
+        conn.pgconn.finish()
     except Exception:
         pass
+    try:
+        conn._closed = True
+    except Exception:
+        pass
+    # agent-K PR #18:172 — mirror sync branch: decrement the per-host
+    # registry counter manually since pgconn.finish() bypasses
+    # Connection.close()'s registry teardown.
+    from .drain import _release_registry_count
+    _release_registry_count(conn)
     if no_viable:
         _stamp_no_viable(conn)
         raise NoViableClusterError(

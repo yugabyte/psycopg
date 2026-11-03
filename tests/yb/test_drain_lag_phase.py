@@ -61,6 +61,14 @@ class _FakeYBAClient:
             raise r
         return r
 
+    def get_committed_lag_sample(self, xcluster_uuid):
+        """PR-H3 (DB-24483): drain.py now calls this variant. Return the
+        same lag value as `get_committed_lag_ms` and a fake-fresh
+        timestamp (`time.time()` so staleness checks see a 0-s age)."""
+        import time as _time
+        lag = self.get_committed_lag_ms(xcluster_uuid)
+        return (lag, _time.time())
+
 
 # ------------------------------------------------------- fake conn (mirrors test_drain.py)
 
@@ -142,26 +150,45 @@ def test_lag_wait_converges_after_multiple_polls(fake_state):
 
 # ------------------------------------------------------- exit condition: timeout
 
-def test_lag_wait_timeout_when_never_converges(fake_state):
-    """All polls return high lag — exits at wall-clock deadline, still
-    proceeds with the flip."""
+def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
+    """`onPhase2Timeout=fail` only gates FAILBACK. A failover lag wait
+    that times out still flips — staying on the side the CB just
+    declared dead is worse than a lagged target."""
     group, client = _make_group_with_yba(
         fake_state,
         yba_responses=[500.0],   # sticky high value
         threshold_ms=1,
-        lag_wait_timeout_s=2,    # short so the test runs fast
+        lag_wait_timeout_s=2,
     )
+    group.on_phase2_timeout = "fail"
     import time
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
     elapsed = time.monotonic() - t0
 
-    # Should wait ~2s (the timeout), give or take poll granularity.
     assert 1.5 <= elapsed <= 3.5
-    # Multiple polls happened (roughly 1 per second)
     assert len(client.calls) >= 2
-    # Status still flipped despite lag not converging
     assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.dispatch_paused is False
+
+
+def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
+    """`onPhase2Timeout=proceed` (default) — flip anyway once the lag
+    wait times out."""
+    group, client = _make_group_with_yba(
+        fake_state,
+        yba_responses=[500.0],
+        threshold_ms=1,
+        lag_wait_timeout_s=2,
+    )
+    group.on_phase2_timeout = "proceed"
+    import time
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    assert 1.5 <= elapsed <= 3.5
+    assert group.primary_status == HealthResult.UNHEALTHY   # pre-fix behavior
 
 
 # ------------------------------------------------------- exit condition: unreachable
@@ -279,6 +306,11 @@ def test_lag_wait_fails_open_on_unexpected_exception(fake_state):
         def get_committed_lag_ms(self, xu):
             self.calls.append(xu)
             raise RuntimeError("bug in yba_client")
+
+        def get_committed_lag_sample(self, xu):
+            # PR-H3 drain path uses this; mirror the ms-method
+            # exception shape.
+            return self.get_committed_lag_ms(xu)
 
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
@@ -418,3 +450,27 @@ def test_failover_direction_still_uses_failover_config(fake_state):
     assert len(client.calls) == 1
     assert client.calls[0] == "xcc-a2b"
 
+
+
+def test_lag_wait_timeout_uses_nearly_full_budget_with_fast_polls(fake_state, caplog):
+    """Fast YBA polls must not cost 2×(connect+read) of the budget: a
+    12s wait with millisecond polls runs to ≥11s, and the exit is logged
+    as a plain "lag wait timeout"."""
+    import logging
+    import time
+    group, client = _make_group_with_yba(
+        fake_state,
+        yba_responses=[500.0],
+        threshold_ms=1,
+        lag_wait_timeout_s=12,
+    )
+    caplog.set_level(logging.WARNING, logger="psycopg.yb.drain")
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    assert 11.0 <= elapsed <= 12.5, elapsed
+    assert group.primary_status == HealthResult.UNHEALTHY
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("lag wait timeout after") for m in msgs), msgs
+    assert not any("near-timeout" in m for m in msgs)

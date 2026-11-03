@@ -492,6 +492,11 @@ class FailoverGroup:
     # from the operator's side). Default True preserves v1 behaviour.
     auto_failback_enabled: bool = True
 
+    # Phase 2 timeout policy. ``"proceed"`` (default) flips once the
+    # lag wait times out. ``"fail"`` keeps routing on the current side
+    # when a FAILBACK lag wait times out; failover always proceeds.
+    on_phase2_timeout: str = "proceed"
+
     # Per-stage timestamps (design doc §3.8). All ``time.monotonic()``
     # floats. Zero means "never fired". Written under ``self.lock`` at
     # the stage boundary; safe to read without the lock (float writes
@@ -511,6 +516,11 @@ class FailoverGroup:
     # this timestamp to distinguish "no viable cluster" from
     # "transient stale conn" after a PoolTimeout.
     last_no_viable_ts: float = 0.0
+    # Set by the drain when a failback Phase 2 lag wait times out and
+    # ``on_phase2_timeout == "fail"`` aborts the flip. Operators can
+    # scrape this to detect degraded failover; custom CBs can read it
+    # to rate-limit their trip signaling.
+    last_phase2_timeout_ts: float = 0.0
 
     def __post_init__(self) -> None:
         # Bind the condition to `lock` — so wait/notify releases and re-
@@ -1242,6 +1252,7 @@ class ClusterRegistry:
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,
+                on_phase2_timeout=yb_params.on_phase2_timeout,
             )
             self._failover_groups[primary.uuid] = group
 
@@ -1399,6 +1410,7 @@ class ClusterRegistry:
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,
+                on_phase2_timeout=yb_params.on_phase2_timeout,
             )
             self._failover_groups[primary.uuid] = group
 
