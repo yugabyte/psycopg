@@ -232,6 +232,97 @@ async def test_async_full_drain_during_tcp_connect_reroutes(
     assert made[0] not in group.primary.tracked_conns
 
 
+
+def _arm_in_generation_read(monkeypatch, group):
+    """Model a drain arming its barrier the moment the first dispatch
+    wait returns, before the connect reads anything else."""
+    import psycopg.yb.state as state_mod
+
+    armed: list[bool] = []
+
+    def arm_once(g):
+        if not armed:
+            armed.append(True)
+            g.pause_dispatch()
+
+    def arm_after(real):
+        def wrapper(g, *a, **k):
+            result = real(g, *a, **k)
+            arm_once(g)
+            return result
+
+        async def awrapper(g, *a, **k):
+            result = await real(g, *a, **k)
+            arm_once(g)
+            return result
+
+        import inspect
+        return awrapper if inspect.iscoroutinefunction(real) else wrapper
+
+    for name in (
+        "wait_for_dispatch", "wait_for_dispatch_async",
+        "wait_for_dispatch_generation", "wait_for_dispatch_generation_async",
+    ):
+        if hasattr(state_mod, name):
+            monkeypatch.setattr(state_mod, name, arm_after(getattr(state_mod, name)))
+
+
+def _finish_drain(group: FailoverGroup) -> None:
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    group.resume_dispatch()
+
+
+def test_drain_armed_between_wait_and_generation_read_reroutes(
+    fresh_registry, fake_state, monkeypatch
+):
+    """Review #10 (Amogh): with the generation read in a second step, a
+    drain armed in between was already counted in it, so the re-check
+    after connect missed the drain and the conn stayed on the primary.
+    The wait now returns the generation from the lock section that saw
+    the pause clear."""
+    group = _install_group(fresh_registry, fake_state)
+    _arm_in_generation_read(monkeypatch, group)
+    made: list[tuple[str, _StubConn]] = []
+
+    def connect(host):
+        c = _StubConn()
+        made.append((host, c))
+        if len(made) == 1 and group.dispatch_paused:
+            _finish_drain(group)
+        return c
+
+    _patch(monkeypatch, fresh_registry, group, connect)
+    from psycopg import Connection
+
+    conn = Connection.connect(DSN)
+
+    assert conn._yb_cluster == "secondary"
+    assert not any(h == "p1" and not c.closed for h, c in made)
+
+
+@pytest.mark.anyio
+async def test_async_drain_armed_between_wait_and_generation_read_reroutes(
+    fresh_registry, fake_state, monkeypatch
+):
+    group = _install_group(fresh_registry, fake_state)
+    _arm_in_generation_read(monkeypatch, group)
+    made: list[_AsyncStubConn] = []
+
+    def aconnect(host):
+        c = _AsyncStubConn()
+        made.append(c)
+        if len(made) == 1 and group.dispatch_paused:
+            _finish_drain(group)
+        return c
+
+    _patch(monkeypatch, fresh_registry, group, lambda h: _StubConn(), aconnect)
+    from psycopg import AsyncConnection
+
+    conn = await AsyncConnection.connect(DSN)
+
+    assert conn._yb_cluster == "secondary"
+
+
 # ------------------------------------------------------- tracked_conns under state.lock
 
 class _LockCheckingWeakSet:

@@ -158,8 +158,9 @@ class Connection(BaseConnection[Row]):
             from .yb import MissingCircuitBreakerError, NoViableClusterError
             from .yb.state import active_cluster as _active_cluster
             from .yb.state import barrier_crossed as _barrier_crossed
-            from .yb.state import dispatch_generation as _dispatch_generation
-            from .yb.state import wait_for_dispatch as _wait_for_dispatch
+            from .yb.state import (
+                wait_for_dispatch_generation as _wait_for_dispatch_generation,
+            )
 
             from .yb.params import with_xcluster_socket_defaults
 
@@ -192,8 +193,7 @@ class Connection(BaseConnection[Row]):
             # entire drain window, stalling every other coroutine
             # (handlers, timers, pool timeouts) alongside — DB-24838
             # observed a 129.93 s stall on one failback.
-            _wait_for_dispatch(failover_group)
-            dispatch_gen = _dispatch_generation(failover_group)
+            dispatch_gen = _wait_for_dispatch_generation(failover_group)
             which = _active_cluster(failover_group)
             if which is None:
                 raise NoViableClusterError(
@@ -320,8 +320,7 @@ class Connection(BaseConnection[Row]):
                     with state.lock:
                         state.tracked_conns.discard(conn)
                     conn.close()
-                    _wait_for_dispatch(failover_group)
-                    dispatch_gen = _dispatch_generation(failover_group)
+                    dispatch_gen = _wait_for_dispatch_generation(failover_group)
                     which = _active_cluster(failover_group)
                     if which is None:
                         raise NoViableClusterError(

@@ -93,6 +93,24 @@ def dispatch_generation(group: "FailoverGroup") -> int:
         return group.barrier_generation
 
 
+def wait_for_dispatch_generation(group: "FailoverGroup") -> int:
+    """:func:`wait_for_dispatch`, returning the barrier generation read
+    in the same lock section that saw the pause clear.
+
+    Review #10 (Amogh): reading :func:`dispatch_generation` in a second
+    step leaves a gap; a drain armed in between is already counted in
+    the generation, so :func:`barrier_crossed` misses it and a connect to
+    the outgoing cluster escapes the drain. Connect paths use this.
+    """
+    with group.lock:
+        if group.dispatch_paused:
+            assert group.dispatch_paused_condition is not None
+            group.dispatch_paused_condition.wait_for(
+                lambda: not group.dispatch_paused,
+            )
+        return group.barrier_generation
+
+
 def barrier_crossed(group: "FailoverGroup", generation: int) -> bool:
     """True if a drain armed its barrier after ``generation`` was read.
 
@@ -129,6 +147,21 @@ async def wait_for_dispatch_async(
     if ``timeout_s`` elapsed with the pause still held. ``timeout_s=None``
     means wait indefinitely.
     """
+    return await _wait_for_dispatch_gen_async(group, timeout_s) is not None
+
+
+async def wait_for_dispatch_generation_async(group: "FailoverGroup") -> int:
+    """Async sibling of :func:`wait_for_dispatch_generation`."""
+    generation = await _wait_for_dispatch_gen_async(group, None)
+    assert generation is not None
+    return generation
+
+
+async def _wait_for_dispatch_gen_async(
+    group: "FailoverGroup", timeout_s: "float | None",
+) -> "int | None":
+    """Body of the async waits: the barrier generation read in the lock
+    section that saw the pause clear, or None if ``timeout_s`` elapsed."""
     import asyncio
 
     loop = asyncio.get_running_loop()
@@ -146,7 +179,7 @@ async def wait_for_dispatch_async(
                 # the wait_for and the rebind; re-reading
                 # dispatch_paused under the lock is the
                 # authoritative check.
-                return True
+                return group.barrier_generation
             event = asyncio.Event()
             waiter = (loop, event)
             group.async_dispatch_waiters.append(waiter)
@@ -155,14 +188,14 @@ async def wait_for_dispatch_async(
             if deadline is not None:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    return False
+                    return None
             if remaining is None:
                 await event.wait()
             else:
                 try:
                     await asyncio.wait_for(event.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    return False
+                    return None
         finally:
             # Remove ourselves if still present (not yet fired). If the
             # resume already cleared the list this is a no-op.

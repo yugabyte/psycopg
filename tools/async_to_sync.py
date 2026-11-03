@@ -358,6 +358,8 @@ class RenameAsyncToSync(ast.NodeTransformer):  # type: ignore
         # blocking a thread; the sync version is the original.
         "wait_for_dispatch_async": "wait_for_dispatch",
         "_wait_for_dispatch_async": "_wait_for_dispatch",
+        "wait_for_dispatch_generation_async": "wait_for_dispatch_generation",
+        "_wait_for_dispatch_generation_async": "_wait_for_dispatch_generation",
     }
     _skip_imports = {
         "acompat": {"alist", "anext", "skip_sync"},
