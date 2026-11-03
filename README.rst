@@ -156,7 +156,16 @@ accepted as separators between tokens):
        anyway. ``fail`` = when the lag wait times out, or YBA stays
        unreachable, the failback is aborted: routing stays on the
        secondary and the probe retries after the cooldown. No effect on
-       failover, which always proceeds.
+       failover, which always proceeds. ``fail`` applies only while the
+       secondary is healthy: when the secondary is down, the failback
+       proceeds on timeout, since a primary that may not have caught up
+       is better than no cluster.
+   * - ``yb.failover.autoFailbackEnabled``
+     - ``true``
+     - ``false`` = once routing is on the secondary, stay there when the
+       primary recovers, until an operator fails back. Applies only
+       while the secondary is healthy: when the secondary goes down, the
+       driver fails back to a healthy primary anyway.
 
 Example (application):
 
