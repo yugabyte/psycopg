@@ -496,6 +496,9 @@ def _safe_host(conn) -> str:
         return "?"
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from ..abc import ConnDict
     from ..connection import Connection
     from ..connection_async import AsyncConnection
 
@@ -524,7 +527,7 @@ class ClusterKey:
     user: str
 
     @classmethod
-    def from_params(cls, pg_kwargs: dict[str, object]) -> "ClusterKey":
+    def from_params(cls, pg_kwargs: Mapping[str, object]) -> "ClusterKey":
         host_str = str(pg_kwargs.get("host", ""))
         hosts = tuple(sorted(
             h.strip().lower() for h in host_str.split(",") if h.strip()
@@ -1118,7 +1121,7 @@ class ClusterRegistry:
     #      Otherwise, build the new `ClusterState` and install.
 
     def get_or_bootstrap(
-        self, key: ClusterKey, conninfo: str, kwargs: dict[str, object]
+        self, key: ClusterKey, conninfo: str, kwargs: ConnDict
     ) -> ClusterState:
         with self._lock:
             uuid = self._key_to_uuid.get(key)
@@ -1186,7 +1189,7 @@ class ClusterRegistry:
             return state
 
     async def aget_or_bootstrap(
-        self, key: ClusterKey, conninfo: str, kwargs: dict[str, object]
+        self, key: ClusterKey, conninfo: str, kwargs: ConnDict
     ) -> ClusterState:
         with self._lock:
             uuid = self._key_to_uuid.get(key)
@@ -1266,8 +1269,8 @@ class ClusterRegistry:
     #   5. Start the `HealthProbe` thread on the group.
 
     def _make_secondary_kwargs(
-        self, kwargs: dict[str, object], secondary_hosts: list[str]
-    ) -> dict[str, object]:
+        self, kwargs: ConnDict, secondary_hosts: list[str]
+    ) -> ConnDict:
         """Return a copy of `kwargs` with `host` replaced by the secondary
         cluster's host list. All other params (port, user, dbname,
         ssl-related, topology, refresh interval, ...) carry over verbatim —
@@ -1474,7 +1477,7 @@ class ClusterRegistry:
         self,
         yb_params,                                  # YBParams; lazy-typed to dodge cycle
         conninfo: str,
-        kwargs: dict[str, object],
+        kwargs: ConnDict,
         strict_param_check: bool = False,
     ) -> "FailoverGroup":
         """Sync bootstrap of a primary + secondary `FailoverGroup`. Idempotent
@@ -1667,7 +1670,7 @@ class ClusterRegistry:
         self,
         yb_params,
         conninfo: str,
-        kwargs: dict[str, object],
+        kwargs: ConnDict,
         strict_param_check: bool = False,
     ) -> "FailoverGroup":
         """Async sibling. Same shape, awaits the async primary + secondary
@@ -1842,8 +1845,8 @@ class ClusterRegistry:
         return group
 
     def _param_dict_for_key(
-        self, conninfo: str, kwargs: dict[str, object]
-    ) -> dict[str, object]:
+        self, conninfo: str, kwargs: ConnDict
+    ) -> ConnDict:
         """Build the dict ClusterKey wants for hashing. Mirrors the way the
         dispatcher constructs ClusterKey before calling `get_or_bootstrap`
         — late import of `conninfo_to_dict` to avoid pulling psycopg's
@@ -1852,7 +1855,7 @@ class ClusterRegistry:
         return conninfo_to_dict(conninfo, **kwargs)
 
     def _hosts_from_kwargs(
-        self, kwargs: dict[str, object], conninfo: str = "",
+        self, kwargs: ConnDict, conninfo: str = "",
     ) -> "list[str]":
         """Extract the comma-separated host list from psycopg kwargs and/
         or conninfo string. Used when building a placeholder ClusterState

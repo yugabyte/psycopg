@@ -19,6 +19,7 @@ from collections.abc import Generator, Iterator
 
 from . import errors as e
 from . import pq, waiting
+from .yb import dispatch as yb_dispatch
 from .abc import RV, AdaptContext, ConnDict, ConnParam, Params, PQGen, Query
 from .abc import QueryNoTemplate
 from ._tpc import Xid
@@ -35,7 +36,7 @@ from .yb.params import extract_yb_params
 from .yb.policy import build_policy
 from .generators import notifies
 from .transaction import Transaction
-from .yb.registry import ClusterKey, ClusterRegistry
+from .yb.registry import ClusterRegistry
 from ._capabilities import capabilities
 from ._server_cursor import ServerCursor
 from ._conninfo_utils import gssapi_requested
@@ -78,14 +79,8 @@ class Connection(BaseConnection[Row]):
     # `if self._yb_uuid` guard in `close` correctly skips decrement.
     _yb_uuid: str | None = None
     _yb_host: str | None = None
-    # Set by `ClusterRegistry.release_conn` once this conn's per-host
-    # counter has been released, so later close paths don't decrement again.
-    _yb_released: bool = False
-    # xCluster tagging. "primary" / "secondary" when the conn was routed via a
-    # FailoverGroup; None for the single-cluster smart-driver path and for
-    # pass-through. Used by `psycopg.yb.pool.xcluster_check` to decide whether
-    # to evict pool-managed conns on failover.
-    _yb_cluster: str | None = None
+    _yb_released: bool = False  # set once the per-host count is released
+    _yb_cluster: str | None = None  # "primary"/"secondary" when xCluster-routed
 
     def __init__(
         self,
@@ -146,80 +141,11 @@ class Connection(BaseConnection[Row]):
             yb_params.xcluster_enabled,
         )
         registry = ClusterRegistry.instance()
-
-        # xCluster path — bootstrap a FailoverGroup and pick the active
-        # cluster from the dual-CB state machine (see psycopg.yb.state).
-        # Falls through to the single-cluster path when xcluster_enabled
-        # is False (the common case).
-        active_cluster: str | None = None
-        failover_group = None
-        dispatch_gen = 0
-        if yb_params.xcluster_enabled:  # late import; cycle-safe
-            from .yb import MissingCircuitBreakerError, NoViableClusterError
-            from .yb.state import active_cluster as _active_cluster
-            from .yb.state import barrier_crossed as _barrier_crossed
-            from .yb.state import (
-                wait_for_dispatch_generation as _wait_for_dispatch_generation,
-            )
-
-            from .yb.params import with_xcluster_socket_defaults
-
-            cleaned_kwargs = with_xcluster_socket_defaults(
-                cleaned_conninfo, cleaned_kwargs
-            )
-            failover_group = registry.get_or_bootstrap_failover_group(
-                yb_params, cleaned_conninfo, cleaned_kwargs
-            )
-            # Fail fast — the driver ships without a default CB. The app
-            # must attach both slots via bootstrap_failover_group + explicit
-            # assignment before any connect. Better to raise here than to
-            # silently route based on a status flag no CB is writing to.
-            if (
-                failover_group.primary_circuit_breaker is None
-                or failover_group.secondary_circuit_breaker is None
-            ):
-                raise MissingCircuitBreakerError(
-                    "Configuration error: 'yb.failover.secondaryClusterHosts' requires circuit breaker class to be configured. Exiting."
-                )
-            # Barrier: if a drain sequence has paused dispatch, yield to
-            # the event loop here until it releases (DB-24838 part 1).
-            # No timeout in the direct-connect path — the wait is
-            # bounded by Phase 1 drain + Phase 2 lag wait. With
-            # drainTimeoutSecs=-1 the Phase 1 bound comes from the
-            # longest in-flight txn plus one drain-poll tick (H7
-            # DB-25012); with a finite drainTimeoutSecs the bound is
-            # drainTimeoutSecs itself. Must be the async variant: the
-            # sync one would block the event-loop OS thread for the
-            # entire drain window, stalling every other coroutine
-            # (handlers, timers, pool timeouts) alongside — DB-24838
-            # observed a 129.93 s stall on one failback.
-            dispatch_gen = _wait_for_dispatch_generation(failover_group)
-            which = _active_cluster(failover_group)
-            if which is None:
-                raise NoViableClusterError(
-                    f"xCluster: both primary and secondary clusters report UNHEALTHY — no viable target for new connections (primary_uuid={failover_group.primary.uuid})"
-                )
-            if which == "secondary":
-                state = failover_group.secondary
-            else:
-                state = failover_group.primary
-            active_cluster = which
-            yb_logger.debug(
-                "xcluster active cluster: %s (primary_uuid=%s)",
-                active_cluster,
-                failover_group.primary.uuid,
-            )
-        else:
-            # xCluster deployments have per-cluster probe threads that
-            # refresh yb_servers() on each tick (design doc §4.1). The
-            # lazy on-demand refresh path is skipped here — the probe
-            # cadence is authoritative for topology in xCluster mode.
-            # ClusterKey wants a dict; parse the cleaned conninfo once for it.
-            pg_dict = conninfo_to_dict(cleaned_conninfo, **cleaned_kwargs)
-            key = ClusterKey.from_params(pg_dict)
-            state = registry.get_or_bootstrap(key, cleaned_conninfo, cleaned_kwargs)
-            # Single-cluster path has no probe thread; keep the lazy refresh.
-            registry.refresh_if_stale(state, yb_params.refresh_interval_s)
+        route = yb_dispatch.resolve(
+            registry, yb_params, cleaned_conninfo, cleaned_kwargs
+        )
+        state = route.state
+        cleaned_kwargs = route.kwargs
         policy = build_policy(yb_params)
 
         attempted: set[str] = set()
@@ -266,12 +192,8 @@ class Connection(BaseConnection[Row]):
                     exc,
                 )
                 registry.decrement(state.uuid, node.host)
-                registry.mark_failed(
-                    state.uuid,
-                    node.host,
-                    timeout="timeout expired" in str(exc),
-                    attempt_started=attempt_started,
-                )
+                timeout = "timeout expired" in str(exc)
+                registry.mark_failed(state.uuid, node.host, timeout, attempt_started)
                 attempted.add(node.host)
                 last_err = exc
                 continue
@@ -292,53 +214,19 @@ class Connection(BaseConnection[Row]):
             registry.mark_up(state.uuid, node.host)
             conn._yb_uuid = state.uuid
             conn._yb_host = node.host
-            # `active_cluster` is "primary"/"secondary" iff we routed via a
-            # FailoverGroup; None for the single-cluster smart-driver path.
-            conn._yb_cluster = active_cluster
-            # Direct-connect weakref tracking (Phase D). Only wire this
-            # in the xCluster path — the drain sequence walks
-            # `state.tracked_conns` on the outgoing cluster to find
-            # in-flight transactions. Pool-borrowed conns are NOT added
-            # here because the pool already holds strong references
-            # (design doc §3.1).
-            if failover_group is not None:
-                # Under state.lock: the drain iterates a snapshot taken
-                # under the same lock (Review #10).
-                with state.lock:
-                    state.tracked_conns.add(conn)
-                if _barrier_crossed(failover_group, dispatch_gen):
-                    # A drain armed while this TCP connect was in progress
-                    # and may already have swept tracked_conns; this conn
-                    # would write to the outgoing cluster (DB-24801). Drop
-                    # it and route again once the barrier releases.
-                    yb_logger.info(
-                        "xCluster: drain barrier armed while connecting to %s "
-                        "(uuid=%s); closing and re-routing",
-                        node.host,
-                        state.uuid,
-                    )
-                    with state.lock:
-                        state.tracked_conns.discard(conn)
-                    conn.close()
-                    dispatch_gen = _wait_for_dispatch_generation(failover_group)
-                    which = _active_cluster(failover_group)
-                    if which is None:
-                        raise NoViableClusterError(
-                            f"xCluster: both primary and secondary clusters report UNHEALTHY — no viable target for new connections (primary_uuid={failover_group.primary.uuid})"
-                        )
-                    if which == "secondary":
-                        state = failover_group.secondary
-                    else:
-                        state = failover_group.primary
-                    active_cluster = which
-                    attempted = set()
-                    last_err = None
-                    continue
+            conn._yb_cluster = route.cluster
+            # A drain armed during the connect: drop the conn and route again.
+            if rerouted := yb_dispatch.track_or_reroute(route, conn, node.host):
+                route = rerouted
+                state = route.state
+                attempted = set()
+                last_err = None
+                continue
             yb_logger.debug(
                 "smart-driver connect succeeded: host=%s, uuid=%s, cluster=%s",
                 node.host,
                 state.uuid,
-                active_cluster or "(single-cluster)",
+                route.cluster or "(single-cluster)",
             )
             return conn
 
@@ -469,9 +357,9 @@ class Connection(BaseConnection[Row]):
 
             self.pgconn.finish()
         finally:
-            # Smart-driver: release the cluster's per-host counter (at most
-            # once per conn). Guarded by `_yb_uuid` so pass-through
-            # connections (which never set it) don't touch the registry.
+            # Smart-driver: release the cluster's per-host counter. Guarded
+            # by `_yb_uuid` so pass-through connections (which never set it)
+            # don't touch the registry.
             if self._yb_uuid is not None and self._yb_host is not None:
                 ClusterRegistry.instance().release_conn(self)
 

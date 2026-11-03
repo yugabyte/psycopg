@@ -25,9 +25,13 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 from dataclasses import dataclass, field
 
 from .node import Placement
+
+if TYPE_CHECKING:
+    from ..abc import ConnDict, ConnMapping
 
 logger = logging.getLogger(__name__)
 
@@ -514,20 +518,20 @@ XCLUSTER_SOCKET_DEFAULTS: dict[str, str] = {
 
 
 def with_xcluster_socket_defaults(
-    conninfo: str, kwargs: dict[str, object],
-) -> dict[str, object]:
+    conninfo: str, kwargs: ConnMapping,
+) -> ConnDict:
     """Return ``kwargs`` plus every XCLUSTER_SOCKET_DEFAULTS key that
     neither ``conninfo`` nor ``kwargs`` sets."""
     from ..conninfo import conninfo_to_dict
 
-    present = conninfo_to_dict(conninfo, **kwargs)  # type: ignore[arg-type]
+    present = conninfo_to_dict(conninfo, **kwargs)
     missing = {k: v for k, v in XCLUSTER_SOCKET_DEFAULTS.items() if k not in present}
     return {**missing, **kwargs}
 
 
 def extract_yb_params(
-    conninfo: str, kwargs: dict[str, object]
-) -> tuple["YBParams", str, dict[str, object]]:
+    conninfo: str, kwargs: ConnMapping
+) -> tuple["YBParams", str, ConnDict]:
     """Read YB-specific params from conninfo + kwargs.
 
     Returns ``(YBParams, cleaned_conninfo, cleaned_kwargs)``. The cleaned
@@ -556,7 +560,7 @@ def extract_yb_params(
     cleaned_conninfo = re.sub(r"\s+", " ", "".join(cleaned_parts)).strip()
 
     # 2. Walk kwargs and pull our keys out. kwargs override conninfo on collision.
-    cleaned_kwargs: dict[str, object] = {}
+    cleaned_kwargs: ConnDict = {}
     for k, v in kwargs.items():
         nk = _normalize_key(k)
         if nk in _PURE_YB_KEYS:
