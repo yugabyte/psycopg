@@ -5,7 +5,7 @@ Verifies the decision table from the module docstring:
 
   * health HEALTHY                          → HEALTHY
   * health UNHEALTHY + lag ≤ threshold      → UNHEALTHY (trip)
-  * health UNHEALTHY + lag >  threshold     → previous verdict (hold)
+  * health UNHEALTHY + lag >  threshold     → driver's applied status (hold)
   * health UNHEALTHY + YBAClientError       → UNHEALTHY (fail-open)
   * health UNHEALTHY + client=None          → UNHEALTHY (fail-open)
   * health UNHEALTHY + no config UUID       → UNHEALTHY (fail-open)
@@ -75,15 +75,20 @@ def _fake_group(
     yba_client=None,
     xcluster_config_uuid: str = "",
     failback_xcluster_config_uuid: str = "",
+    primary_status: HealthResult = HealthResult.HEALTHY,
+    secondary_status: HealthResult = HealthResult.HEALTHY,
 ):
     """Bare-bones stand-in for ``FailoverGroup`` — the CB only reads
-    ``yba_client``, ``xcluster_config_uuid``, and
-    ``failback_xcluster_config_uuid`` off it. Full FailoverGroup
+    ``yba_client``, ``xcluster_config_uuid``,
+    ``failback_xcluster_config_uuid`` and the driver-applied
+    ``primary_status`` / ``secondary_status`` off it. Full FailoverGroup
     construction is overkill for these tests."""
     return SimpleNamespace(
         yba_client=yba_client,
         xcluster_config_uuid=xcluster_config_uuid,
         failback_xcluster_config_uuid=failback_xcluster_config_uuid,
+        primary_status=primary_status,
+        secondary_status=secondary_status,
         lock=threading.Lock(),
     )
 
@@ -169,10 +174,12 @@ def test_db25154_hold_after_trip_stays_unhealthy():
     )
     group = _fake_group(yba_client=yba, xcluster_config_uuid="xcc-a2b")
 
-    # Tick 1: lag=0 ≤ threshold → real trip to UNHEALTHY.
+    # Tick 1: lag=0 ≤ threshold → real trip to UNHEALTHY. The driver
+    # applies it.
     assert cb.check(group) is HealthResult.UNHEALTHY
     assert cb.last_trip_time > 0.0
     first_trip = cb.last_trip_time
+    group.primary_status = HealthResult.UNHEALTHY
 
     # Tick 2: operator-declared-unhealthy primary with lag now above
     # threshold (paused replication). Pre-DB-25154 code returned HEALTHY
@@ -206,6 +213,99 @@ def test_db25154_hold_from_healthy_still_returns_healthy():
     assert cb.check(group) is HealthResult.HEALTHY
     assert cb.check(group) is HealthResult.HEALTHY
     assert cb.last_trip_time == 0.0
+
+
+def _tripping_cb(which: str, lags: list):
+    yba = _StubYBAClient(responses=lags)
+    cb = HealthAndLagCircuitBreaker(
+        which_cluster=which,
+        threshold_lag_ms=0,
+        health_probe=_StubHealthProbe(HealthResult.UNHEALTHY),
+        yba_client=yba,
+        xcluster_config_uuid="xcc-override",
+    )
+    return cb, _fake_group(yba_client=yba)
+
+
+@pytest.mark.parametrize("which", ["primary", "secondary"])
+def test_hold_after_deferred_trip_withdraws_it(which):
+    """PR #22 review: the CB trips while lag ≤ threshold, the driver
+    defers it (cool-down / drain in flight / overrun check / aborted
+    Phase 2), and lag then rises. The applied status is still HEALTHY,
+    so the hold must return HEALTHY — returning the CB's own earlier
+    UNHEALTHY would have the driver fail over onto a target this tick
+    measured as behind."""
+    cb, group = _tripping_cb(which, [0.0, 5000.0, 5000.0])
+
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    # Driver deferred: group.<which>_status stays HEALTHY.
+    assert cb.check(group) is HealthResult.HEALTHY
+    assert cb._last_reported is HealthResult.HEALTHY
+    assert cb.check(group) is HealthResult.HEALTHY
+    # Withdrawing an unapplied trip is not a recovery.
+    assert cb.last_recovery_time == 0.0
+
+
+@pytest.mark.parametrize("which", ["primary", "secondary"])
+def test_hold_after_applied_trip_keeps_unhealthy(which):
+    """The driver applied the trip (status UNHEALTHY); lag rising
+    afterwards must not read as a recovery (DB-25154)."""
+    cb, group = _tripping_cb(which, [0.0, 5000.0, 9000.0])
+
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    setattr(group, f"{which}_status", HealthResult.UNHEALTHY)
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    assert cb._last_reported is HealthResult.UNHEALTHY
+
+
+def test_hold_after_reset_failover_group_returns_healthy():
+    """reset_failover_group forces the status back to HEALTHY while
+    the CB still remembers its trip. The next hold follows the applied
+    HEALTHY instead of re-tripping onto a lagging target."""
+    cb, group = _tripping_cb("primary", [0.0, 5000.0, 5000.0])
+
+    assert cb.check(group) is HealthResult.UNHEALTHY
+    group.primary_status = HealthResult.UNHEALTHY     # driver applied
+    assert cb.check(group) is HealthResult.UNHEALTHY  # hold
+    group.primary_status = HealthResult.HEALTHY       # operator reset
+    assert cb.check(group) is HealthResult.HEALTHY
+    assert cb._last_reported is HealthResult.HEALTHY
+
+
+def test_hold_withdrawal_keeps_backstop_count():
+    """Withdrawing an unapplied trip on a hold tick must not reset the
+    DB-24852 hold counter, or the backstop could never fire."""
+    yba = _StubYBAClient(responses=[5000.0])
+    cb = HealthAndLagCircuitBreaker(
+        which_cluster="primary",
+        threshold_lag_ms=0,
+        health_probe=_StubHealthProbe(HealthResult.UNHEALTHY),
+        yba_client=yba,
+        xcluster_config_uuid="xcc-override",
+        max_hold_ticks=3,
+    )
+    cb._last_reported = HealthResult.UNHEALTHY  # unapplied earlier trip
+    group = _fake_group(yba_client=yba)
+
+    verdicts = [cb.check(group) for _ in range(3)]
+
+    assert verdicts == [
+        HealthResult.HEALTHY, HealthResult.HEALTHY, HealthResult.UNHEALTHY,
+    ]
+
+
+def test_failback_gate_skipped_when_trip_not_applied():
+    """Primary slot: the CB returned UNHEALTHY but the driver never
+    applied it, then health recovers with B→A lag high. There is no
+    failback to gate; UNHEALTHY here would start a failover off a
+    healthy primary."""
+    yba = _StubYBAClient([133.5])
+    cb, group = _recovering_primary(None, override=yba)
+    group.primary_status = HealthResult.HEALTHY
+
+    assert cb.check(group) is HealthResult.HEALTHY
+    assert yba.calls == []
 
 
 # ------------------------------------------------------- fail-open paths
@@ -417,6 +517,7 @@ def _recovering_primary(yba_client, **group_kw):
     group = _fake_group(
         yba_client=yba_client,
         failback_xcluster_config_uuid="xcc-b2a",
+        primary_status=HealthResult.UNHEALTHY,
         **group_kw,
     )
     return cb, group

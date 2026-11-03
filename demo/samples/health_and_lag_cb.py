@@ -12,13 +12,25 @@ Motivation
 
 The driver's Phase 2 (lag wait) polls YBA between "primary CB says
 unhealthy" and "flip routing", to avoid switching to a secondary that
-hasn't caught up yet. Some deployments would rather fold that check
-into the CB itself — so by the time the CB reports UNHEALTHY, the
-secondary is already known caught-up, and the driver can skip Phase 2
-entirely (and can safely set ``drainTimeoutSecs=0`` if the workload
-tolerates it).
+hasn't caught up yet. Deployments without the driver's Phase 2 wired
+(no ``yb.failover.ybaEndpoint``) can fold that check into the CB:
+pass ``yba_client`` / ``xcluster_config_uuid`` to the constructor and
+the CB trips only on a tick where the target's lag is ≤ threshold.
 
-That is what this CB does. It composes:
+When the driver's Phase 2 *is* wired on the group, this CB leaves the
+lag gate to it and trips on the health probe alone (see ``check()``).
+
+What the lag gate guarantees: the CB returns UNHEALTHY only on a tick
+where lag measured ≤ threshold, or on a fail-open / backstop row of
+the table below. A trip the driver defers (cool-down, another drain
+in flight) is re-measured on the next tick and is not resubmitted if
+lag has risen (see the hold row). What it does not guarantee: the
+measurement is from the tick that tripped, so writes the app commits
+after it (during the drain) are not covered, and the backstop and
+fail-open rows trip without a caught-up target. It does not make
+``drainTimeoutSecs=0`` safe on its own.
+
+It composes:
 
   1. A **health probe** — default :class:`TrackerTableCircuitBreaker`,
      but any object implementing ``check(group) -> HealthResult``
@@ -38,16 +50,26 @@ Decision table (per tick):
   ├────────────────────┼──────────────────┼───────────────────────┤
   │  HEALTHY           │  (not consulted) │  HEALTHY              │
   │  UNHEALTHY         │  lag ≤ threshold │  UNHEALTHY            │
-  │  UNHEALTHY         │  lag >  threshold│  previous verdict     │
-  │                    │                  │  (hold — see DB-25154)│
+  │  UNHEALTHY         │  lag >  threshold│  applied status (hold)│
+  │                    │                  │  see DB-25154         │
   │  UNHEALTHY         │  YBA unreachable │  UNHEALTHY            │
   │  UNHEALTHY         │  no config UUID  │  UNHEALTHY            │
   └────────────────────┴──────────────────┴───────────────────────┘
 
-The hold row preserves ``_last_reported`` rather than returning
-``HEALTHY``: a HEALTHY verdict after an UNHEALTHY one is a recovery
-to the driver, which then starts the failback cool-down and drain —
-onto a primary the health probe is still saying is bad (DB-25154).
+The hold row returns the status the driver has applied for this slot
+(``group.primary_status`` / ``group.secondary_status``):
+
+  * applied UNHEALTHY → UNHEALTHY. Returning HEALTHY would be a
+    recovery to the driver, which then starts the failback cool-down
+    and drain onto a primary the health probe still says is bad
+    (DB-25154).
+  * applied HEALTHY → HEALTHY, even if this CB returned UNHEALTHY on
+    an earlier tick. The driver did not apply that trip (deferred,
+    discarded, aborted, or reset by ``reset_failover_group``), and
+    the target is behind now, so the trip is withdrawn.
+
+The primary slot's failback gate (health HEALTHY but B→A lag not
+drained → UNHEALTHY) is keyed on the applied status the same way.
 
 The "YBA unreachable" and "no config UUID" rows fall through to
 UNHEALTHY (fail-open) so a broken control plane never wedges failover.
@@ -83,10 +105,8 @@ Usage
     )
     group.wait_for_first_check(timeout_s=10)
 
-    # Because this CB gates its own trip on lag, Phase 2 in the driver
-    # becomes redundant and drainTimeoutSecs can be small:
-    #   yb.failover.drainTimeoutSecs=0
-    # (only safe when the workload tolerates in-flight force-close.)
+``which_cluster`` must match the slot the CB is attached to: the hold
+reads ``group.<which_cluster>_status``.
 
 The wrapped health probe defaults to ``TrackerTableCircuitBreaker`` but
 can be any CB — swap it via the ``health_probe`` kwarg to compose with
@@ -229,9 +249,13 @@ class HealthAndLagCircuitBreaker:
             # lag gate; only the primary slot owns it because that's
             # the slot whose HEALTHY verdict triggers failback.
             # agent-K PR #12:58.
+            # Keyed on the driver's applied status, not _last_reported:
+            # if the driver never applied our trip, there is no failback
+            # to gate, and UNHEALTHY here would start a fresh failover
+            # off a primary the probe now says is fine.
             if (
                 self.which_cluster == "primary"
-                and self._last_reported == HealthResult.UNHEALTHY
+                and self._applied_status(group) == HealthResult.UNHEALTHY
                 and not self._failback_lag_drained(group)
             ):
                 logger.info(
@@ -374,13 +398,27 @@ class HealthAndLagCircuitBreaker:
             )
             return HealthResult.UNHEALTHY
 
-        # DB-25154: hold means "do not change the verdict." Returning
-        # HEALTHY here after an earlier UNHEALTHY looks like a recovery
-        # to the driver, which then runs the cool-down + failback drain
-        # back onto a primary the health probe is still flagging. Report
-        # whatever we last told the driver — it matches _last_reported,
-        # which _record_unhealthy / _record_healthy maintain.
-        held_as = self._last_reported
+        # DB-25154: hold means "do not change the verdict the driver has
+        # applied." Returning HEALTHY after the driver applied a trip
+        # looks like a recovery, which runs the cool-down + failback
+        # drain back onto a primary the health probe is still flagging.
+        #
+        # The applied verdict is the group's status for this slot, not
+        # what this CB last returned: the driver drops or defers
+        # verdicts (cool-down, another drain in flight, a check that
+        # overran checkTimeoutSecs, the bootstrap check, an aborted
+        # Phase 2 flip, reset_failover_group). Holding a trip the
+        # driver never applied would hand it UNHEALTHY now, with the
+        # target measured as behind this tick, and it would fail over
+        # onto a secondary that hasn't caught up.
+        if self._applied_status(group) == HealthResult.UNHEALTHY:
+            held_as = HealthResult.UNHEALTHY
+        else:
+            held_as = HealthResult.HEALTHY
+        # Keep _last_reported equal to what we return. Set directly, not
+        # via _record_healthy: that resets _hold_ticks and is a recovery,
+        # neither of which a hold is.
+        self._last_reported = held_as
         logger.info(
             "%s: health probe UNHEALTHY but lag %.1fms > threshold %dms "
             "— holding %s (%d/%d, target not ready)",
@@ -392,6 +430,20 @@ class HealthAndLagCircuitBreaker:
         return held_as
 
     # ---------------------------------------------------------- helpers
+
+    def _applied_status(self, group: "FailoverGroup") -> HealthResult:
+        """The status the driver has applied for this CB's slot
+        (``group.primary_status`` / ``group.secondary_status``).
+
+        ``which_cluster`` names the slot, matching the
+        ``group.<which>_circuit_breaker`` attribute the CB is attached
+        to. A group without the attribute counts as HEALTHY, so the
+        CB never holds a trip it can't see applied.
+        """
+        status = getattr(group, f"{self.which_cluster}_status", None)
+        if status == HealthResult.UNHEALTHY:
+            return HealthResult.UNHEALTHY
+        return HealthResult.HEALTHY
 
     def _resolve_yba(self, group: "FailoverGroup") -> tuple[Any, str]:
         """Return ``(yba_client, xcluster_config_uuid)`` for this CB
