@@ -124,7 +124,7 @@ class YBAClient:
         self,
         endpoint: str,
         api_token: str,
-        verify_ssl: bool = True,
+        verify_ssl: bool = False,
         connect_timeout_s: float = 2.0,
         read_timeout_s: float = 3.0,
         cafile: "str | None" = None,
