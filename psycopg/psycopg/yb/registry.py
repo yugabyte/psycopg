@@ -300,6 +300,10 @@ def _diff_failover_params(existing_params, new_params) -> list[tuple[str, object
 
 _MISSING = object()
 
+# Governing params whose values must not appear in the conflict error:
+# it ends up in tracebacks and log aggregators.
+_SECRET_PARAMS = frozenset(("yba_api_token",))
+
 
 def _assert_bootstrap_params_match(group: "FailoverGroup", new_params) -> None:
     """Raise ``ConflictingFailoverConfigError`` if ``new_params`` disagrees
@@ -332,7 +336,9 @@ def _assert_bootstrap_params_match(group: "FailoverGroup", new_params) -> None:
         return
     from . import ConflictingFailoverConfigError
     detail = "; ".join(
-        f"{name}: existing={existing!r} new={incoming!r}"
+        f"{name}: existing=*** new=*** (differs)"
+        if name in _SECRET_PARAMS
+        else f"{name}: existing={existing!r} new={incoming!r}"
         for name, existing, incoming in diffs
     )
     raise ConflictingFailoverConfigError(
