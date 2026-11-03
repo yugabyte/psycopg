@@ -744,7 +744,7 @@ class FailoverGroup:
     # ``"fail"`` (default) keeps routing on the secondary when a FAILBACK
     # lag wait times out or YBA stays unreachable; ``"proceed"`` flips
     # once the lag wait times out. Failover always proceeds.
-    failback_on_phase2_timeout: str = "fail"
+    failback_on_phase2_timeout: str = "proceed"
 
     # Per-stage timestamps (design doc §3.8). All ``time.monotonic()``
     # floats. Zero means "never fired". Written under ``self.lock`` at
