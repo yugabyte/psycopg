@@ -593,20 +593,37 @@ def _down_after_secondary(fake_state):
     return group
 
 
-def test_failback_out_of_no_viable_honours_auto_failback_disabled(fake_state):
-    """Review #8 (Amogh): with traffic on the secondary, the secondary CB
-    trips (no viable cluster), then the primary reports HEALTHY. That is
-    a failback; autoFailbackEnabled=false must still block it."""
-    group = _down_after_secondary(fake_state)
+def test_failback_when_secondary_goes_down_ignores_auto_failback_disabled(
+    fake_state, caplog,
+):
+    """autoFailbackEnabled=false keeps routing on a secondary that is
+    still serving. Once the secondary goes down there is nothing to stay
+    on, so the healthy primary takes over through a real drain."""
+    import logging
+    group = _make_group(fake_state)
     group.auto_failback_enabled = False
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    caplog.set_level(logging.WARNING, logger="psycopg.yb.drain")
+
+    # Primary healthy while the secondary serves: suppressed.
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert any("failback suppressed" in r.getMessage() for r in caplog.records)
+
+    # Secondary goes down, then the primary's next HEALTHY report.
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
     pauses: list[bool] = []
     orig_pause = group.pause_dispatch
     group.pause_dispatch = lambda: (pauses.append(True), orig_pause())[1]  # type: ignore[method-assign]
-
     trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
 
-    assert group.primary_status == HealthResult.UNHEALTHY
-    assert pauses == []
+    assert group.primary_status == HealthResult.HEALTHY
+    assert pauses == [True]
+    assert group.dispatch_paused is False
+    assert any(
+        "failback despite autoFailbackEnabled=false" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_failback_out_of_no_viable_runs_failback_phase2(fake_state):

@@ -522,13 +522,15 @@ def trigger_drain(
         # still open there (e.g. conns that outlived a probe-only
         # outage) before dispatch resumes onto after_active.
         #
-        # Review #8 (Amogh): the primary recovering is a failback unless
-        # routing was on the primary when no-viable began. A failback
-        # goes through the autoFailbackEnabled gate and the failback
-        # Phase 2 lag wait like any other; only, with no healthy side to
-        # stay on, onPhase2Timeout=fail does not abort it. Otherwise
-        # Phase 2 is skipped: the other side was not serving, so there
-        # is nothing in flight to replicate.
+        # The primary recovering is a failback unless routing was on the
+        # primary when no-viable began. It runs the failback Phase 2 lag
+        # wait like any other, but with no healthy side to stay on,
+        # neither onPhase2Timeout=fail nor autoFailbackEnabled=false
+        # holds it back: both only keep routing on a secondary that is
+        # still serving, and a healthy primary that may not have caught
+        # up beats no cluster at all (same reasoning as failover).
+        # Otherwise Phase 2 is skipped: the other side was not serving,
+        # so there is nothing in flight to replicate.
         outgoing = group.secondary if after_active == "primary" else group.primary
         is_failback = (
             after_active == "primary"
@@ -536,13 +538,11 @@ def trigger_drain(
         )
         if is_failback and not group.auto_failback_enabled:
             logger.warning(
-                "xCluster failback suppressed: %s CB reported HEALTHY but "
-                "autoFailbackEnabled=false; no viable cluster until the "
-                "secondary recovers or the operator fails back "
-                "(primary_uuid=%s).",
+                "xCluster failback despite autoFailbackEnabled=false: %s CB "
+                "reported HEALTHY and the secondary is down, so there is no "
+                "secondary to stay on (primary_uuid=%s).",
                 which_cluster, group.primary.uuid,
             )
-            return
         now_start = time.monotonic()
         with group.lock:
             group.last_failover_start_ts = now_start
