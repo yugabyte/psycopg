@@ -422,25 +422,32 @@ class HealthProbe:
         # independent threads; without this gate, the secondary probe
         # could enter trigger_drain while the primary probe was already
         # mid-drain, interleaving pause/resume and status transitions.
-        # Fall through the lock — trigger_drain re-acquires it as it
-        # mutates the group state.
+        # Review #9 (Amogh): check and claim in one lock section, so the
+        # other probe can't pass the same check before this one pauses
+        # dispatch. trigger_drain re-acquires the lock as it mutates the
+        # group state.
         with group.lock:
-            if group.dispatch_paused:
+            if group.dispatch_paused or group.drain_in_progress:
                 logger.info(
                     "%s probe: another drain is in flight "
-                    "(dispatch_paused=True); deferring transition "
+                    "(dispatch_paused=%s); deferring transition "
                     "%s → %s to next tick (primary_uuid=%s)",
-                    self._which, current.value, result.value,
-                    group.primary.uuid,
+                    self._which, group.dispatch_paused, current.value,
+                    result.value, group.primary.uuid,
                 )
                 return
+            group.drain_in_progress = True
         from .drain import trigger_drain            # late import; cycle-safe
-        trigger_drain(
-            group=group,
-            which_cluster=self._which,
-            new_status=result,
-            drain_timeout_s=self._drain_timeout_s,
-        )
+        try:
+            trigger_drain(
+                group=group,
+                which_cluster=self._which,
+                new_status=result,
+                drain_timeout_s=self._drain_timeout_s,
+            )
+        finally:
+            with group.lock:
+                group.drain_in_progress = False
 
     def _never_reached(self) -> bool:
         """True while this cluster is a bootstrap placeholder with no open
