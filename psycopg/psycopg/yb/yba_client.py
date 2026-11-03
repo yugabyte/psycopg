@@ -9,10 +9,10 @@ what the poll loop needs — three endpoints, one metric extraction.
 Wire format ported from Bill Chan's tools/yba-python-scripts/xcluster_lags.py:
   * base URL: ``{yba_endpoint}/api/v1``
   * auth header: ``X-AUTH-YW-API-TOKEN: <api_token>``
-  * self-signed TLS is common in YBA deployments — ``verify_ssl`` defaults
-    to False to match the field behaviour of that script. The DSN turns
-    verification on with ``yb.failover.ybaVerifySsl=true``, optionally
-    against the CA bundle in ``yb.failover.ybaCaFile`` (``cafile``).
+  * TLS is verified by default (``verify_ssl=True``). A YBA behind a
+    self-signed cert needs its CA bundle in ``yb.failover.ybaCaFile``
+    (``cafile``), or ``yb.failover.ybaVerifySsl=false`` to skip
+    verification.
 
 Uses only stdlib (``urllib.request``, ``ssl``, ``json``) — no ``requests``
 dependency added to the driver.
@@ -82,6 +82,18 @@ class YBAClientError(Exception):
         self.transient = transient
 
 
+def _cert_error(method: str, path: str, exc: Exception) -> "YBAClientError":
+    """A certificate that fails verification won't verify on a retry, so
+    it is permanent: bootstrap disables the lag phase and says why,
+    instead of every lag wait failing as "YBA unreachable"."""
+    return YBAClientError(
+        f"YBA {method} {path} TLS certificate verification failed: {exc}. "
+        "Set yb.failover.ybaCaFile to the YBA CA bundle, or "
+        "yb.failover.ybaVerifySsl=false to skip verification",
+        transient=False,
+    )
+
+
 # ------------------------------------------------------------------- client
 
 class YBAClient:
@@ -112,7 +124,7 @@ class YBAClient:
         self,
         endpoint: str,
         api_token: str,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
         connect_timeout_s: float = 2.0,
         read_timeout_s: float = 3.0,
         cafile: "str | None" = None,
@@ -266,6 +278,9 @@ class YBAClient:
                             self._open_connection()
                         else:
                             self._open_connection(deadline)
+                    except ssl.SSLCertVerificationError as exc:
+                        self._close_connection()
+                        raise _cert_error(method, path, exc) from exc
                     except (TimeoutError, OSError, ssl.SSLError) as exc:
                         raise YBAClientError(
                             f"YBA {method} {path} connect failed: {exc}",
@@ -307,6 +322,9 @@ class YBAClient:
                         f"YBA {method} {path} connection error: {exc}",
                         transient=True,
                     ) from exc
+                except ssl.SSLCertVerificationError as exc:
+                    self._close_connection()
+                    raise _cert_error(method, path, exc) from exc
                 except (TimeoutError, OSError, ssl.SSLError) as exc:
                     # Force a reconnect on the next call — http.client's
                     # state machine may be wedged after this.

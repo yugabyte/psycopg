@@ -104,10 +104,10 @@ _LAG_SCRAPE_HINT_S = 10
 # ExternalSignalCircuitBreaker (or a future force_recheck API).
 DEFAULT_AUTO_FAILBACK_ENABLED = True
 
-# YBA TLS verification. Off by default: YBA behind a self-signed cert is
-# the typical field deployment. ``ybaCaFile`` supplies the CA bundle to
-# verify against when it is turned on.
-DEFAULT_YBA_VERIFY_SSL = False
+# YBA TLS verification. On by default (review #8): the YBA API token is
+# an admin credential. A YBA behind a self-signed cert needs ``ybaCaFile``
+# (its CA bundle) or an explicit ``ybaVerifySsl=false``.
+DEFAULT_YBA_VERIFY_SSL = True
 
 # Global failover time budget (Amex ask, Aug 2026). When set, derives
 # drainTimeoutSecs and lagWaitTimeoutSecs so the total post-detection
@@ -359,9 +359,9 @@ class YBParams:
     # repr=False: the token is a YBA admin credential; keep it out of any
     # ``%r`` / exception message that formats a YBParams.
     yba_api_token: str = field(default="", repr=False)
-    # TLS verification of the YBA endpoint (review #8). ``False`` keeps
-    # the historical no-verify behaviour; ``yba_ca_file`` is the CA bundle
-    # used when verification is on (empty → system trust store).
+    # TLS verification of the YBA endpoint (review #8), on by default.
+    # ``yba_ca_file`` is the CA bundle to verify against (empty → system
+    # trust store).
     yba_verify_ssl: bool = DEFAULT_YBA_VERIFY_SSL
     yba_ca_file: str = ""
     replication_name: str = ""
@@ -406,16 +406,16 @@ class YBParams:
     # Phase 2 timeout policy — determines what happens when the YBA lag
     # wait exceeds ``lag_wait_timeout_s`` without converging.
     #
-    # ``"proceed"`` (default): flip anyway once the lag wait times out.
+    # ``"proceed"``: flip anyway once the lag wait times out.
     #     The app moves to a target that may be missing the outgoing
     #     side's last writes; that staleness is the documented cost of a
     #     bounded switch.
     #
-    # ``"fail"``: on a FAILBACK timeout the drain does NOT flip routing.
+    # ``"fail"`` (default): on a FAILBACK timeout the drain does NOT flip routing.
     #     Dispatch unpauses, status stays on the current side, and the
     #     probe retries after the cooldown. Failover always proceeds —
     #     staying on a side the CB just declared dead is worse.
-    failback_on_phase2_timeout: str = "proceed"
+    failback_on_phase2_timeout: str = "fail"
 
     # Failback overrides (design doc §3.5.1). Each is populated at
     # parse time with either the operator's ``yb.failback.<knob>`` value
@@ -776,13 +776,13 @@ def extract_yb_params(
             yba_verify_ssl = DEFAULT_YBA_VERIFY_SSL
     yba_ca_file = raw.get("yb_failover_yba_ca_file", "").strip()
 
-    # Failback Phase 2 timeout policy. 'proceed' (default) flips once
-    # the lag wait times out; 'fail' keeps routing on the secondary when
-    # a failback times out or YBA stays unreachable during its lag wait.
+    # Failback Phase 2 timeout policy. 'fail' (default) keeps routing on
+    # the secondary when a failback times out or YBA stays unreachable
+    # during its lag wait; 'proceed' flips once the lag wait times out.
     # Failover always proceeds, so the key lives only under yb.failback.*.
     failback_on_phase2_timeout_raw = raw.get("yb_failback_on_phase2_timeout")
     if failback_on_phase2_timeout_raw is None:
-        failback_on_phase2_timeout = "proceed"
+        failback_on_phase2_timeout = "fail"
     else:
         low = failback_on_phase2_timeout_raw.strip().lower()
         if low in ("fail", "proceed"):
