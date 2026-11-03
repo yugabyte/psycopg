@@ -1936,20 +1936,52 @@ class ClusterRegistry:
             return {k.dbname for k, u in self._key_to_uuid.items() if u == uuid}
 
     def reset_failover_group(self, primary_uuid: str) -> bool:
-        """Operator failback API. Flips BOTH primary and secondary status
-        back to HEALTHY immediately. Returns True if a group existed and
-        was reset, False otherwise. Equivalent of JDBC's JMX failback
-        operation (design doc §8)."""
+        """Operator failback API (the equivalent of JDBC's JMX failback
+        operation, design doc §8). Marks the primary HEALTHY through the
+        same drain as an automatic failback: barrier, close the conns on
+        the secondary, the failback Phase 2 lag wait under
+        ``yb.failback.onPhase2Timeout``, then the status change. Only the
+        ``autoFailbackEnabled`` gate does not apply. The secondary's status
+        is left to its own probe.
+
+        Review #10 (Amogh): it used to set both statuses directly, which
+        moved routing with no drain and no lag wait while conns on the
+        secondary kept writing.
+
+        Returns True once the failback has been attempted; like an
+        automatic one, it can still be refused under
+        ``onPhase2Timeout=fail`` (``get_failover_status`` shows the
+        result). Returns False if no group exists for ``primary_uuid``, or
+        if a drain is already running (call again once it has finished).
+        """
+        from .drain import trigger_drain
         from .health import HealthResult
         group = self.get_failover_group(primary_uuid)
         if group is None:
             return False
-        group.force_primary_status(HealthResult.HEALTHY)
-        group.force_secondary_status(HealthResult.HEALTHY)
+        with group.lock:
+            if group.dispatch_paused or group.drain_in_progress:
+                logger.warning(
+                    "operator failback not started: a drain is in flight "
+                    "(primary_uuid=%s); call reset_failover_group again "
+                    "once it has finished", primary_uuid,
+                )
+                return False
+            group.drain_in_progress = True
         logger.info(
-            "failover group reset to HEALTHY by operator: primary_uuid=%s",
-            primary_uuid,
+            "operator failback requested: primary_uuid=%s", primary_uuid,
         )
+        try:
+            trigger_drain(
+                group,
+                which_cluster="primary",
+                new_status=HealthResult.HEALTHY,
+                drain_timeout_s=group._probe_drain_timeout_s,
+                operator=True,
+            )
+        finally:
+            with group.lock:
+                group.drain_in_progress = False
         return True
 
     def get_failover_status(

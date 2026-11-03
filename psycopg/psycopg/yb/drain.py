@@ -459,12 +459,18 @@ def trigger_drain(
     which_cluster: str,
     new_status: HealthResult,
     drain_timeout_s: int,
+    operator: bool = False,
 ) -> None:
     """Apply a per-cluster CB status transition, running the barrier
     drain against the outgoing cluster iff the routing target actually
     changes.
 
-    Called from the probe thread — see health_probe.HealthProbe._maybe_apply.
+    Called from the probe thread — see health_probe.HealthProbe._maybe_apply
+    — and, with ``operator=True``, from
+    ``ClusterRegistry.reset_failover_group``. An operator failback runs
+    the same drain and Phase 2 as an automatic one; only the
+    autoFailbackEnabled gate does not apply, since the operator is the
+    manual failback that setting waits for.
     """
     if which_cluster not in ("primary", "secondary"):
         raise ValueError(
@@ -540,7 +546,7 @@ def trigger_drain(
         # Unknown (None): assume it served, so the lag wait still runs.
         outgoing_served = group.active_before_no_viable in (outgoing_label, None)
         is_failback = after_active == "primary" and outgoing_served
-        if is_failback and not group.auto_failback_enabled:
+        if is_failback and not group.auto_failback_enabled and not operator:
             logger.warning(
                 "xCluster failback despite autoFailbackEnabled=false: %s CB "
                 "reported HEALTHY and the secondary is down, so there is no "
@@ -573,7 +579,7 @@ def trigger_drain(
         before_active == "secondary"
         and after_active == "primary"
     )
-    if is_failback and not group.auto_failback_enabled:
+    if is_failback and not group.auto_failback_enabled and not operator:
         logger.warning(
             "xCluster failback suppressed: %s CB reported HEALTHY but "
             "autoFailbackEnabled=false; staying on secondary "
