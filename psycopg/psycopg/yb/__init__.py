@@ -352,10 +352,22 @@ def _read_statement_timeout_ms_sync(conn) -> "int | None":
         return None
 
 
+def _first_open_control(group, attr: str):
+    """The primary's control conn ``attr`` if open, else the secondary's.
+    The secondary covers bootstrap with the primary down (placeholder, no
+    control conn); both sides are opened from the same DSN parameters, so
+    either reports the same statement_timeout."""
+    for state in (group.primary, group.secondary):
+        conn = getattr(state, attr, None) if state is not None else None
+        if conn is not None and not conn.closed:
+            return conn
+    return None
+
+
 def _warn_statement_timeout_sync(group, drain_timeout_s: int) -> None:
     """Sync check called at the tail of ``bootstrap_failover_group``."""
-    conn = group.primary.control_sync
-    if conn is None or conn.closed:
+    conn = _first_open_control(group, "control_sync")
+    if conn is None:
         _bootstrap_logger.debug(
             "no sync control conn available; skipping statement_timeout warn"
         )
@@ -370,10 +382,11 @@ def _warn_statement_timeout_sync(group, drain_timeout_s: int) -> None:
 
 async def _awarn_statement_timeout_async(group, drain_timeout_s: int) -> None:
     """Async check called at the tail of ``abootstrap_failover_group``.
-    Uses ``group.primary.control_async`` if available; otherwise falls
-    through to the sync path if a sync control conn also exists."""
-    aconn = group.primary.control_async
-    if aconn is not None and not aconn.closed:
+    Uses the primary's ``control_async`` if available, else the
+    secondary's; otherwise falls through to the sync path if a sync
+    control conn exists."""
+    aconn = _first_open_control(group, "control_async")
+    if aconn is not None:
         try:
             async with aconn.cursor() as cur:
                 await cur.execute(
