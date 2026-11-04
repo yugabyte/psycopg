@@ -697,7 +697,7 @@ class FailoverGroup:
     yba_customer_uuid: str = ""
     xcluster_config_uuid: str = ""
     threshold_replication_lag_ms: int = 0
-    lag_wait_timeout_s: int = 30
+    lag_wait_timeout_s: int = 60
     # DB-24483 — Phase 2 freshness + liveness gate knobs. See
     # params.py for semantics. ``barrier_ts`` is the wall-clock
     # ``time.time()`` stamp at the moment ``pause_dispatch`` fires; the
@@ -705,8 +705,8 @@ class FailoverGroup:
     # reject samples that cannot reflect post-barrier replication.
     # Defaults match the DSN defaults (gate off, one confirmation), so a
     # group built without these knobs behaves like an unconfigured DSN.
-    lag_freshness_s: int = 0
-    lag_confirmation_samples: int = 1
+    lag_freshness_s: int = 25
+    lag_confirmation_samples: int = 2
     barrier_ts: float = 0.0
 
     # Failback-direction (B→A) Phase 2 config (design doc §3.5.1).
@@ -717,10 +717,10 @@ class FailoverGroup:
     # on failback" (fail-open) — same behaviour as YBA being unreachable.
     failback_xcluster_config_uuid: str = ""
     failback_threshold_replication_lag_ms: int = 0
-    failback_lag_wait_timeout_s: int = 30
+    failback_lag_wait_timeout_s: int = 60
     # DB-24483 — same gates in the failback direction.
-    failback_lag_freshness_s: int = 0
-    failback_lag_confirmation_samples: int = 1
+    failback_lag_freshness_s: int = 25
+    failback_lag_confirmation_samples: int = 2
 
     # ``globalTimeBudgetSecs`` per direction (None = no budget). The
     # drain derives its two phase timeouts from it, and also caps the
