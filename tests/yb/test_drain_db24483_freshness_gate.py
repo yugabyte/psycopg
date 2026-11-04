@@ -608,3 +608,75 @@ def test_pre_barrier_sample_never_confirms_single_confirmation(fake_state):
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
 
     assert len(client.calls) == 2
+
+
+# ------------------------------- failback waits for the first post-barrier sample
+
+def _make_failback_group(fake_state, yba_client, timeout_s: int) -> FailoverGroup:
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.UNHEALTHY,   # already failed over
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0,
+        yba_client=yba_client,
+        xcluster_config_uuid="xcc-a2b",
+        failback_xcluster_config_uuid="xcc-b2a",
+        failback_threshold_replication_lag_ms=0,
+        failback_lag_wait_timeout_s=timeout_s,
+        failback_lag_freshness_s=0,
+        failback_lag_confirmation_samples=1,
+    )
+    group.failback_on_phase2_timeout = "fail"
+    return group
+
+
+@pytest.fixture
+def short_scrape(monkeypatch):
+    from psycopg.yb import drain
+    monkeypatch.setattr(drain, "_LAG_SCRAPE_HINT_S", 3.0)
+
+
+def test_failback_waits_past_timeout_for_first_post_barrier_sample(
+    fake_state, short_scrape,
+):
+    """stress failback_refused_on_timeout/budget_10: lag=0 on every poll of
+    a 6s wait, all on a sample taken just before Phase 1 ended, so the
+    failback aborted. It now waits for the next sample and fails back."""
+    pre = time.time() - 0.5
+    client = _ScriptedYBAClient(script=[
+        (0.0, pre), (0.0, pre), (0.0, pre), (0.0, time.time() + 10_000.0),
+    ])
+    group = _make_failback_group(fake_state, client, timeout_s=1)
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 4
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_failback_extension_runs_once_and_is_bounded(fake_state, short_scrape):
+    pre = time.time() - 0.5
+    client = _ScriptedYBAClient(script=[(0.0, pre)])
+    group = _make_failback_group(fake_state, client, timeout_s=1)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    # 1s timeout + at most one 3s sample interval + one 1s poll.
+    assert elapsed <= 5.5
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_failback_lagged_sample_does_not_extend(fake_state, short_scrape):
+    client = _ScriptedYBAClient(script=[(500.0, time.time() - 0.5)])
+    group = _make_failback_group(fake_state, client, timeout_s=1)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed <= 2.0
+    assert group.primary_status == HealthResult.UNHEALTHY

@@ -1241,7 +1241,10 @@ def _wait_for_replication_lag(
          healthy secondary), as on a timeout.
 
     Never blocks failover on YBA availability. Never blocks longer than
-    ``lag_wait_timeout_s``. Log at WARNING on entry and exit so operators
+    ``lag_wait_timeout_s``, except that a failback which would abort with
+    only pre-barrier ≤ threshold samples waits once for the next YBA
+    sample (at most one scrape interval plus one poll). Log at WARNING on
+    entry and exit so operators
     can read the outcome from the log timeline.
 
     ``is_failback`` picks between the A→B config + failover knobs
@@ -1318,6 +1321,41 @@ def _wait_for_replication_lag(
     # one does NOT advance the liveness count.
     last_counted_sample_ts: float | None = None
     warned_no_sample_ts = False
+    # sample_ts of the latest ≤ threshold sample that was not counted only
+    # because it predates the barrier. None once a later poll says
+    # anything else (lagged, counted, no data).
+    pre_barrier_pass_ts: float | None = None
+    extended = False
+
+    def _extend_to_next_sample() -> bool:
+        """A failback that would abort while the only ≤ threshold samples
+        predate the barrier waits once for YBA's next sample instead.
+        Re-stamping the barrier at the end of Phase 1 leaves a short lag
+        wait (6s on a 10s budget) less than one sample interval after the
+        barrier, so a caught-up universe could never confirm (stress
+        failback_refused_on_timeout/budget_10). The extension can run past
+        globalTimeBudgetSecs by up to one sample interval plus one poll."""
+        nonlocal deadline, extended
+        if extended or pre_barrier_pass_ts is None:
+            return False
+        if not (policy == "fail" and is_failback):
+            return False
+        next_sample_in = pre_barrier_pass_ts + _LAG_SCRAPE_HINT_S - time.time()
+        new_deadline = min(
+            time.monotonic() + max(0.0, next_sample_in) + _LAG_POLL_INTERVAL_S,
+            deadline + _LAG_SCRAPE_HINT_S + _LAG_POLL_INTERVAL_S,
+        )
+        if new_deadline <= deadline:
+            return False
+        extended = True
+        logger.warning(
+            "lag wait: lag=0 so far only on samples that predate the "
+            "barrier; extending the failback lag wait by %.1fs for YBA's "
+            "next sample (past the global time budget if one is set)",
+            new_deadline - deadline,
+        )
+        deadline = new_deadline
+        return True
 
     # agent-K PR #8:430: the deadline is checked only BEFORE each poll,
     # but a YBA request can take up to ~`max(connect, read)`×2 (reconnect
@@ -1346,6 +1384,9 @@ def _wait_for_replication_lag(
             _MIN_POLL_BUDGET_S = _one_poll_cost_s
         if not _poll_guard:
             _MIN_POLL_BUDGET_S = 0.0
+        timed_out = now >= deadline or deadline - now < _MIN_POLL_BUDGET_S
+        if timed_out and _extend_to_next_sample():
+            continue
         if now >= deadline:
             elapsed = now - started
             # Phase 2 timeout policy. Agent-K PR #18:710,575. The `fail`
@@ -1539,6 +1580,7 @@ def _wait_for_replication_lag(
             )
             return
 
+        pre_barrier_pass = False
         if lag_ms is not None and lag_ms <= threshold_ms:
             elapsed = time.monotonic() - started
             # DB-24483 — freshness gate. A YBA sample whose ``sample_ts``
@@ -1571,6 +1613,7 @@ def _wait_for_replication_lag(
                     # Reset liveness: a stale sample is not a true pass.
                     confirmed_count = 0
                     last_counted_sample_ts = None
+                    pre_barrier_pass_ts = None
                     sleep_s = min(
                         _LAG_POLL_INTERVAL_S,
                         max(0.0, deadline - time.monotonic()),
@@ -1594,6 +1637,7 @@ def _wait_for_replication_lag(
                 # (stress phase2_claim: converged on such a sample while
                 # B was still missing batches). Applies at any
                 # confirmation count: with one, it is the only guard.
+                pre_barrier_pass = True
                 logger.info(
                     "lag wait: lag=%.1fms sample at %.3f predates the "
                     "barrier %.3f — not counting (confirmations=%d/%d, "
@@ -1688,6 +1732,7 @@ def _wait_for_replication_lag(
                 )
             confirmed_count = 0
             last_counted_sample_ts = None
+        pre_barrier_pass_ts = sample_ts if pre_barrier_pass else None
 
         # Poll again in ~1s. If the remaining budget is smaller, sleep
         # only that much so we don't overshoot the deadline.
