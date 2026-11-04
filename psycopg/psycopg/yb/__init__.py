@@ -415,8 +415,9 @@ async def _awarn_statement_timeout_async(group, drain_timeout_s: int) -> None:
         if warn:
             _emit_statement_timeout_warning(reason)
         return
-    # No async control conn — try sync fallback.
-    _warn_statement_timeout_sync(group, drain_timeout_s)
+    # No async control conn — try the sync one, off the event loop.
+    import asyncio
+    await asyncio.to_thread(_warn_statement_timeout_sync, group, drain_timeout_s)
 
 
 __all__ = [

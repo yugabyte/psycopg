@@ -18,15 +18,16 @@ The fix:
   * Fire ``close()`` on every survivor concurrently via a thread pool.
     A stuck ``send()`` only ties up one worker; others complete freely.
   * If any close hasn't returned within ``_KILL_AT_TIMEOUT_BUDGET_S``
-    (default 2 s), hard-close the socket fd via ``os.close`` as the
-    escape hatch. The driver-side conn is disowned even if the libpq
-    worker is still blocked in ``send()``.
+    (default 2 s), or never started, shut its socket down
+    (``SHUT_RDWR`` through a dup of the fd) as the escape hatch. The
+    drain never ``os.close``s the conn's own fd: libpq still owns it
+    and the number could be reused under it (Review #6).
 
 These tests verify:
 
   * Fast closes (typical case) still complete + log per-conn ``force-closed``.
-  * A hung ``close()`` gets its fd hard-closed within budget, not after
-    the full TCP timeout.
+  * A hung ``close()`` gets its socket shut down within budget, not
+    after the full TCP timeout; its fd stays open.
   * Drain wall-clock stays bounded regardless of how many conns hang.
   * A ``close()`` that raises (e.g. malformed conn) is caught + logged,
     doesn't break sibling closes.
@@ -71,15 +72,17 @@ class _HungConn:
     """A conn whose ``close()`` blocks on ``hang_event`` (never released
     in these tests) — mirrors a libpq ``PQfinish`` stuck in ``send()``
     on a wedged TCP peer. The socket fd is real (from ``socketpair``)
-    so ``os.close`` can genuinely release it as the escape hatch."""
+    so the escape hatch's shutdown is observable from the peer."""
 
     def __init__(self, fd: int) -> None:
         self.info = _FakeInfo(TransactionStatus.INTRANS)
         self.pgconn = types.SimpleNamespace(socket=fd)
         self.hang_event = threading.Event()
+        self.close_started = False
         self.close_returned = False
 
     def close(self) -> None:
+        self.close_started = True
         # Never released in the test — mimics an infinite hang.
         # 60s cap so a broken test doesn't leak the thread forever.
         self.hang_event.wait(timeout=60)
@@ -135,6 +138,40 @@ def owned_socketpair():
             pass
 
 
+def _spy_os_close(monkeypatch) -> List[int]:
+    """Record os.close calls made by the drain (without stopping them)."""
+    calls: List[int] = []
+    real_os_close = os.close
+
+    def spy(fd):
+        calls.append(fd)
+        return real_os_close(fd)
+
+    monkeypatch.setattr("psycopg.yb.drain.os.close", spy)
+    return calls
+
+
+def _fd_open(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+        return True
+    except OSError:
+        return False
+
+
+def _peer_sees_shutdown(peer_fd: int, timeout: float = 1.0) -> bool:
+    """True if the other end of a socketpair reads EOF: the escape hatch
+    shut the conn's socket down."""
+    s = socket.socket(fileno=os.dup(peer_fd))
+    try:
+        s.settimeout(timeout)
+        return s.recv(1) == b""
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 # ------------------------------------------------------- _safe_close
 
 def test_safe_close_returns_none_on_success():
@@ -186,15 +223,7 @@ def test_hung_close_falls_back_to_hard_fd(fake_state, owned_socketpair, monkeypa
     hung = _HungConn(fd=fd_a)
     group.primary.tracked_conns.add(hung)
 
-    # Observe os.close calls without stopping them.
-    close_calls: List[int] = []
-    real_os_close = os.close
-
-    def spy(fd):
-        close_calls.append(fd)
-        return real_os_close(fd)
-
-    monkeypatch.setattr("psycopg.yb.drain.os.close", spy)
+    close_calls = _spy_os_close(monkeypatch)
 
     t0 = time.monotonic()
     trigger_drain(
@@ -212,10 +241,10 @@ def test_hung_close_falls_back_to_hard_fd(fake_state, owned_socketpair, monkeypa
         f"(drain_timeout_s=1 + kill_budget={_KILL_AT_TIMEOUT_BUDGET_S})"
     )
 
-    # Hard-fd escape hatch actually fired on our fd.
-    assert fd_a in close_calls, (
-        f"expected os.close({fd_a}) as escape hatch; saw calls: {close_calls}"
-    )
+    # Escape hatch shut the socket down without closing the conn's fd.
+    assert fd_a not in close_calls, "drain must never os.close a conn's fd"
+    assert _fd_open(fd_a)
+    assert _peer_sees_shutdown(_fd_b)
 
     # Routing still flipped despite the hung close.
     assert group.primary_status == HealthResult.UNHEALTHY
@@ -239,14 +268,7 @@ def test_mixed_fast_and_hung_closes(fake_state, monkeypatch):
         for c in (fast1, fast2, hung):
             group.primary.tracked_conns.add(c)
 
-        close_calls: List[int] = []
-        real_os_close = os.close
-
-        def spy(fd):
-            close_calls.append(fd)
-            return real_os_close(fd)
-
-        monkeypatch.setattr("psycopg.yb.drain.os.close", spy)
+        close_calls = _spy_os_close(monkeypatch)
 
         t0 = time.monotonic()
         trigger_drain(
@@ -260,11 +282,14 @@ def test_mixed_fast_and_hung_closes(fake_state, monkeypatch):
         assert elapsed < 1 + _KILL_AT_TIMEOUT_BUDGET_S + 2
         assert fast1.closed
         assert fast2.closed
-        # Only the hung conn's fd went through the escape hatch.
-        assert pair3[0].fileno() in close_calls
-        # The fast conns did NOT need hard-fd-close.
-        assert pair1[0].fileno() not in close_calls
-        assert pair2[0].fileno() not in close_calls
+        # Only the hung conn's socket went through the escape hatch,
+        # and no conn's own fd was closed by the drain.
+        assert _peer_sees_shutdown(pair3[1].fileno())
+        for pair in (pair1, pair2, pair3):
+            assert pair[0].fileno() not in close_calls
+            assert _fd_open(pair[0].fileno())
+        assert not _peer_sees_shutdown(pair1[1].fileno(), timeout=0.2)
+        assert not _peer_sees_shutdown(pair2[1].fileno(), timeout=0.2)
 
         hung.hang_event.set()
     finally:
@@ -312,14 +337,7 @@ def test_many_hung_conns_still_bounded(fake_state, monkeypatch):
         for c in hungs:
             group.primary.tracked_conns.add(c)
 
-        close_calls: List[int] = []
-        real_os_close = os.close
-
-        def spy(fd):
-            close_calls.append(fd)
-            return real_os_close(fd)
-
-        monkeypatch.setattr("psycopg.yb.drain.os.close", spy)
+        close_calls = _spy_os_close(monkeypatch)
 
         t0 = time.monotonic()
         trigger_drain(
@@ -334,9 +352,9 @@ def test_many_hung_conns_still_bounded(fake_state, monkeypatch):
         assert elapsed < 1 + _KILL_AT_TIMEOUT_BUDGET_S + 3, (
             f"drain took {elapsed:.1f}s with {n} hung conns; expected bounded"
         )
-        # Every one got the escape hatch.
-        expected_fds = {p[0].fileno() for p in pairs}
-        assert expected_fds.issubset(set(close_calls))
+        # Every one got the escape hatch; none had its fd closed.
+        assert all(_peer_sees_shutdown(p[1].fileno()) for p in pairs)
+        assert not {p[0].fileno() for p in pairs} & set(close_calls)
 
         for h in hungs:
             h.hang_event.set()
@@ -413,14 +431,7 @@ def test_drain_timeout_zero_still_parallel_closes(fake_state, monkeypatch):
         hung = _HungConn(fd=a.fileno())
         group.primary.tracked_conns.add(hung)
 
-        close_calls: List[int] = []
-        real_os_close = os.close   # capture BEFORE patching to avoid recursion
-
-        def spy(fd):
-            close_calls.append(fd)
-            return real_os_close(fd)
-
-        monkeypatch.setattr("psycopg.yb.drain.os.close", spy)
+        close_calls = _spy_os_close(monkeypatch)
 
         t0 = time.monotonic()
         trigger_drain(
@@ -433,7 +444,8 @@ def test_drain_timeout_zero_still_parallel_closes(fake_state, monkeypatch):
 
         # No drain window + kill budget → very fast completion.
         assert elapsed < _KILL_AT_TIMEOUT_BUDGET_S + 2
-        assert a.fileno() in close_calls
+        assert a.fileno() not in close_calls
+        assert _peer_sees_shutdown(b.fileno())
         hung.hang_event.set()
     finally:
         for s in (a, b):
@@ -441,3 +453,48 @@ def test_drain_timeout_zero_still_parallel_closes(fake_state, monkeypatch):
                 s.close()
             except OSError:
                 pass
+
+
+# ------------------------------------------------------- queued past the budget
+
+def test_queued_close_is_cancelled_and_its_socket_shut_down(fake_state, monkeypatch):
+    """Review #6 (Amogh): with more survivors than workers (32), the rest
+    are still queued at the deadline. Their close must be cancelled (it
+    would otherwise run later and PQfinish an fd number that may belong
+    to another socket by then), their socket shut down, and no fd
+    closed by the drain."""
+    n = 36
+    pairs = [socket.socketpair() for _ in range(n)]
+    try:
+        group = _make_group(fake_state)
+        hungs = [_HungConn(fd=p[0].fileno()) for p in pairs]
+        for c in hungs:
+            group.primary.tracked_conns.add(c)
+        close_calls = _spy_os_close(monkeypatch)
+
+        t0 = time.monotonic()
+        trigger_drain(
+            group=group,
+            which_cluster="primary",
+            new_status=HealthResult.UNHEALTHY,
+            drain_timeout_s=0,
+        )
+        assert time.monotonic() - t0 < _KILL_AT_TIMEOUT_BUDGET_S + 2
+
+        started = [h for h in hungs if h.close_started]
+        assert len(started) == 32
+        assert all(_peer_sees_shutdown(p[1].fileno()) for p in pairs)
+        assert not {p[0].fileno() for p in pairs} & set(close_calls)
+
+        # Release the running closes; the cancelled ones never run.
+        for h in hungs:
+            h.hang_event.set()
+        time.sleep(0.3)
+        assert sum(h.close_started for h in hungs) == 32
+    finally:
+        for pair in pairs:
+            for s in pair:
+                try:
+                    s.close()
+                except OSError:
+                    pass

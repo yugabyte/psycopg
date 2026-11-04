@@ -26,8 +26,9 @@ It composes:
      ``_safe_close`` type-dispatches and calls ``pgconn.finish()``
      for async conns (DB-24960). Close is bounded by
      ``_KILL_AT_TIMEOUT_BUDGET_S`` (default 2 s); any conn whose
-     close hasn't returned within the budget gets its socket fd
-     hard-closed via ``os.close`` — a stuck TCP ``send()`` in libpq's
+     close hasn't returned within the budget gets its socket shut
+     down (``SHUT_RDWR`` through a dup of its fd; the fd itself is
+     never closed by the drain) — a stuck TCP ``send()`` in libpq's
      ``PQfinish`` could otherwise block for ``tcp_retries2`` (~15 min
      on Linux, worse with TCP keepalive disabled). Bounds total drain
      wall-clock at ``drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S``
@@ -78,11 +79,17 @@ logger = logging.getLogger(__name__)
 class Phase2TimeoutError(Exception):
     """Raised by a FAILBACK Phase 2 lag wait when it times out, or YBA
     stays unreachable for ``_LAG_UNREACHABLE_STRIKES`` polls, and the
-    group's ``failback_on_phase2_timeout`` is ``"fail"`` (opt-in; the default
-    is ``"proceed"``).
+    group's ``failback_on_phase2_timeout`` is ``"fail"`` (the default;
+    ``"proceed"`` flips instead).
 
     Caught by ``_drain_and_apply``, which then SKIPS the status
     transition (does NOT flip routing) and resumes dispatch.
+
+    The message ends up in the "xCluster drain ABORTED at Phase 2" line.
+    It must not repeat the wording of the ERROR line logged just before
+    the raise ("lag wait timeout", "unexpected YBA error"): log consumers
+    classify a line by the first phrase it contains, and the ABORTED line
+    would then read as a second timeout instead of the abort.
     """
 
 # Minimum time between closing the outgoing side's conns and resuming
@@ -98,8 +105,27 @@ _CLOSE_FENCE_S = 1.0
 # OS's tcp_retries2 gives up — ~15 min on Linux default. A serial
 # for-loop of c.close() would therefore hang drain past its own
 # deadline. This budget bounds the parallel close phase; anything still
-# stuck at the end gets its fd hard-closed via os.close.
+# stuck at the end gets its socket shut down (see _shutdown_socket_fd).
 _KILL_AT_TIMEOUT_BUDGET_S = 2.0
+
+
+def _shutdown_socket_fd(dup_fd: int) -> None:
+    """``shutdown(SHUT_RDWR)`` the socket behind ``dup_fd``, our own dup
+    of a conn's fd. Unblocks any thread inside libpq on that socket
+    (its read/write errors out) without closing the conn's fd, so the
+    fd number can't be reused under libpq. The caller closes
+    ``dup_fd``."""
+    import socket as _socket
+    try:
+        sock = _socket.socket(fileno=dup_fd)
+    except OSError:
+        return   # not a socket
+    try:
+        sock.shutdown(_socket.SHUT_RDWR)
+    except OSError:
+        pass     # already shut down / disconnected
+    finally:
+        sock.detach()
 
 
 def _release_registry_count(c) -> None:
@@ -113,16 +139,16 @@ def _release_registry_count(c) -> None:
     rest of the process lifetime (agent-K PR #13:111). Call this
     manually on any close path that doesn't flow through
     ``Connection.close``.
+
+    Idempotent per conn (review #18): ``ClusterRegistry.release_conn``
+    decrements at most once, so a later ``close()`` or ``xcluster_check``
+    on the same conn doesn't decrement again. Conns without
+    ``_yb_uuid`` / ``_yb_host`` (control conns, test fakes) are skipped
+    there.
     """
-    uuid = getattr(c, "_yb_uuid", None)
-    host = getattr(c, "_yb_host", None)
-    if not uuid or not host:
-        # Not a smart-driver conn (control conn, pool bypass, test
-        # fake). The registry didn't increment for it, nothing to do.
-        return
     try:
         from .registry import ClusterRegistry
-        ClusterRegistry.instance().decrement(uuid, host)
+        ClusterRegistry.instance().release_conn(c)
     except Exception:
         # Registry decrement is best-effort — a stale uuid / torn-down
         # state must not block the actual close path.
@@ -321,6 +347,18 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
 _IN_FLIGHT_TX_STATUSES = frozenset((1, 2, 3))   # ACTIVE, INTRANS, INERROR
 
 
+def _tracked_snapshot(state: "ClusterState") -> list:
+    """List of ``state.tracked_conns`` taken under ``state.lock``, the
+    lock connect holds to add / discard (Review #10, Amogh): iterating
+    the WeakSet while another thread adds to it raises "Set changed size
+    during iteration"."""
+    lock = getattr(state, "lock", None)
+    if lock is None:
+        return list(state.tracked_conns)
+    with lock:
+        return list(state.tracked_conns)
+
+
 def _in_flight_conns(tracked: "weakref.WeakSet") -> list:
     """Return the list of currently-in-transaction conns from a tracked
     set. Iterates over a snapshot so mid-iteration GC evictions don't
@@ -421,12 +459,18 @@ def trigger_drain(
     which_cluster: str,
     new_status: HealthResult,
     drain_timeout_s: int,
+    operator: bool = False,
 ) -> None:
     """Apply a per-cluster CB status transition, running the barrier
     drain against the outgoing cluster iff the routing target actually
     changes.
 
-    Called from the probe thread — see health_probe.HealthProbe._maybe_apply.
+    Called from the probe thread — see health_probe.HealthProbe._maybe_apply
+    — and, with ``operator=True``, from
+    ``ClusterRegistry.reset_failover_group``. An operator failback runs
+    the same drain and Phase 2 as an automatic one; only the
+    autoFailbackEnabled gate does not apply, since the operator is the
+    manual failback that setting waits for.
     """
     if which_cluster not in ("primary", "secondary"):
         raise ValueError(
@@ -473,6 +517,8 @@ def trigger_drain(
             "routing suspended until a cluster recovers",
             which_cluster, new_status.value, group.primary.uuid,
         )
+        with group.lock:
+            group.active_before_no_viable = before_active
         _apply_status_change(group, which_cluster, new_status)
         return
 
@@ -480,10 +526,33 @@ def trigger_drain(
         # Recovery from no-viable. Routing changes (None → after_active),
         # so run a real drain against the OTHER side: it closes anything
         # still open there (e.g. conns that outlived a probe-only
-        # outage) before dispatch resumes onto after_active. Phase 2 is
-        # skipped — the other side was not serving, so there is nothing
-        # in flight to replicate.
+        # outage) before dispatch resumes onto after_active.
+        #
+        # Phase 2 runs when the other side was the one serving when
+        # no-viable began: writes it committed just before going down
+        # may still be replicating. The primary recovering after the
+        # secondary served is a failback: it runs the failback lag wait,
+        # but with no healthy side to stay on, neither
+        # onPhase2Timeout=fail nor autoFailbackEnabled=false holds it
+        # back: both only keep routing on a secondary that is still
+        # serving, and a healthy primary that may not have caught up
+        # beats no cluster at all (same reasoning as failover). The
+        # secondary recovering after the primary served runs the A→B lag
+        # wait, which like any failover proceeds on timeout. Otherwise
+        # Phase 2 is skipped: the other side was not serving, so there
+        # is nothing in flight to replicate.
         outgoing = group.secondary if after_active == "primary" else group.primary
+        outgoing_label = "secondary" if after_active == "primary" else "primary"
+        # Unknown (None): assume it served, so the lag wait still runs.
+        outgoing_served = group.active_before_no_viable in (outgoing_label, None)
+        is_failback = after_active == "primary" and outgoing_served
+        if is_failback and not group.auto_failback_enabled and not operator:
+            logger.warning(
+                "xCluster failback despite autoFailbackEnabled=false: %s CB "
+                "reported HEALTHY and the secondary is down, so there is no "
+                "secondary to stay on (primary_uuid=%s).",
+                which_cluster, group.primary.uuid,
+            )
         now_start = time.monotonic()
         with group.lock:
             group.last_failover_start_ts = now_start
@@ -494,7 +563,8 @@ def trigger_drain(
             outgoing=outgoing,
             drain_timeout_s=drain_timeout_s,
             is_failback=after_active == "primary",
-            skip_phase2=True,
+            skip_phase2=not outgoing_served,
+            phase2_may_abort=False,
         )
         return
 
@@ -509,7 +579,7 @@ def trigger_drain(
         before_active == "secondary"
         and after_active == "primary"
     )
-    if is_failback and not group.auto_failback_enabled:
+    if is_failback and not group.auto_failback_enabled and not operator:
         logger.warning(
             "xCluster failback suppressed: %s CB reported HEALTHY but "
             "autoFailbackEnabled=false; staying on secondary "
@@ -597,16 +667,21 @@ def _drain_and_apply(
     drain_timeout_s: int,
     is_failback: bool = False,
     skip_phase2: bool = False,
+    phase2_may_abort: bool = True,
 ) -> None:
     """Full barrier-drain-flip sequence. See module docstring.
 
     ``skip_phase2`` is set for recovery from no-viable, where the
-    outgoing side was not serving and there is no lag to wait for."""
+    outgoing side was not serving and there is no lag to wait for.
+    ``phase2_may_abort=False`` (failback out of no-viable) makes the
+    failback lag wait proceed where onPhase2Timeout=fail would abort:
+    there is no healthy side to stay on."""
     # Snapshot the initial tracked-conn count for the log line — the
     # weakref set may shrink under GC during the drain.
     drain_started = time.monotonic()
-    initial_tracked = len(outgoing.tracked_conns)
-    initial_in_flight = len(_in_flight_conns(outgoing.tracked_conns))
+    tracked_now = _tracked_snapshot(outgoing)
+    initial_tracked = len(tracked_now)
+    initial_in_flight = len(_in_flight_conns(tracked_now))
     initial_drained = initial_tracked - initial_in_flight
     logger.info(
         "xCluster drain-wait start (barrier armed, deadline in %ss): "
@@ -658,10 +733,10 @@ def _drain_and_apply(
         total_idle_closed = 0
         while True:
             idle_closed = _close_idle_tracked_during_drain(
-                outgoing.tracked_conns, outgoing.uuid,
+                _tracked_snapshot(outgoing), outgoing.uuid,
             )
             total_idle_closed += idle_closed
-            in_txn = _in_flight_conns(outgoing.tracked_conns)
+            in_txn = _in_flight_conns(_tracked_snapshot(outgoing))
             children_in_txn = (
                 follow.children_in_flight(gen) if follow is not None else 0
             )
@@ -670,7 +745,7 @@ def _drain_and_apply(
                 logger.debug(
                     "drain: all in-flight txns completed on %s "
                     "(tracked=%d, idle_closed_this_drain=%d)",
-                    outgoing.uuid, len(outgoing.tracked_conns),
+                    outgoing.uuid, len(_tracked_snapshot(outgoing)),
                     total_idle_closed,
                 )
                 break
@@ -695,7 +770,7 @@ def _drain_and_apply(
         # conns are already evicted by ``xcluster_check`` on next
         # ``getconn``; closing them here is redundant but harmless.
         survivors = [
-            c for c in list(outgoing.tracked_conns)
+            c for c in _tracked_snapshot(outgoing)
             if c is not None and not getattr(c, "closed", False)
         ]
         children_live = 0
@@ -712,10 +787,9 @@ def _drain_and_apply(
         # on the FIRST hung TCP session for ~tcp_retries2 (up to ~15
         # min on Linux, worse with keepalive=0), which would wedge
         # drain past its own deadline. For any close() that doesn't
-        # return within _KILL_AT_TIMEOUT_BUDGET_S, escape via raw
-        # os.close on the socket fd — the libpq send() may still be
-        # blocked upstream, but from the driver's perspective the conn
-        # is disowned and drain proceeds. Bounds total wall-clock at
+        # return within _KILL_AT_TIMEOUT_BUDGET_S (or never started),
+        # escape by shutting its socket down — the blocked libpq call
+        # errors out, and drain proceeds. Bounds total wall-clock at
         # drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S regardless of
         # TCP state.
         if survivors:
@@ -739,8 +813,12 @@ def _drain_and_apply(
                     drain_timeout_s, len(survivors), outgoing.uuid,
                     _KILL_AT_TIMEOUT_BUDGET_S,
                 )
-            # Snapshot fds BEFORE close() nulls the pgconn state —
-            # we need them for the hard-fd escape hatch.
+            # Snapshot fds BEFORE close() nulls the pgconn state, and
+            # dup each one: the escape hatch below shuts the socket down
+            # through our own dup, so it can only ever reach this conn's
+            # socket, even if libpq closes its fd and the number is
+            # reused meanwhile. Review #6 (Amogh): the escape hatch
+            # used to os.close() the borrowed fd number.
             snapshot = []
             for c in survivors:
                 try:
@@ -748,7 +826,13 @@ def _drain_and_apply(
                     conn_id = f"conn=fd{fd}"
                 except Exception:
                     fd, conn_id = None, f"conn={id(c):x}"
-                snapshot.append((c, fd, conn_id))
+                dup_fd = None
+                if isinstance(fd, int) and fd >= 0:
+                    try:
+                        dup_fd = os.dup(fd)
+                    except OSError:
+                        dup_fd = None
+                snapshot.append((c, dup_fd, conn_id))
 
             hung = 0
             # NB: intentionally NOT using `with ThreadPoolExecutor()` —
@@ -756,45 +840,31 @@ def _drain_and_apply(
             # on hung workers and re-introduce the very problem we're
             # solving. Manual instantiation + explicit shutdown(wait=
             # False) in finally lets a stuck close() worker remain
-            # detached in the background; the driver-side conn is
-            # already disowned via os.close of its fd (see below), so
-            # the hang has no downstream effect. When the OS eventually
-            # gives up on the wedged send() (tcp_retries2), the worker
-            # unwinds naturally.
+            # detached in the background; its socket has been shut
+            # down (see below), so the stuck send() errors out and the
+            # worker unwinds, and libpq closes its own fd.
             ex = concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(len(survivors), 32),
                 thread_name_prefix="yb-kill",
             )
             try:
                 fut_by_conn = {
-                    ex.submit(_safe_close, c): (c, fd, conn_id)
-                    for c, fd, conn_id in snapshot
+                    ex.submit(_safe_close, c): (c, dup_fd, conn_id)
+                    for c, dup_fd, conn_id in snapshot
                 }
                 concurrent.futures.wait(
                     list(fut_by_conn),
                     timeout=_KILL_AT_TIMEOUT_BUDGET_S,
                 )
-                for fut, (c, fd, conn_id) in fut_by_conn.items():
+                for fut, (c, dup_fd, conn_id) in fut_by_conn.items():
+                    # Escape hatch: shutdown(SHUT_RDWR), never close.
+                    # The fd is not ours: its owner (a thread inside
+                    # libpq, or the close() worker blocked in PQfinish)
+                    # still uses it. Shutdown unblocks that thread's
+                    # read/write; the fd number stays allocated until
+                    # libpq closes it, so no other socket can be hit
+                    # (agent-K PR #21:672, Review #6).
                     needs_hard_close = False
-                    # agent-K PR #21:672 blocker. The hard-fd escape
-                    # hatch is only safe when `_closed=True` has been
-                    # set on the conn — then the driver has disowned it
-                    # and the owner thread won't touch it again. On the
-                    # hung-close branch, `_safe_close` has already set
-                    # `_closed=True` before `c.close()` started blocking.
-                    # On the lock-timeout branch (DB-25090), `_closed`
-                    # is still False and the owner is still inside
-                    # libpq holding a PGconn whose fd we are about to
-                    # free; Linux will give the next socket the lowest
-                    # free fd (likely this one), the owner's next libpq
-                    # read/write hits a different conn → cross-conn
-                    # protocol corruption. On that branch use
-                    # `shutdown(SHUT_RDWR)` instead: it unblocks the
-                    # owner's blocked read/write but keeps the fd
-                    # number reserved so no reuse race, and the
-                    # owner's eventual close() finishes teardown
-                    # cleanly (including ClusterRegistry.decrement).
-                    hard_close_mode = "close"   # vs "shutdown"
                     hard_close_reason = ""
                     if fut.done():
                         exc = fut.result()
@@ -825,12 +895,8 @@ def _drain_and_apply(
                             # from the driver's point of view, which
                             # means the owner can still issue the next
                             # cursor call on this socket post-flip and
-                            # dual-write. Use the shutdown-not-close
-                            # variant so we unblock the owner's libpq
-                            # call without racing fd reuse (agent-K
-                            # PR #21:672).
+                            # dual-write.
                             needs_hard_close = True
-                            hard_close_mode = "shutdown"
                             hard_close_reason = (
                                 f"lock held past "
                                 f"{_SAFE_CLOSE_LOCK_BUDGET_S}s "
@@ -842,83 +908,33 @@ def _drain_and_apply(
                                 "drain: close() raised on %s: %r",
                                 conn_id, exc,
                             )
-                    else:
-                        # close() hung past the budget. Hard-close the
-                        # fd directly — releases the driver's grip
-                        # even though libpq's PQfinish send() may
-                        # still be blocked in the worker thread. The
-                        # OS closes the socket immediately; libpq's
-                        # blocked send() will error out when the peer
-                        # (or the closed local half) becomes evident.
+                    elif fut.cancel():
+                        # Never started: queued behind max_workers past
+                        # the budget. Nothing closed this conn, and its
+                        # owner may be inside libpq right now.
                         needs_hard_close = True
                         hard_close_reason = (
-                            f"close() hung past "
+                            f"close() still queued after "
+                            f"{_KILL_AT_TIMEOUT_BUDGET_S}s budget"
+                        )
+                    else:
+                        # Started but not returned: blocked waiting for
+                        # conn.lock, or close() hung in PQfinish's
+                        # send(). Shutdown unblocks either.
+                        needs_hard_close = True
+                        hard_close_reason = (
+                            f"close() still running past "
                             f"{_KILL_AT_TIMEOUT_BUDGET_S}s budget"
                         )
                     if needs_hard_close:
                         hung += 1
-                        if fd is not None:
-                            try:
-                                if hard_close_mode == "shutdown":
-                                    # agent-K PR #21:672 — SHUT_RDWR
-                                    # unblocks the owner's libpq read /
-                                    # write without freeing the fd
-                                    # number. Owner's eventual close()
-                                    # (triggered by the broken-socket
-                                    # error their next call sees) runs
-                                    # the full Connection.close path
-                                    # including the registry decrement.
-                                    #
-                                    # Agent-K PR #21:G4 — hold the
-                                    # socket in a local, then call
-                                    # ``detach()`` so the socket
-                                    # object's ``__del__`` does NOT
-                                    # close the fd when it is GC'd
-                                    # right after this block. The whole
-                                    # point of using ``shutdown``
-                                    # instead of ``os.close`` is to
-                                    # keep the fd number reserved so
-                                    # the owner thread's stale libpq
-                                    # read/write can't race a reused
-                                    # fd belonging to another conn;
-                                    # a GC'd socket silently defeated
-                                    # that reservation.
-                                    import socket as _socket
-                                    try:
-                                        sock = _socket.socket(fileno=fd)
-                                        try:
-                                            sock.shutdown(_socket.SHUT_RDWR)
-                                        finally:
-                                            # Releases ownership of the
-                                            # fd back to the kernel's
-                                            # ``close`` boundary (the
-                                            # owner thread will do it);
-                                            # the socket's ``__del__``
-                                            # becomes a no-op.
-                                            sock.detach()
-                                    except OSError:
-                                        # fd already gone / not a socket
-                                        pass
-                                else:
-                                    os.close(fd)
-                                logger.warning(
-                                    "kill-at-timeout: %s %s "
-                                    "(%s on %s)",
-                                    conn_id,
-                                    (
-                                        "hard-fd-shutdown"
-                                        if hard_close_mode == "shutdown"
-                                        else "hard-fd-closed"
-                                    ),
-                                    hard_close_reason,
-                                    outgoing.uuid,
-                                )
-                            except OSError:
-                                # Either close() completed racily and
-                                # already released the fd, or the fd
-                                # was invalid to begin with. Nothing
-                                # more to do.
-                                pass
+                        if dup_fd is not None:
+                            _shutdown_socket_fd(dup_fd)
+                            logger.warning(
+                                "kill-at-timeout: %s hard-fd-shutdown "
+                                "(%s on %s)",
+                                conn_id, hard_close_reason, outgoing.uuid,
+                            )
                         else:
                             logger.warning(
                                 "kill-at-timeout: %s needs hard-close but "
@@ -928,9 +944,17 @@ def _drain_and_apply(
             finally:
                 # wait=False: never block on hung workers. Any still-
                 # running _safe_close call keeps executing after we
-                # return — its future is abandoned and it eventually
-                # unwinds when the OS releases the wedged send().
+                # return — its future is abandoned and it unwinds once
+                # its shut-down socket errors out.
                 ex.shutdown(wait=False)
+                # Our dups only: closing them never touches the conns'
+                # own fds.
+                for _c, dup_fd, _conn_id in snapshot:
+                    if dup_fd is not None:
+                        try:
+                            os.close(dup_fd)
+                        except OSError:
+                            pass
 
             logger.warning(
                 "kill-at-timeout complete on %s: %d force-closed "
@@ -1001,6 +1025,12 @@ def _drain_and_apply(
             )
         with group.lock:
             group.last_phase1_complete_ts = now
+            # Re-stamp the freshness anchor now that the outgoing side
+            # has stopped committing. Phase 1 only stops new opens; work
+            # in flight kept committing until here, and Phase 2 has to
+            # see those commits replicated, not just the ones before
+            # pause_dispatch.
+            group.barrier_ts = time.time()
         closed_any = bool(survivors) or total_idle_closed > 0 or children_live > 0
         closed_at = time.monotonic()
 
@@ -1012,14 +1042,16 @@ def _drain_and_apply(
         # semantics as YBA being unreachable.
         #
         # Wrap in `Phase2TimeoutError` catch. On
-        # ``yb.failback.onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
+        # ``yb.failback.onPhase2Timeout="fail"`` (the default), a failback lag-wait raises
         # when it times out before converging or YBA stays unreachable. We log, record the
         # timeout timestamp, and SKIP the status change — routing
         # stays on the current (known-good) side. Dispatch still
         # resumes in the finally so the app isn't stuck. The probe
         # will try again on its next tick.
         phase2_aborted = False
-        lag_failback = new_status == HealthResult.HEALTHY
+        # Direction of the drain, not of the CB report: recovery from
+        # no-viable to the secondary is a HEALTHY report but drains A→B.
+        lag_failback = is_failback
         phase2_budget = _budget_deadline(
             group.failback_global_time_budget_secs if lag_failback
             else group.global_time_budget_secs,
@@ -1036,10 +1068,14 @@ def _drain_and_apply(
                         outgoing=outgoing,
                     )
                 elif lag_failback and group.failback_xcluster_config_uuid:
+                    # Passed only when set, so stand-ins without the
+                    # parameter keep working.
+                    kw = {} if phase2_may_abort else {"may_abort": False}
                     _wait_for_replication_lag(
                         group, which_cluster, is_failback=True,
                         budget_deadline=phase2_budget,
                         outgoing=outgoing,
+                        **kw,
                     )
             except Phase2TimeoutError as exc:
                 phase2_aborted = True
@@ -1133,9 +1169,11 @@ _LAG_POLL_INTERVAL_S = 1.0
 _LAG_UNREACHABLE_STRIKES = 3
 
 # DB-24483 — Prometheus scrape interval YBA uses, matched to the YBA
-# default (reference.conf:985). Used by the liveness gate to tell
-# whether two "post-barrier" samples came from different scrapes (good)
-# or the same one (YBA's replay pathology).
+# default (reference.conf:985). A YBA sample's ``x`` is the range-query
+# evaluation step, which follows the request time, not the scrape time.
+# The liveness gate therefore counts a confirmation only when it is at
+# least one scrape interval after the previous one, so N confirmations
+# span N distinct scrapes.
 _LAG_SCRAPE_HINT_S = 10.0
 
 # Time kept back from ``globalTimeBudgetSecs`` for the work after the lag
@@ -1187,6 +1225,7 @@ def _wait_for_replication_lag(
     is_failback: bool = False,
     budget_deadline: "float | None" = None,
     outgoing: "ClusterState | None" = None,
+    may_abort: bool = True,
 ) -> None:
     """Poll YBA for the outgoing side's replication lag every second, exit
     on any of three conditions:
@@ -1202,7 +1241,10 @@ def _wait_for_replication_lag(
          healthy secondary), as on a timeout.
 
     Never blocks failover on YBA availability. Never blocks longer than
-    ``lag_wait_timeout_s``. Log at WARNING on entry and exit so operators
+    ``lag_wait_timeout_s``, except that a failback which would abort with
+    only pre-barrier ≤ threshold samples waits once for the next YBA
+    sample (at most one scrape interval plus one poll). Log at WARNING on
+    entry and exit so operators
     can read the outcome from the log timeline.
 
     ``is_failback`` picks between the A→B config + failover knobs
@@ -1211,8 +1253,20 @@ def _wait_for_replication_lag(
     ``outgoing`` is the outgoing cluster's state; while the driver has
     every one of its nodes quarantined, no sample counts toward
     convergence.
+
+    ``may_abort=False`` treats ``onPhase2Timeout=fail`` as ``proceed``
+    (failback out of no-viable: there is no healthy side to stay on).
     """
     from .yba_client import YBAClientError
+
+    policy = getattr(group, "failback_on_phase2_timeout", "fail")
+    if is_failback and policy == "fail" and not may_abort:
+        logger.warning(
+            "lag wait: yb.failback.onPhase2Timeout=fail not applied — "
+            "failback out of no viable cluster has no healthy side to "
+            "stay on; the flip proceeds on timeout"
+        )
+        policy = "proceed"
 
     if is_failback:
         threshold_ms = float(group.failback_threshold_replication_lag_ms)
@@ -1229,11 +1283,11 @@ def _wait_for_replication_lag(
         required_samples = int(getattr(group, "lag_confirmation_samples", 1))
         direction_label = "failover"
 
-    # DB-24483 — snapshot the barrier timestamp set by ``pause_dispatch``.
-    # Zero means "no barrier armed" — a fail-open path (shouldn't happen
-    # inside a drain, but defensive): if we have no barrier, the
-    # freshness gate degrades to "any sample is fresh" and the liveness
-    # gate still runs on sample identity.
+    # DB-24483 — snapshot the freshness anchor: stamped by
+    # ``pause_dispatch`` and re-stamped when Phase 1 completes, so it
+    # marks the last commit on the outgoing side. Zero means "no barrier
+    # armed" — a fail-open path (shouldn't happen inside a drain, but
+    # defensive): the freshness gate then treats any sample as fresh.
     barrier_ts = float(getattr(group, "barrier_ts", 0.0))
 
     logger.warning(
@@ -1263,9 +1317,45 @@ def _wait_for_replication_lag(
     # DB-24483 — liveness tracking: consecutive distinct post-barrier
     # samples at ≤ threshold.
     confirmed_count = 0
-    # Dedupe repeated YBA replays of the same sample. Any sample_ts
-    # equal to the previous one does NOT advance the liveness count.
+    # A sample_ts less than one scrape interval after the last counted
+    # one does NOT advance the liveness count.
     last_counted_sample_ts: float | None = None
+    warned_no_sample_ts = False
+    # sample_ts of the latest ≤ threshold sample that was not counted only
+    # because it predates the barrier. None once a later poll says
+    # anything else (lagged, counted, no data).
+    pre_barrier_pass_ts: float | None = None
+    extended = False
+
+    def _extend_to_next_sample() -> bool:
+        """A failback that would abort while the only ≤ threshold samples
+        predate the barrier waits once for YBA's next sample instead.
+        Re-stamping the barrier at the end of Phase 1 leaves a short lag
+        wait (6s on a 10s budget) less than one sample interval after the
+        barrier, so a caught-up universe could never confirm (stress
+        failback_refused_on_timeout/budget_10). The extension can run past
+        globalTimeBudgetSecs by up to one sample interval plus one poll."""
+        nonlocal deadline, extended
+        if extended or pre_barrier_pass_ts is None:
+            return False
+        if not (policy == "fail" and is_failback):
+            return False
+        next_sample_in = pre_barrier_pass_ts + _LAG_SCRAPE_HINT_S - time.time()
+        new_deadline = min(
+            time.monotonic() + max(0.0, next_sample_in) + _LAG_POLL_INTERVAL_S,
+            deadline + _LAG_SCRAPE_HINT_S + _LAG_POLL_INTERVAL_S,
+        )
+        if new_deadline <= deadline:
+            return False
+        extended = True
+        logger.warning(
+            "lag wait: lag=0 so far only on samples that predate the "
+            "barrier; extending the failback lag wait by %.1fs for YBA's "
+            "next sample (past the global time budget if one is set)",
+            new_deadline - deadline,
+        )
+        deadline = new_deadline
+        return True
 
     # agent-K PR #8:430: the deadline is checked only BEFORE each poll,
     # but a YBA request can take up to ~`max(connect, read)`×2 (reconnect
@@ -1294,6 +1384,9 @@ def _wait_for_replication_lag(
             _MIN_POLL_BUDGET_S = _one_poll_cost_s
         if not _poll_guard:
             _MIN_POLL_BUDGET_S = 0.0
+        timed_out = now >= deadline or deadline - now < _MIN_POLL_BUDGET_S
+        if timed_out and _extend_to_next_sample():
+            continue
         if now >= deadline:
             elapsed = now - started
             # Phase 2 timeout policy. Agent-K PR #18:710,575. The `fail`
@@ -1307,7 +1400,6 @@ def _wait_for_replication_lag(
             # direction regardless of the knob — the knob only matters
             # for the failback case where staying on current side is
             # a safe degraded-mode choice.
-            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=%s, "
@@ -1317,7 +1409,7 @@ def _wait_for_replication_lag(
                     elapsed, direction_label, threshold_ms,
                 )
                 raise Phase2TimeoutError(
-                    f"lag wait timeout after {elapsed:.1f}s "
+                    f"lag wait timed out after {elapsed:.1f}s "
                     f"(direction={direction_label}, "
                     f"threshold={threshold_ms:.1f}ms)"
                 )
@@ -1349,7 +1441,6 @@ def _wait_for_replication_lag(
             # Same "lag wait timeout" prefix as the deadline branch so log
             # consumers see one timeout outcome, not two.
             elapsed = now - started
-            policy = getattr(group, "failback_on_phase2_timeout", "proceed")
             if policy == "fail" and is_failback:
                 logger.error(
                     "lag wait timeout after %.1fs (direction=failback, "
@@ -1358,7 +1449,7 @@ def _wait_for_replication_lag(
                     elapsed, threshold_ms, deadline - now, _MIN_POLL_BUDGET_S,
                 )
                 raise Phase2TimeoutError(
-                    f"lag wait timeout after {elapsed:.1f}s "
+                    f"lag wait timed out after {elapsed:.1f}s "
                     f"(direction=failback, threshold={threshold_ms:.1f}ms)"
                 )
             logger.warning(
@@ -1443,7 +1534,6 @@ def _wait_for_replication_lag(
                 # safe (it's healthy), so a failback aborts like a
                 # timeout. A failover still proceeds: the current side
                 # was just declared unhealthy.
-                policy = getattr(group, "failback_on_phase2_timeout", "proceed")
                 if policy == "fail" and is_failback:
                     elapsed = time.monotonic() - started
                     logger.error(
@@ -1465,15 +1555,32 @@ def _wait_for_replication_lag(
                 return
             lag_ms = None
             sample_ts = None
-        except Exception:
+        except Exception as exc:
             # Belt-and-braces — never let an unexpected exception in the
-            # YBA client wedge the drain barrier.
+            # YBA client wedge the drain barrier. A failback under
+            # yb.failback.onPhase2Timeout="fail" aborts instead, as in
+            # the unreachable branch above: no lag confirmation means no
+            # failback onto the primary.
+            if policy == "fail" and is_failback:
+                elapsed = time.monotonic() - started
+                logger.error(
+                    "lag wait: unexpected YBA error after %.1fs "
+                    "(direction=failback) — ABORTING flip; routing stays "
+                    "on current side (set yb.failback.onPhase2Timeout="
+                    "proceed to flip anyway)",
+                    elapsed, exc_info=True,
+                )
+                raise Phase2TimeoutError(
+                    f"YBA lag read failed after {elapsed:.1f}s "
+                    f"(direction=failback): {exc!r}"
+                ) from exc
             logger.warning(
                 "lag wait: unexpected YBA error — proceeding with flip",
                 exc_info=True,
             )
             return
 
+        pre_barrier_pass = False
         if lag_ms is not None and lag_ms <= threshold_ms:
             elapsed = time.monotonic() - started
             # DB-24483 — freshness gate. A YBA sample whose ``sample_ts``
@@ -1481,10 +1588,17 @@ def _wait_for_replication_lag(
             # freshness_s`` grace window) cannot have observed writes
             # that landed before ``pause_dispatch``. Trusting it is the
             # exact bug that let the driver flip to a 17s-behind B.
-            # Legacy YBA clients that don't return ``sample_ts`` fall
-            # back to the pre-fix single-sample convergence — the
-            # operator opted out of the gate by not giving us the
-            # timestamp. ``freshness_s == 0`` likewise opts out.
+            # A sample with no ``sample_ts`` (YBA sent no ``x`` axis)
+            # skips both this gate and the liveness spacing below: every
+            # ≤ threshold poll counts. That is logged once per lag wait.
+            # ``freshness_s == 0`` opts out of this gate.
+            if sample_ts is None and not warned_no_sample_ts:
+                warned_no_sample_ts = True
+                logger.warning(
+                    "lag wait: YBA returned a lag sample without a "
+                    "timestamp — the freshness and liveness gates can't "
+                    "run; counting every poll at or below the threshold",
+                )
             if freshness_s > 0 and sample_ts is not None and barrier_ts > 0:
                 min_fresh_ts = barrier_ts + freshness_s
                 if sample_ts < min_fresh_ts:
@@ -1499,6 +1613,7 @@ def _wait_for_replication_lag(
                     # Reset liveness: a stale sample is not a true pass.
                     confirmed_count = 0
                     last_counted_sample_ts = None
+                    pre_barrier_pass_ts = None
                     sleep_s = min(
                         _LAG_POLL_INTERVAL_S,
                         max(0.0, deadline - time.monotonic()),
@@ -1509,8 +1624,9 @@ def _wait_for_replication_lag(
             # DB-24483 — liveness gate. YBA replays its last sample for
             # ~5min after the primary dies (DB-24852-adjacent). A single
             # ``lag=0`` is not enough to tell "standby really caught up"
-            # from "same stale replay reused". Require N distinct
-            # ``sample_ts`` values at ≤ threshold before flipping.
+            # from "same stale replay reused". Require N samples at
+            # ≤ threshold, each at least one scrape interval after the
+            # previous counted one, before flipping.
             if (
                 sample_ts is not None
                 and barrier_ts > 0
@@ -1521,6 +1637,7 @@ def _wait_for_replication_lag(
                 # (stress phase2_claim: converged on such a sample while
                 # B was still missing batches). Applies at any
                 # confirmation count: with one, it is the only guard.
+                pre_barrier_pass = True
                 logger.info(
                     "lag wait: lag=%.1fms sample at %.3f predates the "
                     "barrier %.3f — not counting (confirmations=%d/%d, "
@@ -1563,13 +1680,18 @@ def _wait_for_replication_lag(
                 )
                 confirmed_count = 0
                 last_counted_sample_ts = None
-            elif sample_ts is not None and sample_ts == last_counted_sample_ts:
+            elif (
+                sample_ts is not None
+                and last_counted_sample_ts is not None
+                and sample_ts < last_counted_sample_ts + _LAG_SCRAPE_HINT_S
+            ):
                 logger.info(
                     "lag wait: lag=%.1fms ≤ threshold but sample_ts %.3f "
-                    "unchanged since last pass — YBA replay suspected, "
-                    "not counting (confirmations=%d/%d, elapsed=%.1fs / %ds)",
-                    lag_ms, sample_ts, confirmed_count, required_samples,
-                    elapsed, timeout_s,
+                    "is within one scrape interval (%.0fs) of the last "
+                    "counted sample — not counting (confirmations=%d/%d, "
+                    "elapsed=%.1fs / %ds)",
+                    lag_ms, sample_ts, _LAG_SCRAPE_HINT_S, confirmed_count,
+                    required_samples, elapsed, timeout_s,
                 )
             else:
                 confirmed_count += 1
@@ -1610,6 +1732,7 @@ def _wait_for_replication_lag(
                 )
             confirmed_count = 0
             last_counted_sample_ts = None
+        pre_barrier_pass_ts = sample_ts if pre_barrier_pass else None
 
         # Poll again in ~1s. If the remaining budget is smaller, sleep
         # only that much so we don't overshoot the deadline.

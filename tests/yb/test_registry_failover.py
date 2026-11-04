@@ -26,7 +26,7 @@ from psycopg.yb.health import (
 )
 from psycopg.yb.health_probe import HealthProbe
 from psycopg.yb.params import YBParams
-from psycopg.yb.registry import ClusterRegistry, ClusterState, FailoverGroup
+from psycopg.yb.registry import ClusterKey, ClusterRegistry, ClusterState, FailoverGroup
 
 
 # ----------------------------------------------------------------- helpers
@@ -155,6 +155,78 @@ def test_reset_failover_group_flips_to_healthy(fresh_registry, fake_state):
     assert fresh_registry.reset_failover_group("P") is True
     assert group.primary_status == HealthResult.HEALTHY
 
+
+
+class _ResetConn:
+    """Tracked conn stand-in: readable transaction status and close()."""
+
+    def __init__(self) -> None:
+        from psycopg.pq import TransactionStatus
+        self.info = type("I", (), {"transaction_status": TransactionStatus.IDLE})()
+        self.closed = False
+
+    def close(self) -> None:
+        from psycopg.pq import TransactionStatus
+        self.closed = True
+        self.info.transaction_status = TransactionStatus.UNKNOWN
+
+
+def test_reset_failover_group_runs_the_failback_drain(fresh_registry, fake_state):
+    """Review #10 (Amogh): an operator failback goes through the same
+    drain as an automatic one: barrier, the secondary's conns closed,
+    then the flip. autoFailbackEnabled=false does not block it."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group.auto_failback_enabled = False
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    conn_on_b = _ResetConn()
+    s.tracked_conns.add(conn_on_b)
+    generation = group.barrier_generation
+
+    assert fresh_registry.reset_failover_group("P") is True
+
+    assert group.primary_status == HealthResult.HEALTHY
+    assert group.barrier_generation == generation + 1
+    assert conn_on_b.closed is True
+    assert group.dispatch_paused is False
+    assert group.drain_in_progress is False
+
+
+def test_reset_failover_group_refused_while_a_drain_runs(fresh_registry, fake_state):
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    group.drain_in_progress = True
+
+    assert fresh_registry.reset_failover_group("P") is False
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_reset_failover_group_honours_fail_on_lag_timeout(fresh_registry, fake_state):
+    """Same Phase 2 rules as an automatic failback: under
+    onPhase2Timeout=fail an unconfirmed lag keeps routing on the
+    secondary."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+
+    class _Behind:
+        def get_committed_lag_sample(self, uuid):
+            return (5000.0, time.time())
+
+    group.yba_client = _Behind()
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+    group.failback_lag_wait_timeout_s = 1
+    group.failback_on_phase2_timeout = "fail"
+
+    assert fresh_registry.reset_failover_group("P") is True
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
 
 def test_get_failover_status_returns_state_and_timestamp(fresh_registry, fake_state):
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
@@ -414,3 +486,198 @@ def test_probe_swallows_exceptions(fake_state, monkeypatch):
     assert call_count["n"] >= 2
     # Status unchanged.
     assert group.primary_status == HealthResult.HEALTHY
+
+
+# ------------------------------------------------------- async bootstrap lock per loop
+
+def _contend(reg, key):
+    """Run in a fresh event loop: two coroutines contend the key's async
+    bootstrap lock (contention is what binds an asyncio.Lock to a loop)."""
+    import asyncio
+
+    async def main():
+        order = []
+
+        async def worker(tag):
+            async with reg._async_bootstrap_lock_for(key):
+                order.append(tag)
+                await asyncio.sleep(0.01)
+
+        await asyncio.gather(worker("a"), worker("b"))
+        return order
+
+    return asyncio.run(main())
+
+
+def test_async_bootstrap_lock_survives_a_second_event_loop(fresh_registry):
+    """Review #17 (Amogh): one asyncio.Lock per key for the whole process
+    raised "bound to a different event loop" once a second
+    ``asyncio.run`` contended it (pytest-asyncio per-test loops, one loop
+    per worker thread)."""
+    assert _contend(fresh_registry, "k1") == ["a", "b"]
+    assert _contend(fresh_registry, "k1") == ["a", "b"]
+
+
+def test_async_bootstrap_lock_on_loops_in_two_threads(fresh_registry):
+    errors = []
+
+    def run():
+        try:
+            _contend(fresh_registry, "k1")
+        except Exception as exc:   # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert errors == []
+
+
+def test_async_bootstrap_locks_of_closed_loops_are_dropped(fresh_registry):
+    _contend(fresh_registry, "k1")
+    _contend(fresh_registry, "k2")
+    # Each asyncio.run closed its loop; the next lookup prunes them.
+    import asyncio
+
+    async def lookup():
+        fresh_registry._async_bootstrap_lock_for("k3")
+        return [k for k, _loop in fresh_registry._async_bootstrap_locks]
+
+    assert asyncio.run(lookup()) == ["k3"]
+
+
+def test_aget_or_bootstrap_failover_group_across_event_loops(fresh_registry, monkeypatch):
+    """End to end through the public async entry point: concurrent
+    bootstraps on one loop, then again on a new loop."""
+    import asyncio
+
+    sentinel = object()
+
+    async def fake_ado(*a, **kw):
+        await asyncio.sleep(0.01)
+        return sentinel
+
+    monkeypatch.setattr(fresh_registry, "_ado_bootstrap_failover_group", fake_ado)
+    params = YBParams()
+
+    async def main():
+        return await asyncio.gather(*(
+            fresh_registry.aget_or_bootstrap_failover_group(params, "host=h1", {})
+            for _ in range(3)
+        ))
+
+    assert asyncio.run(main()) == [sentinel] * 3
+    assert asyncio.run(main()) == [sentinel] * 3
+
+
+def test_async_bootstraps_on_two_threads_never_overlap(fresh_registry, monkeypatch):
+    """Review #17 (Amogh): one asyncio.Lock per (key, loop) let loops on
+    two threads bootstrap the same group at once, the race the lock exists
+    to prevent. The per-key threading.Lock now excludes them."""
+    import asyncio
+
+    active = 0
+    max_active = 0
+    counter_lock = threading.Lock()
+
+    async def fake_ado(*a, **kw):
+        nonlocal active, max_active
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+        await asyncio.sleep(0.05)
+        with counter_lock:
+            active -= 1
+        return "group"
+
+    monkeypatch.setattr(fresh_registry, "_ado_bootstrap_failover_group", fake_ado)
+    params = YBParams()
+
+    def run():
+        async def main():
+            await asyncio.gather(*(
+                fresh_registry.aget_or_bootstrap_failover_group(params, "host=h1", {})
+                for _ in range(3)
+            ))
+        asyncio.run(main())
+
+    threads = [threading.Thread(target=run) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert max_active == 1
+
+
+def test_async_bootstrap_waits_for_a_sync_bootstrap(fresh_registry, monkeypatch):
+    """A sync bootstrap of the same cluster on another thread holds the
+    async one off until it finishes."""
+    import asyncio
+
+    key = ClusterKey.from_params(fresh_registry._param_dict_for_key("host=h1", {}))
+    lock = fresh_registry._bootstrap_lock_for(key)
+    entered = []
+
+    async def fake_ado(*a, **kw):
+        entered.append(time.monotonic())
+        return "group"
+
+    monkeypatch.setattr(fresh_registry, "_ado_bootstrap_failover_group", fake_ado)
+    lock.acquire()
+    released_at = []
+
+    def release_later():
+        time.sleep(0.2)
+        released_at.append(time.monotonic())
+        lock.release()
+
+    threading.Thread(target=release_later).start()
+    asyncio.run(
+        fresh_registry.aget_or_bootstrap_failover_group(YBParams(), "host=h1", {})
+    )
+    assert entered and released_at and entered[0] >= released_at[0]
+    assert not lock.locked()
+
+
+def test_clear_resets_async_bootstrap_locks(fresh_registry):
+    _contend(fresh_registry, "k1")
+    assert fresh_registry._async_bootstrap_locks
+    fresh_registry.clear()
+    assert fresh_registry._async_bootstrap_locks == {}
+
+
+# ----------------------------------------------------------------- probe interval floor
+
+@pytest.mark.parametrize("refresh_s, expected", [(0, 1), (1, 1), (300, 300)])
+def test_start_probe_floors_interval(
+    fresh_registry, fake_state, monkeypatch, refresh_s, expected,
+):
+    """``yb_servers_refresh_interval=0`` is a valid DSN value, but as a
+    probe interval it would busy-loop CB checks. Probes started from the
+    DSN wiring tick no faster than once a second (review #9)."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s)
+    monkeypatch.setattr(HealthProbe, "start", lambda self: None)
+
+    fresh_registry._start_probe(group, refresh_s)
+
+    assert group.primary_probe._interval_s == expected
+    assert group.secondary_probe._interval_s == expected
+    # The fork hook rebuilds probes from this stash; it must be floored too.
+    assert group._probe_interval_s == expected
+
+
+def test_health_probe_direct_keeps_subsecond_interval(fake_state):
+    """The floor applies to the DSN wiring only; tests constructing a
+    HealthProbe directly can still tick fast."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.HEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+    )
+    assert HealthProbe(group, 0.05)._interval_s == 0.05
