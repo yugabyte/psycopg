@@ -170,8 +170,11 @@ accepted as separators between tokens):
      - ``true``
      - Verify the YBA endpoint's TLS certificate. A YBA behind a
        self-signed certificate needs ``yb.failover.ybaCaFile`` (path to
-       its CA bundle) or ``ybaVerifySsl=false``; otherwise the lag-wait
-       phase is disabled at bootstrap.
+       its CA bundle) or ``ybaVerifySsl=false``. A certificate that fails
+       verification disables the lag-wait phase at bootstrap and is
+       logged at ERROR; failovers then flip without a lag wait, and
+       under ``yb.failback.onPhase2Timeout=fail`` failbacks are refused
+       until the certificate is fixed.
 
 Example (application):
 

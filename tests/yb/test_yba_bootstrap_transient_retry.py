@@ -261,3 +261,97 @@ def test_failback_after_transient_bootstrap_runs_the_lag_wait(fake_state, script
     assert waits and waits[0][0] is True, "failback ran without a lag wait"
     assert waits[0][1] is not None
     assert group.primary_status == HealthResult.HEALTHY
+
+
+# ------------------------------------------------------- certificate errors
+
+def _cert_error():
+    return YBAClientError(
+        "YBA GET /session_info TLS certificate verification failed: self-signed",
+        cert_error=True,
+    )
+
+
+def test_cert_error_logs_at_error_and_marks_failback_refused(
+    fake_state, scripted, caplog,
+):
+    """Review #8 follow-up: a certificate error turned the lag phase off
+    with only a WARNING, and failbacks then skipped the lag check even
+    under onPhase2Timeout=fail."""
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state)
+
+    with caplog.at_level("WARNING", logger="psycopg.yb.registry"):
+        ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    assert group.yba_client is None
+    assert "certificate" in group.yba_cert_error
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "failbacks are refused" in errors[0].getMessage()
+
+
+@pytest.mark.parametrize("policy, failback_name", [
+    ("proceed", "b_to_a"),
+    ("fail", ""),
+])
+def test_cert_error_leaves_failback_alone_when_nothing_to_check(
+    fake_state, scripted, policy, failback_name,
+):
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state, failback_on_phase2_timeout=policy)
+    params = _params()
+    params.failback_replication_name = failback_name
+
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, params)
+
+    assert group.yba_cert_error == ""
+
+
+def test_cert_error_on_retry_marks_failback_refused(fake_state, scripted):
+    scripted.outcomes = [YBAClientError("timeout", transient=True), _cert_error()]
+    group = _group(fake_state)
+    reg = ClusterRegistry.instance()
+    reg._wire_yba_lag_phase(group, _params())
+
+    reg.retry_yba_lag_phase(group, deadline=time.monotonic() + 5)
+
+    assert group.yba_pending_params is None
+    assert "certificate" in group.yba_cert_error
+
+
+def test_failback_refused_after_cert_error(fake_state, scripted):
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
+
+
+def test_failover_still_flips_after_cert_error(fake_state, scripted):
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state)
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts == 0.0
+
+
+def test_failback_out_of_no_viable_proceeds_after_cert_error(fake_state, scripted):
+    """With the secondary down there is no healthy side to stay on, so the
+    failback goes ahead, as it does on a lag-wait timeout."""
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    group.secondary_status = HealthResult.UNHEALTHY
+    group.active_before_no_viable = "secondary"
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.HEALTHY

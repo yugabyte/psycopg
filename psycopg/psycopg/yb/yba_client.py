@@ -75,11 +75,15 @@ class YBAClientError(Exception):
     connect failure, a timeout, a dropped connection or an HTTP 5xx — and
     False for the rest (4xx such as a bad token, an unknown replication
     name, a malformed response). Bootstrap retries only transient ones.
+    ``cert_error`` is True when the YBA certificate failed verification.
     """
 
-    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+    def __init__(
+        self, message: str = "", *, transient: bool = False, cert_error: bool = False,
+    ) -> None:
         super().__init__(message)
         self.transient = transient
+        self.cert_error = cert_error
 
 
 def _cert_error(method: str, path: str, exc: Exception) -> "YBAClientError":
@@ -91,6 +95,7 @@ def _cert_error(method: str, path: str, exc: Exception) -> "YBAClientError":
         "Set yb.failover.ybaCaFile to the YBA CA bundle, or "
         "yb.failover.ybaVerifySsl=false to skip verification",
         transient=False,
+        cert_error=True,
     )
 
 

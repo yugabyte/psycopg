@@ -815,5 +815,6 @@ def test_cert_verification_failure_is_permanent(monkeypatch):
     with pytest.raises(YBAClientError) as ei:
         client.get_session_info()
     assert ei.value.transient is False
+    assert ei.value.cert_error is True
     assert "ybaCaFile" in str(ei.value)
     assert client._conn is None

@@ -1059,8 +1059,22 @@ def _drain_and_apply(
         )
         if not skip_phase2:
             phase2_budget = _retry_pending_yba(group, lag_failback, phase2_budget)
-        if group.yba_client is not None and not skip_phase2:
+        cert_error = getattr(group, "yba_cert_error", "")
+        refuse_unverified = (
+            lag_failback and phase2_may_abort and not skip_phase2
+            and group.yba_client is None and cert_error
+            and getattr(group, "failback_on_phase2_timeout", "fail") == "fail"
+        )
+        if refuse_unverified or (group.yba_client is not None and not skip_phase2):
             try:
+                if refuse_unverified:
+                    # Review #8: a YBA certificate that fails verification
+                    # turns the lag phase off, and a failback that went
+                    # ahead then would skip the lag check that
+                    # onPhase2Timeout=fail exists to enforce.
+                    raise Phase2TimeoutError(
+                        f"failback lag can't be checked: {cert_error}"
+                    )
                 if not lag_failback and group.xcluster_config_uuid:
                     _wait_for_replication_lag(
                         group, which_cluster, is_failback=False,

@@ -694,6 +694,10 @@ class FailoverGroup:
     # YBParams kept when the bootstrap YBA probe failed transiently; the
     # drain retries the probe before its lag wait (``_retry_pending_yba``).
     yba_pending_params: "object | None" = None
+    # Set when the YBA probe failed certificate verification and a
+    # failback replication is configured: under onPhase2Timeout=fail the
+    # drain refuses failbacks, since their lag can't be checked.
+    yba_cert_error: str = ""
     yba_customer_uuid: str = ""
     xcluster_config_uuid: str = ""
     threshold_replication_lag_ms: int = 0
@@ -1355,6 +1359,8 @@ class ClusterRegistry:
                     exc,
                 )
                 return
+            if self._note_cert_error(group, yb_params, exc):
+                return
             logger.warning(
                 "YBA lag phase disabled — bootstrap probe failed: %s. "
                 "Failover drain will flip routing immediately after the "
@@ -1442,6 +1448,29 @@ class ClusterRegistry:
             yb_params.lag_wait_timeout_s,
         )
 
+    @staticmethod
+    def _note_cert_error(group: "FailoverGroup", yb_params, exc) -> bool:
+        """Handle a permanent probe failure caused by the YBA certificate.
+        Returns True when it logged the failure (at ERROR), False to let
+        the caller log its usual WARNING."""
+        if not getattr(exc, "cert_error", False):
+            return False
+        refuses = (
+            bool(yb_params.failback_replication_name)
+            and group.failback_on_phase2_timeout == "fail"
+        )
+        if refuses:
+            group.yba_cert_error = str(exc)
+        logger.error(
+            "YBA lag phase disabled — %s. Failovers flip without a lag "
+            "wait%s.",
+            exc,
+            "; failbacks are refused (yb.failback.onPhase2Timeout=fail) "
+            "until the certificate is fixed and the app restarts"
+            if refuses else "",
+        )
+        return True
+
     def retry_yba_lag_phase(self, group: "FailoverGroup", deadline: float) -> None:
         """Retry a bootstrap YBA probe that failed transiently. A success
         enables Phase 2; another transient failure keeps the params for the
@@ -1462,6 +1491,8 @@ class ClusterRegistry:
                 )
                 return
             group.yba_pending_params = None
+            if self._note_cert_error(group, yb_params, exc):
+                return
             logger.warning(
                 "YBA lag phase disabled — probe failed: %s. Drains flip "
                 "without a lag wait.", exc,
