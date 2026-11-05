@@ -353,6 +353,7 @@ class RenameAsyncToSync(ast.NodeTransformer):  # type: ignore
         "_aconnect_plain": "_connect_plain",
         "aresolve": "resolve",
         "atrack_or_reroute": "track_or_reroute",
+        "ablock_if_held": "block_if_held",
     }
     _skip_imports = {
         "acompat": {"alist", "anext", "skip_sync"},
