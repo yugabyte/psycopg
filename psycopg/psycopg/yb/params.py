@@ -132,6 +132,12 @@ DEFAULT_YBA_VERIFY_SSL = True
 # and ends at the routing flip; it does NOT include
 # ``yb_servers_refresh_interval`` (detection latency), ``checkTimeoutSecs``
 # (CB check cap), or ``cooldownSecs`` (rate limit).
+#
+# One exception: a failback under ``onPhase2Timeout=fail`` whose only
+# lag-0 samples predate the barrier waits once for YBA's next sample, so
+# it can end up to one scrape interval plus one poll (~11s) past the
+# budget, with dispatch still paused. The driver logs a WARNING when it
+# does (``extending the failback lag wait``).
 _BUDGET_DRAIN_RATIO = 0.40
 _BUDGET_LAG_WAIT_RATIO = 0.60
 

@@ -149,6 +149,15 @@ accepted as separators between tokens):
        ``-1`` = wait indefinitely, never force-close;
        ``0`` = force-close in-flight transactions immediately;
        ``N > 0`` = wait up to N seconds then force-close survivors.
+   * - ``yb.failover.globalTimeBudgetSecs``
+     - (unset)
+     - Upper bound on a failover's wall-clock time from detection to the
+       routing flip; derives ``drainTimeoutSecs`` (40%) and the lag wait
+       (60%). ``yb.failback.globalTimeBudgetSecs`` sets the failback's.
+       One exception: a failback under ``onPhase2Timeout=fail`` whose
+       only lag-0 YBA samples predate the barrier waits once for YBA's
+       next sample, and can end up to ~11 s (one scrape interval plus
+       one poll) past the budget, with a WARNING.
    * - ``yb.failback.onPhase2Timeout``
      - ``fail``
      - What a failback does when its replication-lag wait (Phase 2)

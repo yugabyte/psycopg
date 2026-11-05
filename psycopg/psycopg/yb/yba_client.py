@@ -511,6 +511,12 @@ class YBAClient:
         the Phase 2 lag-wait loop can log staleness and operators can
         reason about which snapshot their failover trusted.
 
+        The timestamp is the range-query step, not the scrape time.
+        Known limit: if a tserver stops exporting the lag series without
+        a scrape failure, Prometheus returns its last value at each new
+        step for up to its 5 min lookback, so a stale value carries
+        fresh timestamps and neither Phase 2 gate can tell.
+
         Raises :class:`YBAClientError` on transport / auth / parse
         failures. The failover poll loop translates that into "one
         unreachable poll" and moves on — three consecutive
