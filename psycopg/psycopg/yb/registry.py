@@ -708,7 +708,7 @@ class FailoverGroup:
     yba_customer_uuid: str = ""
     xcluster_config_uuid: str = ""
     threshold_replication_lag_ms: int = 0
-    lag_wait_timeout_s: int = 30
+    lag_wait_timeout_s: int = 40
     # DB-24483 — Phase 2 freshness + liveness gate knobs. See
     # params.py for semantics. ``barrier_ts`` is the wall-clock
     # ``time.time()`` stamp at the moment ``pause_dispatch`` fires; the
@@ -728,7 +728,7 @@ class FailoverGroup:
     # on failback" (fail-open) — same behaviour as YBA being unreachable.
     failback_xcluster_config_uuid: str = ""
     failback_threshold_replication_lag_ms: int = 0
-    failback_lag_wait_timeout_s: int = 30
+    failback_lag_wait_timeout_s: int = 40
     # DB-24483 — same gates in the failback direction.
     failback_lag_freshness_s: int = 0
     failback_lag_confirmation_samples: int = 1

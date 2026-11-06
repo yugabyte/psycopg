@@ -88,7 +88,7 @@ DEFAULT_THRESHOLD_REPLICATION_LAG_MS = 0
 # existing harness profiles that pass lagWaitTimeoutSecs=30 keep
 # working. Operators who turn the gate on (lagFreshnessSecs>0 and/or
 # lagConfirmationSamples>1) should raise this knob accordingly.
-DEFAULT_LAG_WAIT_TIMEOUT_SEC = 30
+DEFAULT_LAG_WAIT_TIMEOUT_SEC = 40
 
 # DB-24483 — freshness gate. Minimum age `sample_ts - barrier_ts` before
 # a YBA lag sample is trusted to describe post-barrier replication. The
@@ -102,7 +102,7 @@ DEFAULT_LAG_WAIT_TIMEOUT_SEC = 30
 # break harnesses that assume the pre-DB-24483 ~30s budget. Opt in via
 # `yb.failover.lagFreshnessSecs=25` (and `yb.failback.lagFreshnessSecs=25`)
 # together with a `lagWaitTimeoutSecs` ≥ floor.
-DEFAULT_LAG_FRESHNESS_SEC = 0
+DEFAULT_LAG_FRESHNESS_SEC = 25
 # DB-24483 — liveness gate. Number of consecutive post-barrier samples
 # at lag ≤ threshold required before the drain flips routing. YBA's
 # known pathology (DB-24852-adjacent): when the primary dies it replays
