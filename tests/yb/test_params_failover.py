@@ -929,3 +929,40 @@ def test_failover_on_phase2_timeout_is_not_a_driver_key(key_form):
     assert yb.failback_on_phase2_timeout == "proceed"
     assert f"{key_form}=fail" in cleaned
     assert "yb.failover.noSuchKnob=fail" in unknown_cleaned
+
+
+# ============================================================
+# yb.failover.closeFenceSecs (review #19)
+# ============================================================
+
+def test_close_fence_default():
+    yb, _, _ = extract_yb_params(_dsn_with_secondary(), {})
+    assert yb.close_fence_s == 1.0
+
+
+@pytest.mark.parametrize("key_form", [
+    "yb.failover.closeFenceSecs",
+    "yb_failover_close_fence_secs",
+    "yb-failover-close-fence-secs",
+    "YB.FAILOVER.CLOSEFENCESECS",
+])
+def test_close_fence_key_forms(key_form):
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=0.5"), {})
+    assert yb.close_fence_s == 0.5
+    assert "fence" not in cleaned.lower()
+
+
+def test_close_fence_zero_disables():
+    yb, _, _ = extract_yb_params(_dsn_with_secondary("yb.failover.closeFenceSecs=0"), {})
+    assert yb.close_fence_s == 0.0
+
+
+@pytest.mark.parametrize("value", ["-1", "abc", "inf", "nan"])
+def test_close_fence_invalid_raises_when_xcluster_enabled(value):
+    with pytest.raises(ValueError, match="closeFenceSecs"):
+        extract_yb_params(_dsn_with_secondary(f"yb.failover.closeFenceSecs={value}"), {})
+
+
+def test_close_fence_invalid_ignored_without_xcluster():
+    yb, _, _ = extract_yb_params("host=h1 yb.failover.closeFenceSecs=-1", {})
+    assert yb.close_fence_s == 1.0

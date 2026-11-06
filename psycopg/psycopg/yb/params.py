@@ -68,6 +68,15 @@ DEFAULT_CHECK_TIMEOUT_SEC = 1
 #    N > 0 → wait up to N seconds, then force-close survivors.
 DEFAULT_DRAIN_TIMEOUT_SEC = 10
 
+# Close fence (yb.failover.closeFenceSecs): after a drain closed conns on
+# the outgoing side, the flip waits until this long has passed since the
+# last close, so an owner of session state (an advisory-lock holder that
+# checks its conn about once a second) notices the close before a new
+# session on the incoming side can take the same state. Phase 2 time
+# counts towards it. Best effort: the driver can't guarantee a single
+# holder of session-level state across two universes. 0 disables it.
+DEFAULT_CLOSE_FENCE_SEC = 1.0
+
 # YBA lag-wait phase (Amogh's flow, 2026-08-11). All zero-value / unset by
 # default; the phase is opt-in via ``yb.failover.ybaEndpoint``. When
 # unset the drain flip is immediate after the txn drain — same as
@@ -133,11 +142,15 @@ DEFAULT_YBA_VERIFY_SSL = True
 # ``yb_servers_refresh_interval`` (detection latency), ``checkTimeoutSecs``
 # (CB check cap), or ``cooldownSecs`` (rate limit).
 #
-# One exception: a failback under ``onPhase2Timeout=fail`` whose only
-# lag-0 samples predate the barrier waits once for YBA's next sample, so
-# it can end up to one scrape interval plus one poll (~11s) past the
-# budget, with dispatch still paused. The driver logs a WARNING when it
-# does (``extending the failback lag wait``).
+# Two exceptions, both with dispatch still paused:
+#   * a failback under ``onPhase2Timeout=fail`` whose only lag-0 samples
+#     predate the barrier waits once for YBA's next sample, so it can end
+#     up to one scrape interval plus one poll (~11s) past the budget. The
+#     driver logs a WARNING when it does (``extending the failback lag
+#     wait``).
+#   * the close fence (``closeFenceSecs``, default 1s) isn't counted in
+#     the budget: when Phase 2 took less than the fence, the flip waits
+#     out the rest.
 _BUDGET_DRAIN_RATIO = 0.40
 _BUDGET_LAG_WAIT_RATIO = 0.60
 
@@ -165,6 +178,7 @@ _PURE_YB_KEYS = frozenset({
     "yb_failover_cooldown_secs",
     "yb_failover_check_timeout_secs",
     "yb_failover_drain_timeout_secs",
+    "yb_failover_close_fence_secs",
     # YBA lag-wait phase.
     "yb_failover_yba_endpoint",
     "yb_failover_yba_api_token",
@@ -221,6 +235,7 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failover[._-](?:cooldownSecs|cooldown[._-]secs)"
     r"|yb[._-]failover[._-](?:checkTimeoutSecs|check[._-]timeout[._-]secs)"
     r"|yb[._-]failover[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
+    r"|yb[._-]failover[._-](?:closeFenceSecs|close[._-]fence[._-]secs)"
     r"|yb[._-]failover[._-](?:ybaEndpoint|yba[._-]endpoint)"
     r"|yb[._-]failover[._-](?:ybaApiToken|yba[._-]api[._-]token)"
     r"|yb[._-]failover[._-](?:ybaVerifySsl|yba[._-]verify[._-]ssl)"
@@ -279,6 +294,7 @@ _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failover_cooldownsecs":                  "yb_failover_cooldown_secs",
     "yb_failover_checktimeoutsecs":              "yb_failover_check_timeout_secs",
     "yb_failover_draintimeoutsecs":              "yb_failover_drain_timeout_secs",
+    "yb_failover_closefencesecs":                "yb_failover_close_fence_secs",
     "yb_failover_ybaendpoint":                   "yb_failover_yba_endpoint",
     "yb_failover_ybaapitoken":                   "yb_failover_yba_api_token",
     "yb_failover_ybaverifyssl":                  "yb_failover_yba_verify_ssl",
@@ -356,6 +372,8 @@ class YBParams:
     # stalling failover. Default: max(1, refresh_interval_s // 2) —
     # computed at parse time in extract_yb_params.
     check_timeout_s: int = DEFAULT_CHECK_TIMEOUT_SEC
+    # See DEFAULT_CLOSE_FENCE_SEC.
+    close_fence_s: float = DEFAULT_CLOSE_FENCE_SEC
     # Barrier-with-timeout drain (design doc §3.3). Sentinel values:
     #   -1 → wait indefinitely; never force-close in-flight transactions.
     #    0 → force-close immediately; no drain window.
@@ -628,6 +646,19 @@ def extract_yb_params(
         )),
         1,
     )
+    close_fence = DEFAULT_CLOSE_FENCE_SEC
+    if (fence_raw := raw.get("yb_failover_close_fence_secs")) is not None:
+        try:
+            close_fence = float(fence_raw)
+        except (TypeError, ValueError):
+            close_fence = -1.0
+        if not 0 <= close_fence < float("inf"):
+            if _xcluster_enabled_at_parse:
+                raise ValueError(
+                    "yb.failover.closeFenceSecs must be a number >= 0, "
+                    f"got {fence_raw!r}"
+                )
+            close_fence = DEFAULT_CLOSE_FENCE_SEC
     # Global failover time budget (§3.7). Parsed first because drain and
     # lag-wait derivation depend on it. ``None`` = unset = existing behaviour.
     global_time_budget_secs: int | None = None
@@ -1018,6 +1049,7 @@ def extract_yb_params(
             secondary_cluster_hosts=secondary_hosts,
             cooldown_s=cooldown,
             check_timeout_s=check_timeout,
+            close_fence_s=close_fence,
             drain_timeout_s=drain_timeout_raw,
             yba_endpoint=yba_endpoint,
             yba_api_token=yba_api_token,

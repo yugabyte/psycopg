@@ -246,6 +246,7 @@ _FAILOVER_GOVERNING_PARAMS = (
     "threshold_replication_lag_ms",
     "cooldown_s",
     "check_timeout_s",
+    "close_fence_s",
     "refresh_interval_s",
     "auto_failback_enabled",
     "failback_on_phase2_timeout",
@@ -626,6 +627,9 @@ class FailoverGroup:
     primary_last_transition_time: float = 0.0
     secondary_last_transition_time: float = 0.0
     cooldown_s: int = 1500
+    # yb.failover.closeFenceSecs. None (a group built without YBParams)
+    # uses params.DEFAULT_CLOSE_FENCE_SEC.
+    close_fence_s: "float | None" = None
     # Per-cluster probes. Type kept loose to avoid a circular import on
     # health_probe.HealthProbe.
     primary_probe: "object | None" = None
@@ -1673,6 +1677,7 @@ class ClusterRegistry:
                 primary_status=primary_status,
                 secondary_status=secondary_status,
                 cooldown_s=yb_params.cooldown_s,
+                close_fence_s=yb_params.close_fence_s,
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,
@@ -1852,6 +1857,7 @@ class ClusterRegistry:
                 primary_status=primary_status,
                 secondary_status=secondary_status,
                 cooldown_s=yb_params.cooldown_s,
+                close_fence_s=yb_params.close_fence_s,
                 primary_circuit_breaker=None,
                 secondary_circuit_breaker=None,
                 auto_failback_enabled=yb_params.auto_failback_enabled,

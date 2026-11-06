@@ -154,10 +154,21 @@ accepted as separators between tokens):
      - Upper bound on a failover's wall-clock time from detection to the
        routing flip; derives ``drainTimeoutSecs`` (40%) and the lag wait
        (60%). ``yb.failback.globalTimeBudgetSecs`` sets the failback's.
-       One exception: a failback under ``onPhase2Timeout=fail`` whose
+       Two exceptions: a failback under ``onPhase2Timeout=fail`` whose
        only lag-0 YBA samples predate the barrier waits once for YBA's
        next sample, and can end up to ~11 s (one scrape interval plus
-       one poll) past the budget, with a WARNING.
+       one poll) past the budget, with a WARNING; and the close fence
+       (``closeFenceSecs``) isn't counted in the budget.
+   * - ``yb.failover.closeFenceSecs``
+     - ``1``
+     - After a drain closed connections on the outgoing side, the flip
+       waits until this many seconds have passed since the last close,
+       so an app holding session state (e.g. an advisory-lock leader
+       that checks its connection once a second) sees the close before
+       a new session on the other universe can take the same state.
+       Phase 2 time counts towards it. Best effort: the driver can't
+       guarantee a single holder of session-level state across two
+       universes. ``0`` disables it.
    * - ``yb.failback.onPhase2Timeout``
      - ``proceed``
      - What a failback does when its replication-lag wait (Phase 2)

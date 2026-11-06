@@ -92,11 +92,6 @@ class Phase2TimeoutError(Exception):
     would then read as a second timeout instead of the abort.
     """
 
-# Minimum time between closing the outgoing side's conns and resuming
-# dispatch onto the incoming side (see the close fence in
-# _drain_and_apply). Covers an owner that polls its conn once a second.
-_CLOSE_FENCE_S = 1.0
-
 # Wall-clock budget for the parallel force-close phase — separate from
 # drainTimeoutSecs (which is the grace window for natural drain).
 # Rationale: libpq's PQfinish calls send() to push a Terminate byte
@@ -1248,9 +1243,13 @@ def _drain_and_apply(
             # session on the incoming side acquires it. Hold dispatch
             # until the fence has elapsed since the last close; Phase 2
             # time counts towards it. Once per flip, only when something
-            # was closed.
+            # was closed. yb.failover.closeFenceSecs; 0 disables it. Not
+            # counted in globalTimeBudgetSecs (documented overrun).
             if closed_any:
-                remaining = closed_at + _CLOSE_FENCE_S - time.monotonic()
+                fence = getattr(group, "close_fence_s", None)
+                if fence is None:
+                    from .params import DEFAULT_CLOSE_FENCE_SEC as fence
+                remaining = closed_at + fence - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
             _apply_status_change(
