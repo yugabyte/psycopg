@@ -231,9 +231,16 @@ async def atrack_or_reroute(
     route: Route, conn: AsyncConnection[Any], host: str
 ) -> Route | None:
     """Async version of :func:`track_or_reroute`."""
+    import asyncio
+
     from . import state as _state
 
-    if route.group is None or not _track(route, conn, host):
+    if route.group is None:
+        return None
+    # The drain closes the conn on this loop (_safe_close), so the close
+    # can't interleave with a libpq call the loop is making on it.
+    conn._yb_loop = asyncio.get_running_loop()  # type: ignore[attr-defined]
+    if not _track(route, conn, host):
         return None
     await conn.close()
     generation = await _state.wait_for_dispatch_generation_async(route.group)

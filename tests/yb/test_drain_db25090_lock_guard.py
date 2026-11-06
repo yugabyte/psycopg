@@ -26,8 +26,8 @@ the existing hard-fd escape hatch — same path as a hung ``close()``.
 
 Async conns don't get the treatment: their ``.lock`` is an
 ``asyncio.Lock`` and acquiring it from the drain thread would be a
-cross-thread asyncio-lock call. The residual async finish-race is
-tracked separately.
+cross-thread asyncio-lock call. They are finished on their own event
+loop instead (test_drain_close_races.py).
 """
 
 # Copyright (C) 2026 Yugabyte

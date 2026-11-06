@@ -185,6 +185,13 @@ class _CloseLockTimeoutError(Exception):
     """
 
 
+class _ConnNotIdleError(Exception):
+    """``_safe_close(only_if_idle=True)`` found the conn in a transaction
+    once it held the conn's lock (review #21): its owner started one
+    between the idle check and the close. Left open; the idle sweep
+    retries on its next tick."""
+
+
 # Poll interval while waiting for an async conn's ``asyncio.Lock`` to be
 # released (see ``_wait_async_lock_free``).
 _ASYNC_LOCK_POLL_S = 0.005
@@ -207,7 +214,93 @@ def _wait_async_lock_free(c, budget: float) -> bool:
     return True
 
 
-def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
+def _is_in_flight(c) -> bool:
+    """True if ``c`` is in a transaction (ACTIVE, INTRANS, INERROR)."""
+    try:
+        return int(c.info.transaction_status) in _IN_FLIGHT_TX_STATUSES
+    except Exception:
+        return False
+
+
+def _finish_async(c) -> None:
+    try:
+        c.pgconn.finish()
+    finally:
+        c._closed = True
+        _release_registry_count(c)
+
+
+def _close_async_on_loop(
+    c, loop, budget: float, only_if_idle: bool
+) -> "Exception | None | bool":
+    """Finish async conn ``c`` on ``loop``, the event loop it was opened
+    on, so the finish can't run while the loop is inside a libpq call on
+    it (review #23: on the C build ``PQfinish`` from the drain thread
+    could free the ``PGconn`` under a ``PQsendQuery`` the loop was
+    starting). Retries while ``c.lock`` is held, up to ``budget``.
+
+    Returns ``None`` once closed, an exception for the caller, or False
+    when the loop isn't running, or is the one running this call (an
+    operator reset from async code), in which case nothing can be inside
+    libpq on the conn and the caller closes it directly.
+    """
+    import asyncio
+
+    try:
+        if asyncio.get_running_loop() is loop:
+            return False
+    except RuntimeError:
+        pass   # no loop in this thread: the usual drain-thread case
+
+    def attempt(fut: "concurrent.futures.Future[str]") -> None:
+        if not fut.set_running_or_notify_cancel():
+            return   # the drain thread gave up waiting
+        try:
+            if c.lock.locked():
+                fut.set_result("locked")
+            elif only_if_idle and _is_in_flight(c):
+                fut.set_result("busy")
+            else:
+                _finish_async(c)
+                fut.set_result("closed")
+        except BaseException as exc:
+            fut.set_exception(exc)
+
+    deadline = time.monotonic() + max(budget, 0.0)
+    while True:
+        if loop.is_closed() or not loop.is_running():
+            return False
+        fut: "concurrent.futures.Future[str]" = concurrent.futures.Future()
+        try:
+            loop.call_soon_threadsafe(attempt, fut)
+        except RuntimeError:
+            return False   # closed since the check
+        try:
+            # A loop blocked for the whole budget can't be inside an await
+            # on this conn's socket; the caller escalates to the fd path.
+            outcome = fut.result(timeout=max(deadline - time.monotonic(), 0.05))
+        except concurrent.futures.TimeoutError:
+            fut.cancel()
+            return _CloseLockTimeoutError(
+                f"event loop didn't run the close within {budget}s; "
+                f"escalate to hard-fd close"
+            )
+        if outcome == "closed":
+            return None
+        if outcome == "busy":
+            return _ConnNotIdleError("conn started a transaction")
+        if time.monotonic() >= deadline:
+            return _CloseLockTimeoutError(
+                f"async conn.lock still held after {budget}s — "
+                f"a statement (possibly COMMIT) is on the wire; "
+                f"escalate to hard-fd close"
+            )
+        time.sleep(_ASYNC_LOCK_POLL_S)
+
+
+def _safe_close(
+    c, lock_timeout_s: "float | None" = None, only_if_idle: bool = False,
+) -> "Exception | None":
     """Call close on ``c``; return the exception if it raises, else
     ``None``. Isolates a raising close so it doesn't blow up the
     executor's worker thread — the caller tracks per-conn outcomes
@@ -250,8 +343,18 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
     was on the wire cut it mid-reply: the app saw "connection socket
     closed", an unknown outcome on the outgoing universe (r12 drain_zero
     c3 dual_write). Pool-borrowed sync conns take ``Connection.lock``
-    before ``pgconn.finish()`` for the same reason. A statement started
-    between the wait and the finish still fails on the closed socket.
+    before ``pgconn.finish()`` for the same reason.
+
+    An async conn opened through the dispatcher is finished on its own
+    event loop (``_close_async_on_loop``), so no statement can start
+    between the lock check and the finish (review #23). Conns without a
+    recorded loop, or whose loop has stopped, are checked from this
+    thread as before.
+
+    ``only_if_idle`` (the idle sweep, review #21): re-read the
+    transaction status once the lock is held and leave the conn open,
+    returning ``_ConnNotIdleError``, if its owner started a transaction
+    after the caller's idle check.
     """
     try:
         # Lazy import — ``..connection_async`` pulls ``.yb.state`` which
@@ -269,17 +372,20 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
             else _SAFE_CLOSE_LOCK_BUDGET_S
         )
         if isinstance(c, AsyncConnection):
+            loop = getattr(c, "_yb_loop", None)
+            if loop is not None:
+                result = _close_async_on_loop(c, loop, budget, only_if_idle)
+                if result is not False:
+                    return result
             if not _wait_async_lock_free(c, budget):
                 return _CloseLockTimeoutError(
                     f"async conn.lock still held after {budget}s — "
                     f"a statement (possibly COMMIT) is on the wire; "
                     f"escalate to hard-fd close"
                 )
-            try:
-                c.pgconn.finish()
-            finally:
-                c._closed = True
-                _release_registry_count(c)
+            if only_if_idle and _is_in_flight(c):
+                return _ConnNotIdleError("conn started a transaction")
+            _finish_async(c)
             return None
         # Pool-borrowed conn: ``psycopg_pool.ConnectionPool`` patches
         # ``Connection.close`` with ``close_returns=True`` so that
@@ -327,6 +433,8 @@ def _safe_close(c, lock_timeout_s: "float | None" = None) -> "Exception | None":
                     f"inside libpq; escalate to hard-fd close (DB-25090)"
                 )
         try:
+            if only_if_idle and _is_in_flight(c):
+                return _ConnNotIdleError("conn started a transaction")
             if is_pool:
                 try:
                     c.pgconn.finish()
@@ -398,10 +506,10 @@ def _close_idle_tracked_during_drain(
 
     The close is sync here (no thread pool) because an IDLE conn has no
     in-flight libpq state — ``pgconn.finish()`` returns in microseconds.
-    Uses ``_safe_close`` for sync/async dispatch (DB-24960, PR-H1). Pool
-    conns are strong-referenced by the pool and are not in ``tracked`` —
-    they're evicted by ``xcluster_check`` on the next ``getconn``, not
-    here.
+    Uses ``_safe_close`` for sync/async dispatch (DB-24960, PR-H1).
+    Pool conns are in ``tracked`` too (they connect through the
+    dispatcher); ``_safe_close`` finishes their pgconn directly so the
+    pool's ``close_returns`` doesn't put them back.
     """
     closed = 0
     for c in list(tracked):
@@ -419,16 +527,18 @@ def _close_idle_tracked_during_drain(
         # An IDLE conn whose owner is in a long libpq call (e.g.
         # LISTEN/NOTIFY) would otherwise stall the drain poll by
         # 1.5 s per such conn. Skip + retry next tick instead.
-        exc = _safe_close(c, lock_timeout_s=0)
+        # only_if_idle (review #21): the status read above isn't under
+        # conn.lock, so the owner may have run BEGIN since.
+        exc = _safe_close(c, lock_timeout_s=0, only_if_idle=True)
         if exc is None:
             closed += 1
-        elif isinstance(exc, _CloseLockTimeoutError):
-            # Owner's holding the lock — not stuck, just long-running.
-            # Next poll will retry.
+        elif isinstance(exc, (_CloseLockTimeoutError, _ConnNotIdleError)):
+            # Owner's holding the lock or started a transaction — not
+            # stuck, just busy. Next poll will retry.
             logger.log(
                 TRACE,
-                "drain: idle-close skipped on %s (lock held, retry next tick)",
-                outgoing_uuid,
+                "drain: idle-close skipped on %s (%s, retry next tick)",
+                outgoing_uuid, exc,
             )
         else:
             # Rare — _safe_close on an IDLE conn mostly just calls
