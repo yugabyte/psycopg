@@ -176,7 +176,8 @@ def test_async_idle_sweep_on_loop_leaves_an_open_transaction(loop_thread):
     loop, _ = loop_thread
     c = _async_conn(_FlagLock(), status=INTRANS, loop=loop)
 
-    assert isinstance(_safe_close(c, lock_timeout_s=0, only_if_idle=True), _ConnNotIdleError)
+    exc = _safe_close(c, lock_timeout_s=0, only_if_idle=True)
+    assert isinstance(exc, _ConnNotIdleError)
     assert c.finish_thread is None
     c.pgconn.status = ConnStatus.BAD
 

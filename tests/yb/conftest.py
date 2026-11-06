@@ -1228,4 +1228,3 @@ def _no_close_fence_in_drain_tests(request, monkeypatch):
     if request.node.path.name.startswith("test_drain"):
         from psycopg.yb import params
         monkeypatch.setattr(params, "DEFAULT_CLOSE_FENCE_SEC", 0.0)
-

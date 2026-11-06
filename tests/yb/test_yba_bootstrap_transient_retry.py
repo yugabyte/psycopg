@@ -354,7 +354,9 @@ def test_failback_refused_after_cert_error(fake_state, scripted, caplog):
     assert scripted.probes == 2
 
 
-def test_fixed_cert_lets_the_failback_run_its_lag_wait(fake_state, scripted, monkeypatch):
+def test_fixed_cert_lets_the_failback_run_its_lag_wait(
+    fake_state, scripted, monkeypatch,
+):
     scripted.outcomes = [_cert_error(), None]   # bootstrap fails, re-probe works
     group = _cert_failed_group(fake_state)
     waits = []

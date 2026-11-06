@@ -953,14 +953,16 @@ def test_close_fence_key_forms(key_form):
 
 
 def test_close_fence_zero_disables():
-    yb, _, _ = extract_yb_params(_dsn_with_secondary("yb.failover.closeFenceSecs=0"), {})
+    dsn = _dsn_with_secondary("yb.failover.closeFenceSecs=0")
+    yb, _, _ = extract_yb_params(dsn, {})
     assert yb.close_fence_s == 0.0
 
 
 @pytest.mark.parametrize("value", ["-1", "abc", "inf", "nan"])
 def test_close_fence_invalid_raises_when_xcluster_enabled(value):
     with pytest.raises(ValueError, match="closeFenceSecs"):
-        extract_yb_params(_dsn_with_secondary(f"yb.failover.closeFenceSecs={value}"), {})
+        dsn = _dsn_with_secondary(f"yb.failover.closeFenceSecs={value}")
+        extract_yb_params(dsn, {})
 
 
 def test_close_fence_invalid_ignored_without_xcluster():
