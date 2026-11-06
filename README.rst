@@ -193,8 +193,10 @@ accepted as separators between tokens):
        its CA bundle) or ``ybaVerifySsl=false``. A certificate that fails
        verification disables the lag-wait phase at bootstrap and is
        logged at ERROR; failovers then flip without a lag wait, and
-       under ``yb.failback.onPhase2Timeout=fail`` failbacks are refused
-       until the certificate is fixed.
+       under ``yb.failback.onPhase2Timeout=fail`` failbacks are refused,
+       before any connection is drained. Each failback attempt re-checks
+       the certificate first, so a fixed one takes effect without a
+       restart.
 
 Example (application):
 

@@ -697,6 +697,9 @@ def trigger_drain(
         # again. Cool-down bounds the log rate.
         return
 
+    if is_failback and _refuse_unverifiable_failback(group, which_cluster, new_status):
+        return
+
     # Stamp per-stage timestamps at their boundaries (design doc §3.8).
     # last_cb_trip_ts fires on UNHEALTHY-direction transitions (the CB
     # just observed the outgoing cluster as bad); last_failover_start_ts
@@ -718,6 +721,50 @@ def trigger_drain(
         drain_timeout_s=drain_timeout_s,
         is_failback=is_failback,
     )
+
+
+def _arm_refusal_cooldown(group: "FailoverGroup", which_cluster: str) -> None:
+    """Record a refused failback and re-arm ``which_cluster``'s cooldown,
+    so the probe's next tick doesn't retry it at once (agent-K PR
+    #18:608)."""
+    now = time.monotonic()
+    with group.lock:
+        group.last_phase2_timeout_ts = now
+        if which_cluster == "primary":
+            group.primary_last_transition_time = now
+        else:
+            group.secondary_last_transition_time = now
+
+
+def _refuse_unverifiable_failback(
+    group: "FailoverGroup", which_cluster: str, new_status: HealthResult,
+) -> bool:
+    """Review #26: refuse, before Phase 1, a failback whose lag can't be
+    checked because YBA's certificate failed verification
+    (``yba_cert_error``, set only under onPhase2Timeout=fail). Nothing
+    needs measuring, so pausing dispatch and closing the secondary's
+    conns first would only disrupt the side that keeps serving. Re-probes
+    YBA first, so a fixed certificate takes effect without a restart.
+    Returns True when the failback was refused."""
+    if not getattr(group, "yba_cert_error", "") or group.yba_client is not None:
+        return False
+    if getattr(group, "failback_on_phase2_timeout", "proceed") != "fail":
+        return False
+    from .registry import ClusterRegistry      # late import; cycle-safe
+    ClusterRegistry.instance().reprobe_after_cert_error(
+        group, deadline=time.monotonic() + group.failback_lag_wait_timeout_s,
+    )
+    if not group.yba_cert_error:
+        return False
+    _arm_refusal_cooldown(group, which_cluster)
+    logger.error(
+        "xCluster failback refused before the drain: failback lag can't be "
+        "checked: %s (primary_uuid=%s, which=%s, new_status=%s) — routing "
+        "stays on the secondary, re-arming %s cooldown",
+        group.yba_cert_error, group.primary.uuid, which_cluster,
+        new_status.value, which_cluster,
+    )
+    return True
 
 
 def _apply_status_change(
@@ -1176,7 +1223,10 @@ def _drain_and_apply(
                     # Review #8: a YBA certificate that fails verification
                     # turns the lag phase off, and a failback that went
                     # ahead then would skip the lag check that
-                    # onPhase2Timeout=fail exists to enforce.
+                    # onPhase2Timeout=fail exists to enforce. Usually
+                    # refused before Phase 1 (_refuse_unverifiable_failback);
+                    # this catches a certificate error first seen by the
+                    # retried probe in _retry_pending_yba above.
                     raise Phase2TimeoutError(
                         f"failback lag can't be checked: {cert_error}"
                     )
@@ -1198,26 +1248,17 @@ def _drain_and_apply(
                     )
             except Phase2TimeoutError as exc:
                 phase2_aborted = True
-                abort_now = time.monotonic()
-                with group.lock:
-                    group.last_phase2_timeout_ts = abort_now
-                    # agent-K PR #18:608. Stamp the per-side transition
-                    # time so the probe's cooldown gate (health_probe
-                    # ``_tick_check`` cooldown check) blocks the next
-                    # tick from re-firing this drain. Without this,
-                    # the probe sees status unchanged (because the
-                    # flip was aborted) and immediately re-calls
-                    # trigger_drain on its next tick (every 5 s by
-                    # default) → pause_dispatch again → force-close
-                    # every tracked conn on the active side again →
-                    # Phase 2 wait again → abort again. Shubham's
-                    # failback case turns a lag outage into a near-
-                    # total application outage. Writing the stamp
-                    # arms the cooldown so the next retry is bounded.
-                    if which_cluster == "primary":
-                        group.primary_last_transition_time = abort_now
-                    else:
-                        group.secondary_last_transition_time = abort_now
+                # agent-K PR #18:608. Stamp the per-side transition time
+                # so the probe's cooldown gate (health_probe
+                # ``_tick_check``) blocks the next tick from re-firing
+                # this drain. Without this, the probe sees status
+                # unchanged (because the flip was aborted) and re-calls
+                # trigger_drain on its next tick → pause_dispatch again
+                # → force-close every tracked conn on the active side
+                # again → Phase 2 wait again → abort again. Shubham's
+                # failback case turns a lag outage into a near-total
+                # application outage.
+                _arm_refusal_cooldown(group, which_cluster)
                 logger.error(
                     "xCluster drain ABORTED at Phase 2: %s (primary_uuid=%s, "
                     "which=%s, new_status=%s) — routing stays on current "

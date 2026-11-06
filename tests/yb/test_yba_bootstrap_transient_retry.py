@@ -319,16 +319,93 @@ def test_cert_error_on_retry_marks_failback_refused(fake_state, scripted):
     assert "certificate" in group.yba_cert_error
 
 
-def test_failback_refused_after_cert_error(fake_state, scripted):
-    scripted.outcomes = [_cert_error()]
+def _cert_failed_group(fake_state):
     group = _group(fake_state, failback_on_phase2_timeout="fail")
+    group.primary_status = HealthResult.UNHEALTHY
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+    return group
+
+
+class _Conn:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_failback_refused_after_cert_error(fake_state, scripted, caplog):
+    """Review #26: refused before Phase 1, so the serving secondary is
+    neither paused nor drained."""
+    scripted.outcomes = [_cert_error(), _cert_error()]   # bootstrap, re-probe
+    group = _cert_failed_group(fake_state)
+    conn = _Conn()   # keep a ref: tracked_conns is weak
+    group.secondary.tracked_conns.add(conn)
+
+    with caplog.at_level("INFO", logger="psycopg.yb.drain"):
+        trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
+    assert group.primary_last_transition_time > 0, "cooldown not re-armed"
+    assert conn.closed is False
+    assert group.last_failover_start_ts == 0.0
+    assert not any("drain-wait start" in r.getMessage() for r in caplog.records)
+    assert any("refused before the drain" in r.getMessage() for r in caplog.records)
+    assert scripted.probes == 2
+
+
+def test_fixed_cert_lets_the_failback_run_its_lag_wait(fake_state, scripted, monkeypatch):
+    scripted.outcomes = [_cert_error(), None]   # bootstrap fails, re-probe works
+    group = _cert_failed_group(fake_state)
+    waits = []
+    monkeypatch.setattr(
+        drain_mod, "_wait_for_replication_lag",
+        lambda g, which, is_failback=False, budget_deadline=None, outgoing=None:
+            waits.append(is_failback),
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.yba_cert_error == ""
+    assert group.yba_client is not None
+    assert waits == [True]
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_transient_reprobe_keeps_refusing(fake_state, scripted):
+    scripted.outcomes = [_cert_error(), YBAClientError("timeout", transient=True)]
+    group = _cert_failed_group(fake_state)
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.yba_cert_error
+    assert group.yba_cert_params is not None
+
+
+def test_other_permanent_reprobe_error_disables_the_lag_phase(fake_state, scripted):
+    """Certificate fixed but the token is now rejected: same as that
+    error at bootstrap, the lag phase is off and the failback goes ahead."""
+    scripted.outcomes = [_cert_error(), YBAClientError("HTTP 401", transient=False)]
+    group = _cert_failed_group(fake_state)
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.yba_cert_error == ""
+    assert group.yba_cert_params is None
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_proceed_policy_never_reprobes(fake_state, scripted):
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state, failback_on_phase2_timeout="proceed")
     group.primary_status = HealthResult.UNHEALTHY
     ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
 
     trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
 
-    assert group.primary_status == HealthResult.UNHEALTHY
-    assert group.last_phase2_timeout_ts > 0
+    assert scripted.probes == 1
+    assert group.primary_status == HealthResult.HEALTHY
 
 
 def test_failover_still_flips_after_cert_error(fake_state, scripted):

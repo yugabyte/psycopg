@@ -699,9 +699,12 @@ class FailoverGroup:
     # drain retries the probe before its lag wait (``_retry_pending_yba``).
     yba_pending_params: "object | None" = None
     # Set when the YBA probe failed certificate verification and a
-    # failback replication is configured: under onPhase2Timeout=fail the
-    # drain refuses failbacks, since their lag can't be checked.
+    # failback replication is configured: under onPhase2Timeout=fail
+    # failbacks are refused, since their lag can't be checked. Each
+    # failback attempt re-probes YBA with ``yba_cert_params`` first and
+    # clears both once the certificate verifies.
     yba_cert_error: str = ""
+    yba_cert_params: "object | None" = None
     yba_customer_uuid: str = ""
     xcluster_config_uuid: str = ""
     threshold_replication_lag_ms: int = 0
@@ -1465,15 +1468,54 @@ class ClusterRegistry:
         )
         if refuses:
             group.yba_cert_error = str(exc)
+            group.yba_cert_params = yb_params
         logger.error(
             "YBA lag phase disabled — %s. Failovers flip without a lag "
             "wait%s.",
             exc,
             "; failbacks are refused (yb.failback.onPhase2Timeout=fail) "
-            "until the certificate is fixed and the app restarts"
+            "until the certificate verifies (re-checked on each failback)"
             if refuses else "",
         )
         return True
+
+    def reprobe_after_cert_error(self, group: "FailoverGroup", deadline: float) -> None:
+        """Re-run the YBA probe for a group whose certificate failed
+        verification (review #26), before a failback is refused for it. A
+        success enables the lag phase and clears ``yba_cert_error``, so a
+        fixed certificate takes effect without a restart. Another
+        certificate or transient failure keeps the refusal; any other
+        permanent failure disables the lag phase as at bootstrap."""
+        from .yba_client import YBAClientError
+
+        yb_params = group.yba_cert_params
+        if yb_params is None or group.yba_client is not None:
+            return
+        try:
+            self._probe_yba(group, yb_params, deadline=deadline)
+        except YBAClientError as exc:
+            if exc.transient or getattr(exc, "cert_error", False):
+                group.yba_cert_error = str(exc)
+                logger.warning(
+                    "YBA certificate still can't be checked: %s", exc,
+                )
+                return
+            group.yba_cert_error = ""
+            group.yba_cert_params = None
+            logger.warning(
+                "YBA lag phase disabled — probe failed: %s. Drains flip "
+                "without a lag wait.", exc,
+            )
+            return
+        except Exception:
+            logger.warning(
+                "YBA re-probe after a certificate error failed unexpectedly.",
+                exc_info=True,
+            )
+            return
+        group.yba_cert_error = ""
+        group.yba_cert_params = None
+        logger.info("YBA certificate verifies now; failbacks run the lag wait again.")
 
     def retry_yba_lag_phase(self, group: "FailoverGroup", deadline: float) -> None:
         """Retry a bootstrap YBA probe that failed transiently. A success
