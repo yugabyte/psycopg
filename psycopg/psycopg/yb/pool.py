@@ -63,7 +63,6 @@ import logging
 
 from .. import errors as e
 from . import NoViableClusterError
-from . import hold as yb_hold
 from .registry import ClusterRegistry
 from .state import active_cluster
 
@@ -137,11 +136,7 @@ def xcluster_check(conn) -> None:
 
     Non-smart-driver conns (no ``_yb_uuid``) and conns whose primary
     cluster has no FailoverGroup configured always pass through.
-
-    A conn held by a failback drain (DB-25803) is checked once the drain
-    has decided: kept if the failback was refused, evicted if not.
     """
-    yb_hold.wait_settled(conn)
     should_evict, active_uuid, active_label, no_viable = _decide_eviction(conn)
     if not should_evict:
         return
@@ -241,7 +236,6 @@ async def xcluster_check_async(conn) -> None:
     raises. The close uses ``await conn.close()`` here so the wrapper's
     event-loop bookkeeping happens cleanly.
     """
-    await yb_hold.await_settled(conn)
     should_evict, active_uuid, active_label, no_viable = _decide_eviction(conn)
     if not should_evict:
         return

@@ -20,7 +20,6 @@ from collections.abc import Generator, Iterator
 from . import errors as e
 from . import pq, waiting
 from .yb import dispatch as yb_dispatch
-from .yb import hold as yb_hold
 from .abc import RV, AdaptContext, ConnDict, ConnParam, Params, PQGen, Query
 from .abc import QueryNoTemplate
 from ._tpc import Xid
@@ -648,8 +647,6 @@ class Connection(BaseConnection[Row]):
         The function must be used on generators that don't change connection
         fd (i.e. not on connect and reset).
         """
-        if self._yb_cluster is not None:  # a failback drain may hold it
-            yb_hold.block_if_held(self)
         try:
             return waiting.wait(gen, self.pgconn.socket, interval=interval)
         except _INTERRUPTED:
@@ -662,9 +659,6 @@ class Connection(BaseConnection[Row]):
                 except e.QueryCanceled:
                     pass  # as expected
             raise
-        finally:
-            if self._yb_cluster is not None:
-                yb_hold.done(self)
 
     def _set_autocommit(self, value: bool) -> None:
         self.set_autocommit(value)

@@ -38,7 +38,6 @@ from .yb.params import extract_yb_params
 from .yb.policy import build_policy
 from .yb.registry import ClusterRegistry
 from .yb import dispatch as yb_dispatch
-from .yb import hold as yb_hold
 
 if True:  # ASYNC
     import sys
@@ -681,8 +680,6 @@ class AsyncConnection(BaseConnection[Row]):
         The function must be used on generators that don't change connection
         fd (i.e. not on connect and reset).
         """
-        if self._yb_cluster is not None:  # a failback drain may hold it
-            await yb_hold.ablock_if_held(self)
         try:
             return await waiting.wait_async(gen, self.pgconn.socket, interval=interval)
         except _INTERRUPTED:
@@ -695,9 +692,6 @@ class AsyncConnection(BaseConnection[Row]):
                 except e.QueryCanceled:
                     pass  # as expected
             raise
-        finally:
-            if self._yb_cluster is not None:
-                yb_hold.done(self)
 
     def _set_autocommit(self, value: bool) -> None:
         if True:  # ASYNC

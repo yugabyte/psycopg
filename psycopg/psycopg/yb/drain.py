@@ -68,7 +68,6 @@ import weakref
 from typing import TYPE_CHECKING
 
 from . import TRACE, fork_follow
-from . import hold as yb_hold
 from .health import HealthResult
 
 if TYPE_CHECKING:
@@ -384,13 +383,9 @@ def _in_flight_conns(tracked: "weakref.WeakSet") -> list:
 
 def _close_idle_tracked_during_drain(
     tracked: "weakref.WeakSet", outgoing_uuid: str,
-    hold: "yb_hold.Hold | None" = None, held: "list | None" = None,
 ) -> int:
     """Close every tracked direct conn that is currently IDLE (not in a
     transaction) and not yet closed. Returns the number of conns closed.
-
-    With ``hold`` (a failback that may be refused, DB-25803), hold each
-    such conn instead and append it to ``held``; nothing is closed.
 
     Called from the drain poll loop while ``dispatch_paused=True`` (barrier
     held) to prevent persistent sockets from starting a FRESH transaction
@@ -420,12 +415,6 @@ def _close_idle_tracked_during_drain(
             # Broken conn / stale weakref / in the middle of a status
             # read race — treat as "do nothing", the next tick retries.
             continue
-        if hold is not None:
-            if getattr(c, "_yb_hold", None) is not hold:
-                yb_hold.hold_conn(c, hold)
-                assert held is not None
-                held.append(c)
-            continue
         # agent-K PR #21:146 — use non-blocking lock acquire here.
         # An IDLE conn whose owner is in a long libpq call (e.g.
         # LISTEN/NOTIFY) would otherwise stall the drain poll by
@@ -452,28 +441,6 @@ def _close_idle_tracked_during_drain(
                 outgoing_uuid, exc,
             )
     return closed
-
-
-def _close_held(hold: "yb_hold.Hold", held: list, outgoing_uuid: str) -> None:
-    """The failback goes ahead: fail the round-trips blocked on ``hold``
-    and close the conns Phase 1 held. None of them has a round-trip on
-    the wire, so each close is quick; a blocked owner releases the conn
-    lock as soon as its round-trip raises. A conn whose close fails keeps
-    its hold, so every later round-trip on it raises too."""
-    yb_hold.close(hold)
-    failed = 0
-    for c in held:
-        if getattr(c, "closed", False):
-            continue
-        if _safe_close(c) is not None:
-            failed += 1
-    if held:
-        logger.info(
-            "xCluster drain: closed %d held conn(s) on %s before the flip"
-            "%s",
-            len(held) - failed, outgoing_uuid,
-            f" ({failed} close(s) failed)" if failed else "",
-        )
 
 
 def _compute_active(primary_healthy: bool, secondary_healthy: bool):
@@ -731,17 +698,6 @@ def _drain_and_apply(
             "server-side AdminShutdown killed conns before CB detected."
         )
 
-    # DB-25803: a failback that onPhase2Timeout=fail may refuse holds the
-    # secondary's conns instead of closing them, so a refusal leaves the
-    # side that keeps serving untouched. See yb/hold.py.
-    hold = None
-    held: list = []
-    if (
-        is_failback and phase2_may_abort and not skip_phase2
-        and getattr(group, "failback_on_phase2_timeout", "fail") == "fail"
-    ):
-        hold = yb_hold.Hold()
-
     # 1. Pause dispatch (new opens block on the Condition).
     group.pause_dispatch()
     # DB-25060 — forked workers pause with us and report their in-flight
@@ -777,7 +733,7 @@ def _drain_and_apply(
         total_idle_closed = 0
         while True:
             idle_closed = _close_idle_tracked_during_drain(
-                _tracked_snapshot(outgoing), outgoing.uuid, hold, held,
+                _tracked_snapshot(outgoing), outgoing.uuid,
             )
             total_idle_closed += idle_closed
             in_txn = _in_flight_conns(_tracked_snapshot(outgoing))
@@ -817,25 +773,6 @@ def _drain_and_apply(
             c for c in _tracked_snapshot(outgoing)
             if c is not None and not getattr(c, "closed", False)
         ]
-        if hold is not None:
-            # Hold every survivor; close only those with a round-trip on
-            # the wire, which a hold can't stop (an autocommit statement
-            # would commit on the outgoing side during Phase 2).
-            busy = []
-            held_ids = {id(c) for c in held}
-            for c in survivors:
-                if yb_hold.hold_conn(c, hold):
-                    busy.append(c)
-                elif id(c) not in held_ids:
-                    held.append(c)
-            survivors = busy
-            if held:
-                logger.info(
-                    "xCluster drain: holding %d tracked conn(s) on %s "
-                    "through Phase 2 instead of closing them (failback "
-                    "may be refused, DB-25803)",
-                    len(held), outgoing.uuid,
-                )
         children_live = 0
         if follow is not None:
             children_live = follow.live_children()
@@ -1194,12 +1131,6 @@ def _drain_and_apply(
         # SKIPPED when Phase 2 aborted on timeout (data-corruption fix) —
         # we don't flip to a target we know is behind.
         if not phase2_aborted:
-            if hold is not None:
-                # The failback goes ahead: close what Phase 1 held.
-                _close_held(hold, held, outgoing.uuid)
-                if held:
-                    closed_any = True
-                    closed_at = time.monotonic()
             # Close fence: a conn we just closed is only noticed by its
             # owner on its next call. An app that holds session state
             # (an advisory-lock leader heartbeating every ~1s) would
@@ -1218,17 +1149,6 @@ def _drain_and_apply(
     finally:
         # 6. Resume dispatch — release waiters.
         group.resume_dispatch()
-        if hold is not None and hold.verdict is None:
-            # Refused (or the drain failed): routing stays on the
-            # secondary, so its held conns carry on. After the resume, so
-            # a pool check waiting on a hold sees dispatch running again.
-            yb_hold.release(hold, held)
-            if held:
-                logger.info(
-                    "xCluster drain: released %d held conn(s) on %s; "
-                    "routing stays there",
-                    len(held), outgoing.uuid,
-                )
         if follow is not None:
             follow.publish_resume(group.primary_status, group.secondary_status)
         # Record the direction-appropriate completion timestamp — but

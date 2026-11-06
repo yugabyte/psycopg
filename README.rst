@@ -164,11 +164,7 @@ accepted as separators between tokens):
        can't confirm the primary has caught up. ``fail`` = when the lag
        wait times out, or YBA stays unreachable, the failback is
        aborted: routing stays on the secondary and the probe retries
-       after the cooldown. Under ``fail``, the drain holds the
-       secondary's connections during the lag wait instead of closing
-       them (their next statement waits), so an aborted failback leaves
-       them open; only a statement already running when the drain
-       deadline hits is closed. ``proceed`` = fail back anyway. No effect on
+       after the cooldown. ``proceed`` = fail back anyway. No effect on
        failover, which always proceeds. ``fail`` applies only while the
        secondary is healthy: when the secondary is down, the failback
        proceeds on timeout, since a primary that may not have caught up
