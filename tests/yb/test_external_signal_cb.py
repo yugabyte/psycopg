@@ -11,7 +11,9 @@ Verifies:
   * Missing table → CB creates it on the fly, returns HEALTHY.
   * Broken control conn → HEALTHY (this CB is a request channel, NOT a
     health detector; transient errors don't imply cluster failure).
-  * ``which_cluster`` gates which side the CB reads from.
+  * ``which_cluster`` gates which side the CB reads from and which rows.
+  * A table without ``which_cluster`` gets the column; a current one
+    gets no DDL beyond the CREATE IF NOT EXISTS.
 """
 
 # Copyright (C) 2026 Yugabyte
@@ -46,12 +48,15 @@ class _Cursor:
 
     def execute(self, sql, *args, **kw):
         self._conn.executed.append((sql, args))
+        self._last_sql = sql
         if self._conn._raise_on_execute is not None:
             exc = self._conn._raise_on_execute
             self._conn._raise_on_execute = None
             raise exc
 
     def fetchone(self):
+        if "information_schema.columns" in self._last_sql:
+            return (1,) if self._conn.has_column else None
         return self._conn._next_row
 
 
@@ -66,8 +71,10 @@ class _Conn:
         self,
         next_row=None,
         raise_on_execute: Exception | None = None,
+        has_column: bool = True,
     ) -> None:
         self.executed: list = []
+        self.has_column = has_column
         self.commits = 0
         self.rollbacks = 0
         self.closed = False
@@ -122,6 +129,7 @@ def test_no_signal_returns_healthy():
     kinds = [sql.split()[0] for sql, _ in conn.executed]
     assert "CREATE" in kinds
     assert "SELECT" in kinds
+    assert "ALTER" not in kinds
 
 
 def test_unhealthy_signal_returns_unhealthy():
@@ -155,23 +163,27 @@ def test_signal_strips_whitespace():
 
 # ------------------------------------------------------------ SELECT filters signal row
 
-def test_select_filters_by_group_id():
-    """The SELECT binds the group_id (primary.uuid). Per-slot isolation
-    is provided by each CB reading its own cluster's ``control_sync``,
-    not by a row-level filter."""
+def _signal_selects(conn: _Conn) -> list:
+    return [
+        (sql, args) for sql, args in conn.executed
+        if sql.startswith("SELECT target_status")
+    ]
+
+
+def test_select_filters_by_group_id_and_slot():
+    """The SELECT binds the group_id (primary.uuid) and the CB's own
+    ``which_cluster``, so a row for the other slot never trips it."""
     conn = _Conn(next_row=None)
     group = _make_group(primary_conn=conn)
     cb = ExternalSignalCircuitBreaker(which_cluster="primary")
     cb.check(group)
-    selects = [
-        (sql, args) for sql, args in conn.executed if sql.startswith("SELECT")
-    ]
+    selects = _signal_selects(conn)
     assert len(selects) == 1
     sql, args = selects[0]
-    assert "which_cluster" not in sql
+    assert "which_cluster = %s" in sql
     # The mock records ``*args`` so the inner tuple is the one passed
     # to ``cur.execute(SQL, params)``.
-    assert args == ((group.primary.uuid,),)
+    assert args == ((group.primary.uuid, "primary"),)
 
 
 def test_secondary_slot_reads_from_secondary_control_sync():
@@ -180,12 +192,46 @@ def test_secondary_slot_reads_from_secondary_control_sync():
     group = _make_group(secondary_conn=conn)
     cb = ExternalSignalCircuitBreaker(which_cluster="secondary")
     cb.check(group)
-    selects = [
-        (sql, args) for sql, args in conn.executed if sql.startswith("SELECT")
-    ]
+    selects = _signal_selects(conn)
     assert len(selects) == 1
     _, args = selects[0]
-    assert args == ((group.primary.uuid,),)
+    assert args == ((group.primary.uuid, "secondary"),)
+
+
+# ------------------------------------------------------------ schema
+
+def test_new_table_has_which_cluster_defaulting_to_primary():
+    """Writers that omit ``which_cluster`` (the stress harness inserts
+    only group_id, target_status, reason) signal the primary slot."""
+    conn = _Conn(next_row=None)
+    cb = ExternalSignalCircuitBreaker(which_cluster="primary")
+    cb.check(_make_group(primary_conn=conn))
+    create = next(sql for sql, _ in conn.executed if sql.startswith("CREATE"))
+    assert "which_cluster TEXT      NOT NULL DEFAULT 'primary'" in create
+    assert "PRIMARY KEY (group_id, which_cluster, ts DESC)" in create
+
+
+def test_table_without_which_cluster_gets_the_column():
+    conn = _Conn(next_row=None, has_column=False)
+    cb = ExternalSignalCircuitBreaker(which_cluster="primary")
+    assert cb.check(_make_group(primary_conn=conn)) == HealthResult.HEALTHY
+    alters = [sql for sql, _ in conn.executed if sql.startswith("ALTER")]
+    assert alters == [
+        "ALTER TABLE yb_failover_signals "
+        "ADD COLUMN IF NOT EXISTS which_cluster TEXT DEFAULT 'primary'"
+    ]
+    # Each DDL commits on its own, before the SELECT.
+    assert conn.commits >= 3
+
+
+def test_schema_check_runs_once_per_cb():
+    conn = _Conn(next_row=None)
+    cb = ExternalSignalCircuitBreaker(which_cluster="primary")
+    group = _make_group(primary_conn=conn)
+    cb.check(group)
+    cb.check(group)
+    checks = [sql for sql, _ in conn.executed if "information_schema" in sql]
+    assert len(checks) == 1
 
 
 # ------------------------------------------------------------ error paths

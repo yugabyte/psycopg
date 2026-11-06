@@ -234,14 +234,13 @@ Reference implementations under ``demo/samples/``:
 
   .. code-block:: sql
 
-      INSERT INTO yb_failover_signals (group_id, target_status, reason)
-      VALUES ('<primary-uuid>', 'UNHEALTHY', 'planned maintenance');
+      INSERT INTO yb_failover_signals (group_id, which_cluster, target_status, reason)
+      VALUES ('<primary-uuid>', 'primary', 'UNHEALTHY', 'planned maintenance');
 
-  Each CB reads the table through its own cluster's control connection,
-  so ``yb_failover_signals`` must live in a database that xCluster does
-  not replicate. If it is replicated, a row written on one cluster
-  reaches the other, both CBs trip, and every connect raises
-  ``NoViableClusterError``.
+  ``which_cluster`` (``'primary'`` or ``'secondary'``) defaults to
+  ``'primary'``. Each CB reads the table through its own cluster's
+  control connection and only the rows for its own slot, so the table
+  can live in a database that xCluster replicates.
 
 Ships in ``psycopg.yb.circuit_breaker``:
 

@@ -15,29 +15,35 @@ Signal-table schema (auto-created on first tick):
 
     CREATE TABLE yb_failover_signals (
         group_id      TEXT      NOT NULL,
+        which_cluster TEXT      NOT NULL DEFAULT 'primary',  -- 'primary' | 'secondary'
         target_status TEXT      NOT NULL,   -- 'HEALTHY' | 'UNHEALTHY'
         reason        TEXT,
         ts            TIMESTAMP NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (group_id, ts DESC)
+        PRIMARY KEY (group_id, which_cluster, ts DESC)
     );
 
-Operator triggers a failover-to-secondary by marking the group UNHEALTHY:
+A table created by an earlier version of this sample, without
+``which_cluster``, gets the column on the first tick
+(``ADD COLUMN IF NOT EXISTS``); its existing rows read as ``'primary'``.
 
-    INSERT INTO yb_failover_signals (group_id, target_status, reason)
-    VALUES ('<primary-uuid>', 'UNHEALTHY', 'planned maintenance');
+Operator triggers a failover-to-secondary by marking the primary
+UNHEALTHY:
 
-Failback is the mirror: write a HEALTHY row for the same group_id.
+    INSERT INTO yb_failover_signals (group_id, which_cluster, target_status, reason)
+    VALUES ('<primary-uuid>', 'primary', 'UNHEALTHY', 'planned maintenance');
 
-No row for a group_id means "no signal, return HEALTHY" — the default
-state for fresh deployments.
+Failback is the mirror: write a HEALTHY row for the same slot.
+``which_cluster`` defaults to ``'primary'``, so writers that omit it
+signal the primary slot.
+
+No row for a (group_id, which_cluster) pair means "no signal for that
+slot, return HEALTHY" — the default state for fresh deployments.
 
 Two instances per ``FailoverGroup`` (one per cluster). Each reads from
-its own cluster's ``control_sync`` connection, which is the only per-slot
-isolation, so ``yb_failover_signals`` must live in a database that
-xCluster does not replicate. If it is replicated, a row written on one
-cluster reaches the other, both CBs trip, and every connect raises
-``NoViableClusterError``. (A former ``which_cluster`` column that also
-filtered rows per slot was reverted here — see ``_SIGNAL_TABLE_DDL``.)
+its own cluster's ``control_sync`` connection and only the rows for its
+own ``which_cluster``. The table can live in a database that xCluster
+replicates: a "primary UNHEALTHY" row that reaches the secondary is
+ignored by the secondary's CB.
 
 Usage:
 
@@ -80,29 +86,38 @@ logger = logging.getLogger(__name__)
 
 
 _SIGNAL_TABLE_DDL = (
-    # `which_cluster` was added to this schema in PR-F (fd2baa34) to let
-    # the primary- and secondary-slot CBs filter independently against
-    # the same signal table. It was reverted here because the
-    # yb-stress-test harness's `_insert_signal`
-    # (test_xcluster_smart_driver_failover.py:2498) supplies only
-    # (group_id, target_status, reason) — the extra NOT NULL column
-    # fails every signal INSERT in the stress suite. Re-add it (and
-    # the matching SELECT filter) once the harness is updated to
-    # supply `which_cluster` explicitly. Per-slot isolation is still
-    # provided by each CB instance reading its own cluster's
-    # control_sync connection (see `_target_state`).
+    # The DEFAULT keeps writers that omit `which_cluster` working: the
+    # yb-stress-test harness inserts only (group_id, target_status,
+    # reason), and only signals meant for the primary slot.
     "CREATE TABLE IF NOT EXISTS yb_failover_signals (\n"
     "    group_id      TEXT      NOT NULL,\n"
+    "    which_cluster TEXT      NOT NULL DEFAULT 'primary',\n"
     "    target_status TEXT      NOT NULL,\n"
     "    reason        TEXT,\n"
     "    ts            TIMESTAMP NOT NULL DEFAULT NOW(),\n"
-    "    PRIMARY KEY (group_id, ts DESC)\n"
+    "    PRIMARY KEY (group_id, which_cluster, ts DESC)\n"
     ")"
+)
+
+# Tables created before `which_cluster` came back keep their primary key
+# (group_id, ts DESC); the column is added with the same default. The
+# ALTER runs only when the column is missing, so a current table never
+# sees DDL beyond the CREATE IF NOT EXISTS.
+_SIGNAL_COLUMN_CHECK_SQL = (
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_name = 'yb_failover_signals' "
+    "AND column_name = 'which_cluster' "
+    "AND table_schema = ANY (current_schemas(false))"
+)
+
+_SIGNAL_TABLE_UPGRADE_SQL = (
+    "ALTER TABLE yb_failover_signals "
+    "ADD COLUMN IF NOT EXISTS which_cluster TEXT DEFAULT 'primary'"
 )
 
 _SIGNAL_SELECT_SQL = (
     "SELECT target_status FROM yb_failover_signals "
-    "WHERE group_id = %s "
+    "WHERE group_id = %s AND which_cluster = %s "
     "ORDER BY ts DESC LIMIT 1"
 )
 
@@ -156,7 +171,9 @@ class ExternalSignalCircuitBreaker:
             if not self._table_setup_done:
                 self._setup_table(conn)
             with conn.cursor() as cur:
-                cur.execute(_SIGNAL_SELECT_SQL, (group.primary.uuid,))
+                cur.execute(
+                    _SIGNAL_SELECT_SQL, (group.primary.uuid, self.which_cluster)
+                )
                 row = cur.fetchone()
             conn.commit()
         except Exception as exc:
@@ -177,10 +194,23 @@ class ExternalSignalCircuitBreaker:
             return HealthResult.HEALTHY
 
     def _setup_table(self, conn) -> None:
-        """Idempotent: CREATE TABLE IF NOT EXISTS."""
+        """Idempotent: CREATE TABLE IF NOT EXISTS, then ADD COLUMN IF NOT
+        EXISTS for a table created without ``which_cluster``."""
         with conn.cursor() as cur:
             cur.execute(_SIGNAL_TABLE_DDL)
         conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(_SIGNAL_COLUMN_CHECK_SQL)
+            has_column = cur.fetchone() is not None
+        conn.commit()
+        if not has_column:
+            with conn.cursor() as cur:
+                cur.execute(_SIGNAL_TABLE_UPGRADE_SQL)
+            conn.commit()
+            logger.info(
+                "ExternalSignalCircuitBreaker: added which_cluster to the "
+                "signal table on %s cluster", self.which_cluster,
+            )
         self._table_setup_done = True
         logger.info(
             "ExternalSignalCircuitBreaker: signal table ready on %s cluster",
