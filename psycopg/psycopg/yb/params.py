@@ -426,16 +426,16 @@ class YBParams:
     # Phase 2 timeout policy — determines what happens when the YBA lag
     # wait exceeds ``lag_wait_timeout_s`` without converging.
     #
-    # ``"proceed"``: flip anyway once the lag wait times out.
+    # ``"proceed"`` (default): flip anyway once the lag wait times out.
     #     The app moves to a target that may be missing the outgoing
     #     side's last writes; that staleness is the documented cost of a
     #     bounded switch.
     #
-    # ``"fail"`` (default): on a FAILBACK timeout the drain does NOT flip routing.
+    # ``"fail"``: on a FAILBACK timeout the drain does NOT flip routing.
     #     Dispatch unpauses, status stays on the current side, and the
     #     probe retries after the cooldown. Failover always proceeds —
     #     staying on a side the CB just declared dead is worse.
-    failback_on_phase2_timeout: str = "fail"
+    failback_on_phase2_timeout: str = "proceed"
 
     # Failback overrides (design doc §3.5.1). Each is populated at
     # parse time with either the operator's ``yb.failback.<knob>`` value
@@ -811,13 +811,13 @@ def extract_yb_params(
             yba_verify_ssl = DEFAULT_YBA_VERIFY_SSL
     yba_ca_file = raw.get("yb_failover_yba_ca_file", "").strip()
 
-    # Failback Phase 2 timeout policy. 'fail' (default) keeps routing on
-    # the secondary when a failback times out or YBA stays unreachable
-    # during its lag wait; 'proceed' flips once the lag wait times out.
+    # Failback Phase 2 timeout policy. 'proceed' (default) flips once
+    # the lag wait times out; 'fail' keeps routing on the secondary when
+    # a failback times out or YBA stays unreachable during its lag wait.
     # Failover always proceeds, so the key lives only under yb.failback.*.
     failback_on_phase2_timeout_raw = raw.get("yb_failback_on_phase2_timeout")
     if failback_on_phase2_timeout_raw is None:
-        failback_on_phase2_timeout = "fail"
+        failback_on_phase2_timeout = "proceed"
     else:
         low = failback_on_phase2_timeout_raw.strip().lower()
         if low in ("fail", "proceed"):

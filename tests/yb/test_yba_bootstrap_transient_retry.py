@@ -279,7 +279,7 @@ def test_cert_error_logs_at_error_and_marks_failback_refused(
     with only a WARNING, and failbacks then skipped the lag check even
     under onPhase2Timeout=fail."""
     scripted.outcomes = [_cert_error()]
-    group = _group(fake_state)
+    group = _group(fake_state, failback_on_phase2_timeout="fail")
 
     with caplog.at_level("WARNING", logger="psycopg.yb.registry"):
         ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
@@ -309,7 +309,7 @@ def test_cert_error_leaves_failback_alone_when_nothing_to_check(
 
 def test_cert_error_on_retry_marks_failback_refused(fake_state, scripted):
     scripted.outcomes = [YBAClientError("timeout", transient=True), _cert_error()]
-    group = _group(fake_state)
+    group = _group(fake_state, failback_on_phase2_timeout="fail")
     reg = ClusterRegistry.instance()
     reg._wire_yba_lag_phase(group, _params())
 
@@ -321,7 +321,7 @@ def test_cert_error_on_retry_marks_failback_refused(fake_state, scripted):
 
 def test_failback_refused_after_cert_error(fake_state, scripted):
     scripted.outcomes = [_cert_error()]
-    group = _group(fake_state)
+    group = _group(fake_state, failback_on_phase2_timeout="fail")
     group.primary_status = HealthResult.UNHEALTHY
     ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
 

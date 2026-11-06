@@ -79,8 +79,8 @@ logger = logging.getLogger(__name__)
 class Phase2TimeoutError(Exception):
     """Raised by a FAILBACK Phase 2 lag wait when it times out, or YBA
     stays unreachable for ``_LAG_UNREACHABLE_STRIKES`` polls, and the
-    group's ``failback_on_phase2_timeout`` is ``"fail"`` (the default;
-    ``"proceed"`` flips instead).
+    group's ``failback_on_phase2_timeout`` is ``"fail"`` (opt-in; the default
+    is ``"proceed"``).
 
     Caught by ``_drain_and_apply``, which then SKIPS the status
     transition (does NOT flip routing) and resumes dispatch.
@@ -1042,7 +1042,7 @@ def _drain_and_apply(
         # semantics as YBA being unreachable.
         #
         # Wrap in `Phase2TimeoutError` catch. On
-        # ``yb.failback.onPhase2Timeout="fail"`` (the default), a failback lag-wait raises
+        # ``yb.failback.onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
         # when it times out before converging or YBA stays unreachable. We log, record the
         # timeout timestamp, and SKIP the status change — routing
         # stays on the current (known-good) side. Dispatch still
@@ -1063,7 +1063,7 @@ def _drain_and_apply(
         refuse_unverified = (
             lag_failback and phase2_may_abort and not skip_phase2
             and group.yba_client is None and cert_error
-            and getattr(group, "failback_on_phase2_timeout", "fail") == "fail"
+            and getattr(group, "failback_on_phase2_timeout", "proceed") == "fail"
         )
         if refuse_unverified or (group.yba_client is not None and not skip_phase2):
             try:
@@ -1273,7 +1273,7 @@ def _wait_for_replication_lag(
     """
     from .yba_client import YBAClientError
 
-    policy = getattr(group, "failback_on_phase2_timeout", "fail")
+    policy = getattr(group, "failback_on_phase2_timeout", "proceed")
     if is_failback and policy == "fail" and not may_abort:
         logger.warning(
             "lag wait: yb.failback.onPhase2Timeout=fail not applied — "

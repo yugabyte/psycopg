@@ -159,12 +159,12 @@ accepted as separators between tokens):
        next sample, and can end up to ~11 s (one scrape interval plus
        one poll) past the budget, with a WARNING.
    * - ``yb.failback.onPhase2Timeout``
-     - ``fail``
+     - ``proceed``
      - What a failback does when its replication-lag wait (Phase 2)
-       can't confirm the primary has caught up. ``fail`` = when the lag
-       wait times out, or YBA stays unreachable, the failback is
-       aborted: routing stays on the secondary and the probe retries
-       after the cooldown. ``proceed`` = fail back anyway. No effect on
+       can't confirm the primary has caught up. ``proceed`` = fail back
+       anyway. ``fail`` = when the lag wait times out, or YBA stays
+       unreachable, the failback is aborted: routing stays on the
+       secondary and the probe retries after the cooldown. No effect on
        failover, which always proceeds. ``fail`` applies only while the
        secondary is healthy: when the secondary is down, the failback
        proceeds on timeout, since a primary that may not have caught up
