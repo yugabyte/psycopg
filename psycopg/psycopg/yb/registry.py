@@ -716,7 +716,7 @@ class FailoverGroup:
     # reject samples that cannot reflect post-barrier replication.
     # Defaults match the DSN defaults (gate off, one confirmation), so a
     # group built without these knobs behaves like an unconfigured DSN.
-    lag_freshness_s: int = 0
+    lag_freshness_s: int = 25
     lag_confirmation_samples: int = 1
     barrier_ts: float = 0.0
 
@@ -730,7 +730,7 @@ class FailoverGroup:
     failback_threshold_replication_lag_ms: int = 0
     failback_lag_wait_timeout_s: int = 40
     # DB-24483 — same gates in the failback direction.
-    failback_lag_freshness_s: int = 0
+    failback_lag_freshness_s: int = 25
     failback_lag_confirmation_samples: int = 1
 
     # ``globalTimeBudgetSecs`` per direction (None = no budget). The
