@@ -73,6 +73,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class Phase2TimeoutError(Exception):
+    """Raised by a FAILBACK Phase 2 lag wait when it times out and the
+    group's ``on_phase2_timeout`` is ``"fail"`` (opt-in; the default
+    is ``"proceed"``).
+
+    Caught by ``_drain_and_apply``, which then SKIPS the status
+    transition (does NOT flip routing) and resumes dispatch.
+    """
+
 # Wall-clock budget for the parallel force-close phase — separate from
 # drainTimeoutSecs (which is the grace window for natural drain).
 # Rationale: libpq's PQfinish calls send() to push a Terminate byte
@@ -651,14 +661,53 @@ def _drain_and_apply(
         #                            (per §3.5.1 symmetric behaviour).
         # A missing config UUID in either direction fails open — same
         # semantics as YBA being unreachable.
+        #
+        # Wrap in `Phase2TimeoutError` catch. On
+        # ``onPhase2Timeout="fail"`` (opt-in), a failback lag-wait raises
+        # when it times out before converging. We log, record the
+        # timeout timestamp, and SKIP the status change — routing
+        # stays on the current (known-good) side. Dispatch still
+        # resumes in the finally so the app isn't stuck. The probe
+        # will try again on its next tick.
+        phase2_aborted = False
         if group.yba_client is not None and not skip_phase2:
-            if new_status == HealthResult.UNHEALTHY and group.xcluster_config_uuid:
-                _wait_for_replication_lag(group, which_cluster, is_failback=False)
-            elif (
-                new_status == HealthResult.HEALTHY
-                and group.failback_xcluster_config_uuid
-            ):
-                _wait_for_replication_lag(group, which_cluster, is_failback=True)
+            try:
+                if new_status == HealthResult.UNHEALTHY and group.xcluster_config_uuid:
+                    _wait_for_replication_lag(group, which_cluster, is_failback=False)
+                elif (
+                    new_status == HealthResult.HEALTHY
+                    and group.failback_xcluster_config_uuid
+                ):
+                    _wait_for_replication_lag(group, which_cluster, is_failback=True)
+            except Phase2TimeoutError as exc:
+                phase2_aborted = True
+                abort_now = time.monotonic()
+                with group.lock:
+                    group.last_phase2_timeout_ts = abort_now
+                    # agent-K PR #18:608. Stamp the per-side transition
+                    # time so the probe's cooldown gate (health_probe
+                    # ``_tick_check`` cooldown check) blocks the next
+                    # tick from re-firing this drain. Without this,
+                    # the probe sees status unchanged (because the
+                    # flip was aborted) and immediately re-calls
+                    # trigger_drain on its next tick (every 5 s by
+                    # default) → pause_dispatch again → force-close
+                    # every tracked conn on the active side again →
+                    # Phase 2 wait again → abort again. Shubham's
+                    # failback case turns a lag outage into a near-
+                    # total application outage. Writing the stamp
+                    # arms the cooldown so the next retry is bounded.
+                    if which_cluster == "primary":
+                        group.primary_last_transition_time = abort_now
+                    else:
+                        group.secondary_last_transition_time = abort_now
+                logger.error(
+                    "xCluster drain ABORTED at Phase 2: %s (primary_uuid=%s, "
+                    "which=%s, new_status=%s) — routing stays on current "
+                    "side, re-arming %s cooldown so probe backs off",
+                    exc, group.primary.uuid, which_cluster, new_status.value,
+                    which_cluster,
+                )
 
         # Phase 2 complete — record the boundary (fires even when Phase 2
         # was skipped, so downstream code sees a consistent timeline).
@@ -667,22 +716,29 @@ def _drain_and_apply(
 
         # 5. Apply the status change while dispatch is still paused so
         # the state machine transitions atomically before waiters wake.
-        # after_drain=True so the log line reflects "routing flipped"
-        # rather than the "routing unchanged" wording used by the
-        # non-drain no-op transition path.
-        _apply_status_change(
-            group, which_cluster, new_status, after_drain=True,
-        )
+        # SKIPPED when Phase 2 aborted on timeout (data-corruption fix) —
+        # we don't flip to a target we know is behind.
+        if not phase2_aborted:
+            _apply_status_change(
+                group, which_cluster, new_status, after_drain=True,
+            )
     finally:
         # 6. Resume dispatch — release waiters.
         group.resume_dispatch()
-        # Record the direction-appropriate completion timestamp.
-        now_done = time.monotonic()
-        with group.lock:
-            if is_failback:
-                group.last_failback_complete_ts = now_done
-            else:
-                group.last_failover_complete_ts = now_done
+        # Record the direction-appropriate completion timestamp — but
+        # only when the flip actually happened. agent-K PR #18:612:
+        # debounced CBs read ``last_failover_complete_ts`` as "the
+        # last time the state machine actually transitioned";
+        # stamping it on an aborted drain lies to them and lets a
+        # subsequent debounce window close over a flip that never
+        # occurred.
+        if not phase2_aborted:
+            now_done = time.monotonic()
+            with group.lock:
+                if is_failback:
+                    group.last_failback_complete_ts = now_done
+                else:
+                    group.last_failover_complete_ts = now_done
     logger.info(
         "xCluster drain complete: dispatch resumed (primary_uuid=%s, "
         "outgoing=%s, force_closed=%d)",
@@ -760,33 +816,95 @@ def _wait_for_replication_lag(
         getattr(group.yba_client, "connect_timeout_s", 2.0),
         getattr(group.yba_client, "read_timeout_s", 3.0),
     ) * 2.0
-    _MIN_POLL_BUDGET_S = (
-        _one_poll_cost_s if timeout_s >= _one_poll_cost_s * 2.0 else 0.0
-    )
+    _poll_guard = timeout_s >= _one_poll_cost_s * 2.0
+    # Reserve twice the slowest poll seen so far (floor 0.5s), capped at
+    # the worst case. Reserving the worst case outright cut a 30s wait
+    # to 24s even though real polls take milliseconds.
+    slowest_poll_s = 0.0
 
     while True:
         now = time.monotonic()
+        if slowest_poll_s > 0.0:
+            _MIN_POLL_BUDGET_S = min(_one_poll_cost_s, max(0.5, slowest_poll_s * 2.0))
+        else:
+            _MIN_POLL_BUDGET_S = _one_poll_cost_s
+        if not _poll_guard:
+            _MIN_POLL_BUDGET_S = 0.0
         if now >= deadline:
             elapsed = now - started
-            logger.warning(
-                "lag wait timeout after %.1fs — proceeding with flip",
-                elapsed,
-            )
+            # Phase 2 timeout policy. Agent-K PR #18:710,575. The `fail`
+            # policy aborts the flip on timeout — correct for FAILBACK
+            # (we don't want to send traffic BACK to a lagged primary
+            # while B→A hasn't caught up). But for FAILOVER (new_status
+            # UNHEALTHY), "stay on current side" means stay on the
+            # universe the CB just declared dead. If A is dead, A→B
+            # lag can never converge; `fail` would then block the
+            # failover forever. Force `proceed` in the failover
+            # direction regardless of the knob — the knob only matters
+            # for the failback case where staying on current side is
+            # a safe degraded-mode choice.
+            policy = getattr(group, "on_phase2_timeout", "proceed")
+            if policy == "fail" and is_failback:
+                logger.error(
+                    "lag wait timeout after %.1fs (direction=%s, "
+                    "threshold=%.1fms) — ABORTING flip; routing stays "
+                    "on current side (set yb.failover.onPhase2Timeout="
+                    "proceed to flip anyway)",
+                    elapsed, direction_label, threshold_ms,
+                )
+                raise Phase2TimeoutError(
+                    f"lag wait timeout after {elapsed:.1f}s "
+                    f"(direction={direction_label}, "
+                    f"threshold={threshold_ms:.1f}ms)"
+                )
+            if policy == "fail" and not is_failback:
+                logger.warning(
+                    "lag wait timeout after %.1fs — proceeding with flip "
+                    "despite on_phase2_timeout='fail' (direction=failover; "
+                    "the current side was just marked UNHEALTHY so "
+                    "staying on it is worse than flipping to a lagged "
+                    "target)", elapsed,
+                )
+            else:
+                logger.warning(
+                    "lag wait timeout after %.1fs — proceeding with flip "
+                    "(policy=proceed)",
+                    elapsed,
+                )
             return
         if deadline - now < _MIN_POLL_BUDGET_S:
             # Not enough budget left to safely run one more poll
-            # without overshooting the lag_wait_timeout. Treat as a
-            # strict timeout — proceeding with the flip rather than
-            # risking an unbounded overshoot (agent-K PR #8:430).
+            # without overshooting the lag_wait_timeout. Agent-K PR
+            # #18:G3 — this branch is a timeout equivalent, so it
+            # must honour the on_phase2_timeout="fail" policy for the
+            # FAILBACK direction (same reasoning as the deadline-hit
+            # branch above). Previously this branch just returned,
+            # bypassing the abort and silently flipping onto a
+            # known-lagged target during tight lag_wait_timeout_s
+            # settings.
+            # Same "lag wait timeout" prefix as the deadline branch so log
+            # consumers see one timeout outcome, not two.
             elapsed = now - started
+            policy = getattr(group, "on_phase2_timeout", "proceed")
+            if policy == "fail" and is_failback:
+                logger.error(
+                    "lag wait timeout after %.1fs (direction=failback, "
+                    "threshold=%.1fms; %.1fs left is below the %.1fs poll "
+                    "budget) — ABORTING flip; routing stays on current side",
+                    elapsed, threshold_ms, deadline - now, _MIN_POLL_BUDGET_S,
+                )
+                raise Phase2TimeoutError(
+                    f"lag wait timeout after {elapsed:.1f}s "
+                    f"(direction=failback, threshold={threshold_ms:.1f}ms)"
+                )
             logger.warning(
-                "lag wait near-timeout: %.1fs remaining is below "
-                "min poll budget %.1fs — proceeding with flip "
-                "(elapsed=%.1fs / %ds)",
-                deadline - now, _MIN_POLL_BUDGET_S, elapsed, timeout_s,
+                "lag wait timeout after %.1fs (%.1fs left is below the "
+                "%.1fs poll budget) — proceeding with flip (direction=%s)",
+                elapsed, deadline - now, _MIN_POLL_BUDGET_S, direction_label,
             )
             return
 
+        poll_started = time.monotonic()
         try:
             # DB-24483: prefer the sample-returning variant so we can
             # log how old the YBA data was. Custom lag sources that
@@ -803,6 +921,7 @@ def _wait_for_replication_lag(
             else:
                 lag_ms = group.yba_client.get_committed_lag_ms(xcluster_uuid)
                 sample_ts = None
+            slowest_poll_s = max(slowest_poll_s, time.monotonic() - poll_started)
             unreachable_streak = 0
             # One line per poll — operator can trace exactly what the
             # driver observed on each 1-second tick. INFO because
@@ -827,6 +946,7 @@ def _wait_for_replication_lag(
                     lag_ms, threshold_ms, age_str, elapsed, timeout_s,
                 )
         except YBAClientError as exc:
+            slowest_poll_s = max(slowest_poll_s, time.monotonic() - poll_started)
             unreachable_streak += 1
             logger.warning(
                 "lag wait: YBA unreachable (%d/%d): %s",
