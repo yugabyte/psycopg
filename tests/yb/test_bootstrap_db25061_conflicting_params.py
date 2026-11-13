@@ -177,6 +177,22 @@ def test_assert_raises_on_drain_timeout_conflict_db25061(fake_state):
     assert "primary_uuid=P" in msg
 
 
+def test_assert_conflict_does_not_print_yba_api_token(fake_state):
+    """A token rotation between two bootstraps names the key but keeps
+    both token values out of the error (tracebacks, log aggregators)."""
+    group = _make_group(fake_state, _Params(yba_api_token="old-secret-token"))
+
+    with pytest.raises(ConflictingFailoverConfigError) as exc_info:
+        _assert_bootstrap_params_match(
+            group, _Params(yba_api_token="new-secret-token"),
+        )
+
+    msg = str(exc_info.value)
+    assert "yba_api_token: existing=*** new=*** (differs)" in msg
+    assert "old-secret-token" not in msg
+    assert "new-secret-token" not in msg
+
+
 def test_assert_no_stored_params_is_tolerant(fake_state):
     """A FailoverGroup created directly (test fixture, legacy shim)
     with ``bootstrap_params=None`` must not raise — nothing to compare

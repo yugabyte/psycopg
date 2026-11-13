@@ -9,8 +9,10 @@ what the poll loop needs — three endpoints, one metric extraction.
 Wire format ported from Bill Chan's tools/yba-python-scripts/xcluster_lags.py:
   * base URL: ``{yba_endpoint}/api/v1``
   * auth header: ``X-AUTH-YW-API-TOKEN: <api_token>``
-  * self-signed TLS is common in YBA deployments — ``verify_ssl`` defaults
-    to False to match the field behaviour of that script.
+  * TLS is verified by default (``verify_ssl=True``). A YBA behind a
+    self-signed cert needs its CA bundle in ``yb.failover.ybaCaFile``
+    (``cafile``), or ``yb.failover.ybaVerifySsl=false`` to skip
+    verification.
 
 Uses only stdlib (``urllib.request``, ``ssl``, ``json``) — no ``requests``
 dependency added to the driver.
@@ -23,6 +25,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import math
 import ssl
 import threading
 import time
@@ -43,9 +46,12 @@ _COMMITTED_LAG_TRACE_NAMES = (
 )
 
 # YBA reports the tserver lag micros divided by 1000, so units are already
-# milliseconds when they come back. When a tablet is caught up, YBA returns
-# a "not reported" sentinel around 1e12 — we treat anything at or above
-# ``_NOT_REPORTED_THRESHOLD_MS`` as "no data" (None).
+# milliseconds when they come back. Values at or above
+# ``_NOT_REPORTED_THRESHOLD_MS`` are YBA's "not reported" sentinel (~1e12):
+# that trace is skipped. If every matching trace is a sentinel, there is
+# no usable sample and the extractors return ``None`` ("no data"), the
+# same as when no trace came back at all. A sentinel is never read as
+# caught up; only values at or below ``_CAUGHT_UP_LAG_MS`` are.
 _NOT_REPORTED_THRESHOLD_MS = 1.0e12
 
 # YBA emits ~1 ms for caught-up tablets due to internal rounding. Anything
@@ -69,11 +75,28 @@ class YBAClientError(Exception):
     connect failure, a timeout, a dropped connection or an HTTP 5xx — and
     False for the rest (4xx such as a bad token, an unknown replication
     name, a malformed response). Bootstrap retries only transient ones.
+    ``cert_error`` is True when the YBA certificate failed verification.
     """
 
-    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+    def __init__(
+        self, message: str = "", *, transient: bool = False, cert_error: bool = False,
+    ) -> None:
         super().__init__(message)
         self.transient = transient
+        self.cert_error = cert_error
+
+
+def _cert_error(method: str, path: str, exc: Exception) -> "YBAClientError":
+    """A certificate that fails verification won't verify on a retry, so
+    it is permanent: bootstrap disables the lag phase and says why,
+    instead of every lag wait failing as "YBA unreachable"."""
+    return YBAClientError(
+        f"YBA {method} {path} TLS certificate verification failed: {exc}. "
+        "Set yb.failover.ybaCaFile to the YBA CA bundle, or "
+        "yb.failover.ybaVerifySsl=false to skip verification",
+        transient=False,
+        cert_error=True,
+    )
 
 
 # ------------------------------------------------------------------- client
@@ -106,13 +129,15 @@ class YBAClient:
         self,
         endpoint: str,
         api_token: str,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
         connect_timeout_s: float = 2.0,
         read_timeout_s: float = 3.0,
+        cafile: "str | None" = None,
     ) -> None:
         self.endpoint = _normalize_url(endpoint)
         self._api_token = api_token
         self.verify_ssl = verify_ssl
+        self.cafile = cafile
         self.connect_timeout_s = connect_timeout_s
         self.read_timeout_s = read_timeout_s
         self._customer_uuid: str | None = None
@@ -132,7 +157,12 @@ class YBAClient:
         # (not exposed today; construction-time only).
         self._ssl_ctx: ssl.SSLContext | None = None
         if self._is_https:
-            self._ssl_ctx = ssl.create_default_context()
+            try:
+                self._ssl_ctx = ssl.create_default_context(cafile=cafile)
+            except (OSError, ssl.SSLError) as exc:
+                raise YBAClientError(
+                    f"YBAClient: cannot load CA file {cafile!r}: {exc}"
+                ) from exc
             if not verify_ssl:
                 # YBA over self-signed cert is the typical field
                 # deployment; match Bill's script behaviour by default.
@@ -224,7 +254,9 @@ class YBAClient:
         On stale-socket errors (``ConnectionError`` / ``BadStatusLine`` /
         ``RemoteDisconnected``) reconnects once and retries. Anything
         after that surfaces to the caller — the poll loop's 3-strike
-        rule handles it from there.
+        rule handles it from there. Every transport / protocol failure,
+        including other ``http.client.HTTPException`` subclasses such as
+        ``IncompleteRead``, is raised as :class:`YBAClientError`.
 
         ``deadline`` (monotonic) caps every socket op at the time left
         before it, so a blocked call returns at the deadline.
@@ -251,6 +283,9 @@ class YBAClient:
                             self._open_connection()
                         else:
                             self._open_connection(deadline)
+                    except ssl.SSLCertVerificationError as exc:
+                        self._close_connection()
+                        raise _cert_error(method, path, exc) from exc
                     except (TimeoutError, OSError, ssl.SSLError) as exc:
                         raise YBAClientError(
                             f"YBA {method} {path} connect failed: {exc}",
@@ -292,12 +327,26 @@ class YBAClient:
                         f"YBA {method} {path} connection error: {exc}",
                         transient=True,
                     ) from exc
+                except ssl.SSLCertVerificationError as exc:
+                    self._close_connection()
+                    raise _cert_error(method, path, exc) from exc
                 except (TimeoutError, OSError, ssl.SSLError) as exc:
                     # Force a reconnect on the next call — http.client's
                     # state machine may be wedged after this.
                     self._close_connection()
                     raise YBAClientError(
                         f"YBA {method} {path} timeout: {exc}",
+                        transient=True,
+                    ) from exc
+                except http.client.HTTPException as exc:
+                    # IncompleteRead (short body), LineTooLong,
+                    # ResponseNotReady, ...: not OSErrors, so they used to
+                    # escape unwrapped and the lag wait read them as an
+                    # "unexpected error". The connection's state machine is
+                    # unusable after these; drop it.
+                    self._close_connection()
+                    raise YBAClientError(
+                        f"YBA {method} {path} protocol error: {exc!r}",
                         transient=True,
                     ) from exc
                 break
@@ -417,8 +466,9 @@ class YBAClient:
         lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
     ) -> float | None:
         """Backward-compatible wrapper around :meth:`get_committed_lag_sample`
-        that returns only the lag value. ``None`` means "no trace at
-        all"; the all-caught-up case returns ``0.0`` (not ``None``).
+        that returns only the lag value. ``None`` means "no data": no
+        matching trace, or only not-reported sentinels / non-finite
+        values. The all-caught-up case returns ``0.0`` (not ``None``).
         Prefer the sample variant when the caller cares about
         staleness (DB-24483)."""
         sample = self.get_committed_lag_sample(xcluster_config_uuid, lookback_s)
@@ -435,17 +485,21 @@ class YBAClient:
         the epoch seconds timestamp YBA stamped on the sample.
 
           * ``lag_ms`` is always a float when a sample is returned.
-            All-caught-up / all-sentinel traces collapse to ``0.0``
-            with the newest matching sample's timestamp.
+            All-caught-up traces (every value at or below
+            ``_CAUGHT_UP_LAG_MS``) collapse to ``0.0`` with the newest
+            matching sample's timestamp.
           * ``sample_epoch_s`` may be ``None`` individually when YBA
             returned no ``x`` axis in the trace (shouldn't happen in
             practice but we handle it). Caller logs sample age as
             unknown in that case.
 
-        The whole result is ``None`` when YBA returned no matching
-        trace at all (config not reporting / error block / malformed
-        payload). Caller distinguishes "no data at all" (None) from
-        "fully caught up" (``(0.0, ts)``). agent-K PR #15:392.
+        The whole result is ``None`` when YBA returned no usable
+        sample: no matching trace (config not reporting / error block /
+        malformed payload), or every matching trace carried only the
+        ~1e12 not-reported sentinel or non-finite values. An
+        all-sentinel trace is "no data", not caught up. Caller
+        distinguishes "no data" (None) from "fully caught up"
+        (``(0.0, ts)``). agent-K PR #15:392.
 
         DB-24483: Shubham observed that YBA's default step (coarse,
         derived from the 300 s window) could return a sample up to
@@ -456,6 +510,12 @@ class YBAClient:
         YBA returns to us. The sample timestamp is surfaced here so
         the Phase 2 lag-wait loop can log staleness and operators can
         reason about which snapshot their failover trusted.
+
+        The timestamp is the range-query step, not the scrape time.
+        Known limit: if a tserver stops exporting the lag series without
+        a scrape failure, Prometheus returns its last value at each new
+        step for up to its 5 min lookback, so a stale value carries
+        fresh timestamps and neither Phase 2 gate can tell.
 
         Raises :class:`YBAClientError` on transport / auth / parse
         failures. The failover poll loop translates that into "one
@@ -526,22 +586,36 @@ def _latest_xy(trace: dict) -> "tuple[float | None, float | None]":
     convert to seconds for consistency with ``time.time()``. Either
     element may be ``None`` independently (e.g. ``y`` present but
     malformed ``x``).
+
+    Non-finite or unparseable ``y`` values (Prometheus emits ``NaN`` for
+    missing or stale series) are skipped: the point used is the last one
+    with a finite value, and its own ``x``. A series with no finite value
+    gives ``y = None`` ("no data"). A ``NaN`` used to fail every
+    comparison and land in the caught-up bucket.
     """
     y_values = trace.get("y") or []
     x_values = trace.get("x") or []
     y_out: float | None = None
     x_out: float | None = None
-    if y_values:
+    idx = len(x_values) - 1
+    for i in range(len(y_values) - 1, -1, -1):
         try:
-            y_out = float(y_values[-1])
+            y = float(y_values[i])
         except (TypeError, ValueError):
-            pass
-    if x_values:
+            continue
+        if math.isfinite(y):
+            y_out = y
+            if i < len(x_values):
+                idx = i
+            break
+    if x_values and idx >= 0:
         try:
             # YBA sends epoch milliseconds as strings; normalise to seconds.
-            x_out = float(x_values[-1]) / 1000.0
+            x_out = float(x_values[idx]) / 1000.0
         except (TypeError, ValueError):
             pass
+        if x_out is not None and not math.isfinite(x_out):
+            x_out = None
     return y_out, x_out
 
 
@@ -550,7 +624,8 @@ def _max_lag_from_traces(
 ) -> float | None:
     """Aggregate max committed lag across all traces whose name matches one
     of ``name_hints``. Returns:
-      * ``None`` — no matching trace had a value (metric not being reported)
+      * ``None`` — no matching trace had a usable value (metric not
+        being reported, or only not-reported sentinels)
       * ``0.0`` — all matching traces were at or below the caught-up ceiling
       * positive float — max ms across matching traces
     """

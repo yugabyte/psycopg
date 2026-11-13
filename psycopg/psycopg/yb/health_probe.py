@@ -37,7 +37,6 @@ Concurrency invariants:
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import threading
 import time
@@ -80,6 +79,49 @@ def _emit_startup_notice_once() -> None:
 # ``psycopg.yb.health.check_primary_cluster`` both work.
 check_primary_cluster = _health.check_primary_cluster
 check_secondary_cluster = _health.check_secondary_cluster
+
+
+class _PendingCheck:
+    """One CB check running on its own daemon thread; the probe keeps it
+    as the pending handle until it finishes.
+
+    A raw daemon thread, not an executor worker: interpreter exit joins
+    executor workers (before atexit handlers run), so a CB check that
+    never returns would block process exit. Review #9 (Amogh)."""
+
+    def __init__(
+        self,
+        check_fn: "Callable[[FailoverGroup], HealthResult]",
+        group: "FailoverGroup",
+        name: str,
+    ) -> None:
+        self.result: "HealthResult | None" = None
+        self.exc: "BaseException | None" = None
+        self._done = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, args=(check_fn, group), name=name, daemon=True,
+        )
+
+    def _run(
+        self,
+        check_fn: "Callable[[FailoverGroup], HealthResult]",
+        group: "FailoverGroup",
+    ) -> None:
+        try:
+            self.result = check_fn(group)
+        except BaseException as exc:
+            self.exc = exc
+        finally:
+            self._done.set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def wait(self, timeout: float) -> bool:
+        return self._done.wait(timeout)
+
+    def done(self) -> bool:
+        return self._done.is_set()
 
 
 class HealthProbe:
@@ -126,25 +168,13 @@ class HealthProbe:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._started = False
-        # Persistent single-worker executor so a stuck check() doesn't
-        # multiply into N threads across ticks. If a check hangs past
-        # the cap, we abandon its future — the executor thread stays
-        # occupied until the underlying call returns (or the process
-        # exits), and _tick_check skips subsequent ticks until it clears.
-        #
-        # agent-K PR #9:179: ThreadPoolExecutor workers are NOT daemon
-        # threads on 3.10+. The interpreter's exit hook joins them, so
-        # a stuck CB check would block process exit indefinitely. Fix:
-        # register an atexit hook that force-shuts the executor via
-        # cancel_futures=True — matches the "daemon dies with process"
-        # contract the docstring originally promised.
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"yb-check-{which_cluster}-{id(group):x}",
-        )
-        import atexit
-        atexit.register(self._executor.shutdown, wait=False, cancel_futures=True)
-        self._pending_future: concurrent.futures.Future | None = None
+        # Each check runs on its own daemon thread (``_PendingCheck``).
+        # At most one is alive per probe: if a check hangs past the cap
+        # it is abandoned but kept here, and _tick_check skips
+        # subsequent ticks until it clears, so a stuck check() doesn't
+        # multiply into N threads across ticks. Daemon threads never
+        # block process exit (agent-K PR #9:179, Review #9).
+        self._pending_check: _PendingCheck | None = None
         # Set after the first tick completes (success, timeout, or raised).
         # ``FailoverGroup.wait_for_first_check`` waits on this so callers
         # can synchronise routing decisions with actual CB observations
@@ -183,10 +213,8 @@ class HealthProbe:
                     "(primary_uuid=%s)",
                     self._which, join_timeout, self._group.primary.uuid,
                 )
-        # Fire-and-forget executor shutdown — a stuck check() may still
-        # be holding the worker. `wait=False` lets us tear down cleanly
-        # without blocking on it (the daemon thread dies with the process).
-        self._executor.shutdown(wait=False)
+        # A stuck check() may still be running on its daemon thread; it
+        # is not joined (it dies with the process).
         logger.debug(
             "HealthProbe (%s) stopped: primary_uuid=%s",
             self._which, self._group.primary.uuid,
@@ -219,18 +247,18 @@ class HealthProbe:
         ``bootstrap_failover_group`` (agent-K PR #10:284). The next
         natural daemon tick will apply the verdict normally.
 
-        Enforcement: submit to the persistent single-worker executor and
-        wait via ``future.result(timeout=)``. If the check exceeds the
-        cap, we abandon the future and log a WARNING; the previous status
+        Enforcement: run the check on a daemon thread and wait for it up
+        to the cap. If the check exceeds the cap, we abandon it and log a
+        WARNING; the previous status
         is preserved (the check is NOT treated as UNHEALTHY — a stuck
-        check is a CB bug, not a cluster signal). If the executor is
-        still busy with a previous stuck check, skip this tick entirely
+        check is a CB bug, not a cluster signal). If a previous stuck
+        check is still running, skip this tick entirely
         so a wedged CB doesn't accumulate a backlog."""
         try:
             # Previous check still running past its cap? Skip this tick.
             if (
-                self._pending_future is not None
-                and not self._pending_future.done()
+                self._pending_check is not None
+                and not self._pending_check.done()
             ):
                 logger.warning(
                     "%s CB check still running past checkTimeoutSecs=%.1fs; "
@@ -246,29 +274,31 @@ class HealthProbe:
             check_fn: Callable[["FailoverGroup"], HealthResult] = (
                 module_scope[f"check_{self._which}_cluster"]
             )
-            future = self._executor.submit(check_fn, self._group)
-            self._pending_future = future
-            try:
-                result = future.result(timeout=self._check_timeout_s)
-            except concurrent.futures.TimeoutError:
+            check = _PendingCheck(
+                check_fn, self._group,
+                name=f"yb-check-{self._which}-{id(self._group):x}",
+            )
+            self._pending_check = check
+            check.start()
+            if not check.wait(self._check_timeout_s):
                 logger.warning(
                     "%s CB check exceeded checkTimeoutSecs=%.1fs; preserving "
                     "previous status (primary_uuid=%s)",
                     self._which, self._check_timeout_s,
                     self._group.primary.uuid,
                 )
-                # Leave `_pending_future` in place so the next tick sees the
+                # Leave `_pending_check` in place so the next tick sees the
                 # still-running check and skips itself.
                 return
-            except Exception:
+            self._pending_check = None
+            if check.exc is not None:
                 logger.warning(
                     "%s CB check raised; treating as no-change (primary_uuid=%s)",
                     self._which, self._group.primary.uuid,
-                    exc_info=True,
+                    exc_info=check.exc,
                 )
-                self._pending_future = None
                 return
-            self._pending_future = None
+            result = check.result
             try:
                 if apply_verdict:
                     self._maybe_apply(result)
@@ -311,7 +341,7 @@ class HealthProbe:
                 )
         except Exception:
             # Belt-and-braces for anything else in this tick (module
-            # scope lookup, executor submission failures). Probe
+            # scope lookup, thread start failures). Probe
             # survives so failover doesn't go silent (agent-K PR #9:254).
             logger.error(
                 "%s probe: unexpected error in _tick_check; probe "
@@ -392,25 +422,32 @@ class HealthProbe:
         # independent threads; without this gate, the secondary probe
         # could enter trigger_drain while the primary probe was already
         # mid-drain, interleaving pause/resume and status transitions.
-        # Fall through the lock — trigger_drain re-acquires it as it
-        # mutates the group state.
+        # Review #9 (Amogh): check and claim in one lock section, so the
+        # other probe can't pass the same check before this one pauses
+        # dispatch. trigger_drain re-acquires the lock as it mutates the
+        # group state.
         with group.lock:
-            if group.dispatch_paused:
+            if group.dispatch_paused or group.drain_in_progress:
                 logger.info(
                     "%s probe: another drain is in flight "
-                    "(dispatch_paused=True); deferring transition "
+                    "(dispatch_paused=%s); deferring transition "
                     "%s → %s to next tick (primary_uuid=%s)",
-                    self._which, current.value, result.value,
-                    group.primary.uuid,
+                    self._which, group.dispatch_paused, current.value,
+                    result.value, group.primary.uuid,
                 )
                 return
+            group.drain_in_progress = True
         from .drain import trigger_drain            # late import; cycle-safe
-        trigger_drain(
-            group=group,
-            which_cluster=self._which,
-            new_status=result,
-            drain_timeout_s=self._drain_timeout_s,
-        )
+        try:
+            trigger_drain(
+                group=group,
+                which_cluster=self._which,
+                new_status=result,
+                drain_timeout_s=self._drain_timeout_s,
+            )
+        finally:
+            with group.lock:
+                group.drain_in_progress = False
 
     def _never_reached(self) -> bool:
         """True while this cluster is a bootstrap placeholder with no open
@@ -440,8 +477,8 @@ class HealthProbe:
         """
         group = self._group
         if (
-            self._pending_future is not None
-            and not self._pending_future.done()
+            self._pending_check is not None
+            and not self._pending_check.done()
         ):
             # CB check still running on the control conn; skip refresh
             # this tick to avoid the race with it.

@@ -182,7 +182,7 @@ def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
 
 
 def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
-    """`yb.failback.onPhase2Timeout=proceed` (default) — flip anyway once the lag
+    """`yb.failback.onPhase2Timeout=proceed` (opt-in) — flip anyway once the lag
     wait times out."""
     group, client = _make_group_with_yba(
         fake_state,
@@ -704,6 +704,47 @@ def test_failback_yba_unreachable_proceeds_with_proceed_policy(fake_state):
 def test_failover_yba_unreachable_proceeds_even_with_fail_policy(fake_state):
     group, client = _make_group_with_yba(
         fake_state, yba_responses=[YBAClientError("net down")] * 3,
+        threshold_ms=0, lag_wait_timeout_s=30,
+    )
+    group.failback_on_phase2_timeout = "fail"
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.dispatch_paused is False
+
+
+# ------------------------------------------------------- unexpected error + yb.failback.onPhase2Timeout=fail
+
+def test_failback_unexpected_yba_error_aborts_with_fail_policy(fake_state):
+    """Review #8 (Amogh): a non-YBAClientError from the lag source took
+    the "unexpected YBA error — proceeding with flip" path and failed
+    back with no lag confirmation, whatever the policy. Under `fail` the
+    failback aborts there too."""
+    group, client = _failback_group(
+        fake_state, [RuntimeError("boom")], "fail",
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
+    assert group.dispatch_paused is False
+
+
+def test_failback_unexpected_yba_error_proceeds_with_proceed_policy(fake_state):
+    group, client = _failback_group(
+        fake_state, [RuntimeError("boom")], "proceed",
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_failover_unexpected_yba_error_proceeds_even_with_fail_policy(fake_state):
+    group, client = _make_group_with_yba(
+        fake_state, yba_responses=[RuntimeError("boom")],
         threshold_ms=0, lag_wait_timeout_s=30,
     )
     group.failback_on_phase2_timeout = "fail"

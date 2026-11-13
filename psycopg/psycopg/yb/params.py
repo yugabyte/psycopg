@@ -25,11 +25,25 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 from dataclasses import dataclass, field
 
 from .node import Placement
 
+if TYPE_CHECKING:
+    from ..abc import ConnDict, ConnMapping
+
 logger = logging.getLogger(__name__)
+
+# extract_yb_params runs on every connect; a config warning is logged
+# once per distinct message rather than on each connection.
+_warned_once: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg not in _warned_once:
+        _warned_once.add(msg)
+        logger.warning("%s", msg)
 
 
 # Mirror pgjdbc-yb's clamps. See design doc §3.2.4.
@@ -53,6 +67,15 @@ DEFAULT_CHECK_TIMEOUT_SEC = 1
 #    0 → force-close in-flight transactions immediately. No drain window.
 #    N > 0 → wait up to N seconds, then force-close survivors.
 DEFAULT_DRAIN_TIMEOUT_SEC = 10
+
+# Close fence (yb.failover.closeFenceSecs): after a drain closed conns on
+# the outgoing side, the flip waits until this long has passed since the
+# last close, so an owner of session state (an advisory-lock holder that
+# checks its conn about once a second) notices the close before a new
+# session on the incoming side can take the same state. Phase 2 time
+# counts towards it. Best effort: the driver can't guarantee a single
+# holder of session-level state across two universes. 0 disables it.
+DEFAULT_CLOSE_FENCE_SEC = 1.0
 
 # YBA lag-wait phase (Amogh's flow, 2026-08-11). All zero-value / unset by
 # default; the phase is opt-in via ``yb.failover.ybaEndpoint``. When
@@ -104,6 +127,11 @@ _LAG_SCRAPE_HINT_S = 10
 # ExternalSignalCircuitBreaker (or a future force_recheck API).
 DEFAULT_AUTO_FAILBACK_ENABLED = True
 
+# YBA TLS verification. On by default (review #8): the YBA API token is
+# an admin credential. A YBA behind a self-signed cert needs ``ybaCaFile``
+# (its CA bundle) or an explicit ``ybaVerifySsl=false``.
+DEFAULT_YBA_VERIFY_SSL = True
+
 # Global failover time budget (Amex ask, Aug 2026). When set, derives
 # drainTimeoutSecs and lagWaitTimeoutSecs so the total post-detection
 # failover wall-clock ≤ budget. See design doc §3.7 for the semantics
@@ -113,6 +141,16 @@ DEFAULT_AUTO_FAILBACK_ENABLED = True
 # and ends at the routing flip; it does NOT include
 # ``yb_servers_refresh_interval`` (detection latency), ``checkTimeoutSecs``
 # (CB check cap), or ``cooldownSecs`` (rate limit).
+#
+# Two exceptions, both with dispatch still paused:
+#   * a failback under ``onPhase2Timeout=fail`` whose only lag-0 samples
+#     predate the barrier waits once for YBA's next sample, so it can end
+#     up to one scrape interval plus one poll (~11s) past the budget. The
+#     driver logs a WARNING when it does (``extending the failback lag
+#     wait``).
+#   * the close fence (``closeFenceSecs``, default 1s) isn't counted in
+#     the budget: when Phase 2 took less than the fence, the flip waits
+#     out the rest.
 _BUDGET_DRAIN_RATIO = 0.40
 _BUDGET_LAG_WAIT_RATIO = 0.60
 
@@ -140,9 +178,12 @@ _PURE_YB_KEYS = frozenset({
     "yb_failover_cooldown_secs",
     "yb_failover_check_timeout_secs",
     "yb_failover_drain_timeout_secs",
+    "yb_failover_close_fence_secs",
     # YBA lag-wait phase.
     "yb_failover_yba_endpoint",
     "yb_failover_yba_api_token",
+    "yb_failover_yba_verify_ssl",
+    "yb_failover_yba_ca_file",
     "yb_failover_replication_name",
     "yb_failover_threshold_replication_lag_ms",
     "yb_failover_lag_wait_timeout_secs",
@@ -194,8 +235,11 @@ _YB_KEY_RE = re.compile(
     r"|yb[._-]failover[._-](?:cooldownSecs|cooldown[._-]secs)"
     r"|yb[._-]failover[._-](?:checkTimeoutSecs|check[._-]timeout[._-]secs)"
     r"|yb[._-]failover[._-](?:drainTimeoutSecs|drain[._-]timeout[._-]secs)"
+    r"|yb[._-]failover[._-](?:closeFenceSecs|close[._-]fence[._-]secs)"
     r"|yb[._-]failover[._-](?:ybaEndpoint|yba[._-]endpoint)"
     r"|yb[._-]failover[._-](?:ybaApiToken|yba[._-]api[._-]token)"
+    r"|yb[._-]failover[._-](?:ybaVerifySsl|yba[._-]verify[._-]ssl)"
+    r"|yb[._-]failover[._-](?:ybaCaFile|yba[._-]ca[._-]file)"
     r"|yb[._-]failover[._-](?:replicationName|replication[._-]name)"
     r"|yb[._-]failover[._-](?:thresholdReplicationLagMs|threshold[._-]replication[._-]lag[._-]ms)"
     r"|yb[._-]failover[._-](?:lagWaitTimeoutSecs|lag[._-]wait[._-]timeout[._-]secs)"
@@ -250,8 +294,11 @@ _FAILOVER_KEY_ALIASES: dict[str, str] = {
     "yb_failover_cooldownsecs":                  "yb_failover_cooldown_secs",
     "yb_failover_checktimeoutsecs":              "yb_failover_check_timeout_secs",
     "yb_failover_draintimeoutsecs":              "yb_failover_drain_timeout_secs",
+    "yb_failover_closefencesecs":                "yb_failover_close_fence_secs",
     "yb_failover_ybaendpoint":                   "yb_failover_yba_endpoint",
     "yb_failover_ybaapitoken":                   "yb_failover_yba_api_token",
+    "yb_failover_ybaverifyssl":                  "yb_failover_yba_verify_ssl",
+    "yb_failover_ybacafile":                     "yb_failover_yba_ca_file",
     "yb_failover_replicationname":               "yb_failover_replication_name",
     "yb_failover_thresholdreplicationlagms":     "yb_failover_threshold_replication_lag_ms",
     "yb_failover_lagwaittimeoutsecs":            "yb_failover_lag_wait_timeout_secs",
@@ -325,6 +372,8 @@ class YBParams:
     # stalling failover. Default: max(1, refresh_interval_s // 2) —
     # computed at parse time in extract_yb_params.
     check_timeout_s: int = DEFAULT_CHECK_TIMEOUT_SEC
+    # See DEFAULT_CLOSE_FENCE_SEC.
+    close_fence_s: float = DEFAULT_CLOSE_FENCE_SEC
     # Barrier-with-timeout drain (design doc §3.3). Sentinel values:
     #   -1 → wait indefinitely; never force-close in-flight transactions.
     #    0 → force-close immediately; no drain window.
@@ -345,7 +394,14 @@ class YBParams:
     # in YBA's DR page); the driver resolves it to ``customerUUID`` and
     # ``xClusterConfigUUID`` at bootstrap and caches them on the group.
     yba_endpoint: str = ""
-    yba_api_token: str = ""
+    # repr=False: the token is a YBA admin credential; keep it out of any
+    # ``%r`` / exception message that formats a YBParams.
+    yba_api_token: str = field(default="", repr=False)
+    # TLS verification of the YBA endpoint (review #8), on by default.
+    # ``yba_ca_file`` is the CA bundle to verify against (empty → system
+    # trust store).
+    yba_verify_ssl: bool = DEFAULT_YBA_VERIFY_SSL
+    yba_ca_file: str = ""
     replication_name: str = ""
     threshold_replication_lag_ms: int = DEFAULT_THRESHOLD_REPLICATION_LAG_MS
     lag_wait_timeout_s: int = DEFAULT_LAG_WAIT_TIMEOUT_SEC
@@ -388,16 +444,16 @@ class YBParams:
     # Phase 2 timeout policy — determines what happens when the YBA lag
     # wait exceeds ``lag_wait_timeout_s`` without converging.
     #
-    # ``"proceed"`` (default): flip anyway once the lag wait times out.
+    # ``"proceed"``: flip anyway once the lag wait times out.
     #     The app moves to a target that may be missing the outgoing
     #     side's last writes; that staleness is the documented cost of a
     #     bounded switch.
     #
-    # ``"fail"``: on a FAILBACK timeout the drain does NOT flip routing.
+    # ``"fail"`` (default): on a FAILBACK timeout the drain does NOT flip routing.
     #     Dispatch unpauses, status stays on the current side, and the
     #     probe retries after the cooldown. Failover always proceeds —
     #     staying on a side the CB just declared dead is worse.
-    failback_on_phase2_timeout: str = "proceed"
+    failback_on_phase2_timeout: str = "fail"
 
     # Failback overrides (design doc §3.5.1). Each is populated at
     # parse time with either the operator's ``yb.failback.<knob>`` value
@@ -486,20 +542,20 @@ XCLUSTER_SOCKET_DEFAULTS: dict[str, str] = {
 
 
 def with_xcluster_socket_defaults(
-    conninfo: str, kwargs: dict[str, object],
-) -> dict[str, object]:
+    conninfo: str, kwargs: ConnMapping,
+) -> ConnDict:
     """Return ``kwargs`` plus every XCLUSTER_SOCKET_DEFAULTS key that
     neither ``conninfo`` nor ``kwargs`` sets."""
     from ..conninfo import conninfo_to_dict
 
-    present = conninfo_to_dict(conninfo, **kwargs)  # type: ignore[arg-type]
+    present = conninfo_to_dict(conninfo, **kwargs)
     missing = {k: v for k, v in XCLUSTER_SOCKET_DEFAULTS.items() if k not in present}
     return {**missing, **kwargs}
 
 
 def extract_yb_params(
-    conninfo: str, kwargs: dict[str, object]
-) -> tuple["YBParams", str, dict[str, object]]:
+    conninfo: str, kwargs: ConnMapping
+) -> tuple["YBParams", str, ConnDict]:
     """Read YB-specific params from conninfo + kwargs.
 
     Returns ``(YBParams, cleaned_conninfo, cleaned_kwargs)``. The cleaned
@@ -528,7 +584,7 @@ def extract_yb_params(
     cleaned_conninfo = re.sub(r"\s+", " ", "".join(cleaned_parts)).strip()
 
     # 2. Walk kwargs and pull our keys out. kwargs override conninfo on collision.
-    cleaned_kwargs: dict[str, object] = {}
+    cleaned_kwargs: ConnDict = {}
     for k, v in kwargs.items():
         nk = _normalize_key(k)
         if nk in _PURE_YB_KEYS:
@@ -590,6 +646,19 @@ def extract_yb_params(
         )),
         1,
     )
+    close_fence = DEFAULT_CLOSE_FENCE_SEC
+    if (fence_raw := raw.get("yb_failover_close_fence_secs")) is not None:
+        try:
+            close_fence = float(fence_raw)
+        except (TypeError, ValueError):
+            close_fence = -1.0
+        if not 0 <= close_fence < float("inf"):
+            if _xcluster_enabled_at_parse:
+                raise ValueError(
+                    "yb.failover.closeFenceSecs must be a number >= 0, "
+                    f"got {fence_raw!r}"
+                )
+            close_fence = DEFAULT_CLOSE_FENCE_SEC
     # Global failover time budget (§3.7). Parsed first because drain and
     # lag-wait derivation depend on it. ``None`` = unset = existing behaviour.
     global_time_budget_secs: int | None = None
@@ -639,6 +708,15 @@ def extract_yb_params(
         lag_wait_timeout = _clamp_lo(
             round(global_time_budget_secs * _BUDGET_LAG_WAIT_RATIO), 0,
         )
+        # Named in the floor warning, so it blames the knob actually set.
+        lag_wait_source = (
+            f"{round(_BUDGET_LAG_WAIT_RATIO * 100)}% of "
+            f"yb.failover.globalTimeBudgetSecs={global_time_budget_secs}"
+        )
+        lag_wait_fix = (
+            "yb.failover.globalTimeBudgetSecs, or set "
+            "yb.failover.lagWaitTimeoutSecs explicitly,"
+        )
     else:
         lag_wait_timeout = _clamp_lo(
             int(raw.get(
@@ -647,6 +725,11 @@ def extract_yb_params(
             )),
             0,
         )
+        lag_wait_source = (
+            "yb.failover.lagWaitTimeoutSecs" if lag_wait_user_set
+            else "the default"
+        )
+        lag_wait_fix = "yb.failover.lagWaitTimeoutSecs"
 
     # When a budget is set, each phase knob has an implicit share of the
     # budget (drain: 40%, lag_wait: 60%). If the user explicitly sets a
@@ -708,15 +791,16 @@ def extract_yb_params(
             # harnesses do this), and the Phase 2 timeout + abort policy
             # already handles the result safely. Operators who want strict
             # rejection can treat this logger at ERROR.
-            logger.warning(
-                "yb.failover.lagWaitTimeoutSecs=%d is below the floor %ds "
-                "imposed by lagFreshnessSecs=%d + lagConfirmationSamples=%d × "
-                "scrapeIntervalSecs=%d — Phase 2 will time out on every "
-                "planned failover under this config. Raise lagWaitTimeoutSecs "
-                "to ≥%d, lower lagFreshnessSecs/lagConfirmationSamples, or "
-                "disable the gate with lagFreshnessSecs=0.",
-                lag_wait_timeout, needed, lag_freshness_s,
-                lag_confirmation_samples, _LAG_SCRAPE_HINT_S, needed,
+            _warn_once(
+                f"The failover lag wait of {lag_wait_timeout}s "
+                f"({lag_wait_source}) is below the floor {needed}s imposed "
+                f"by lagFreshnessSecs={lag_freshness_s} + "
+                f"lagConfirmationSamples={lag_confirmation_samples} × "
+                f"scrapeIntervalSecs={_LAG_SCRAPE_HINT_S} — Phase 2 will "
+                f"time out on every planned failover under this config. "
+                f"Raise {lag_wait_fix} so the lag wait is ≥{needed}s, lower "
+                f"lagFreshnessSecs/lagConfirmationSamples, or disable the "
+                f"gate with lagFreshnessSecs=0."
             )
 
     # Auto-failback toggle. Default true (backward-compatible). Accepts
@@ -738,13 +822,33 @@ def extract_yb_params(
         else:
             auto_failback_enabled = DEFAULT_AUTO_FAILBACK_ENABLED
 
-    # Failback Phase 2 timeout policy. 'proceed' (default) flips once
-    # the lag wait times out; 'fail' keeps routing on the secondary when
-    # a failback times out or YBA stays unreachable during its lag wait.
+    # YBA TLS verification (review #8). Same bool forms and same
+    # "validate only when xCluster is enabled" policy as autoFailbackEnabled.
+    yba_verify_ssl_raw = raw.get("yb_failover_yba_verify_ssl")
+    if yba_verify_ssl_raw is None:
+        yba_verify_ssl = DEFAULT_YBA_VERIFY_SSL
+    else:
+        low = yba_verify_ssl_raw.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            yba_verify_ssl = True
+        elif low in ("false", "0", "no", "off"):
+            yba_verify_ssl = False
+        elif _xcluster_enabled_at_parse:
+            raise ValueError(
+                "yb.failover.ybaVerifySsl must be a boolean "
+                f"(true/false), got {yba_verify_ssl_raw!r}"
+            )
+        else:
+            yba_verify_ssl = DEFAULT_YBA_VERIFY_SSL
+    yba_ca_file = raw.get("yb_failover_yba_ca_file", "").strip()
+
+    # Failback Phase 2 timeout policy. 'fail' (default) keeps routing on
+    # the secondary when a failback times out or YBA stays unreachable
+    # during its lag wait; 'proceed' flips once the lag wait times out.
     # Failover always proceeds, so the key lives only under yb.failback.*.
     failback_on_phase2_timeout_raw = raw.get("yb_failback_on_phase2_timeout")
     if failback_on_phase2_timeout_raw is None:
-        failback_on_phase2_timeout = "proceed"
+        failback_on_phase2_timeout = "fail"
     else:
         low = failback_on_phase2_timeout_raw.strip().lower()
         if low in ("fail", "proceed"):
@@ -876,16 +980,33 @@ def extract_yb_params(
         if failback_lag_wait_timeout_s < fb_needed:
             # Downgraded to a WARNING; see the failover-side comment above
             # for rationale.
-            logger.warning(
-                "yb.failback.lagWaitTimeoutSecs=%d is below the floor %ds "
-                "imposed by lagFreshnessSecs=%d + lagConfirmationSamples=%d × "
-                "scrapeIntervalSecs=%d — failback Phase 2 will time out on "
-                "every planned failback under this config. Raise "
-                "yb.failback.lagWaitTimeoutSecs to ≥%d, lower the failback "
-                "freshness/confirmation knobs, or disable the gate with "
-                "yb.failback.lagFreshnessSecs=0.",
-                failback_lag_wait_timeout_s, fb_needed, failback_lag_freshness_s,
-                failback_lag_confirmation_samples, _LAG_SCRAPE_HINT_S, fb_needed,
+            if failback_lag_wait_user_set:
+                fb_source = "yb.failback.lagWaitTimeoutSecs"
+                fb_fix = "yb.failback.lagWaitTimeoutSecs"
+            elif failback_budget_raw is not None:
+                fb_source = (
+                    f"{round(_BUDGET_LAG_WAIT_RATIO * 100)}% of "
+                    f"yb.failback.globalTimeBudgetSecs="
+                    f"{failback_global_time_budget_secs}"
+                )
+                fb_fix = (
+                    "yb.failback.globalTimeBudgetSecs, or set "
+                    "yb.failback.lagWaitTimeoutSecs explicitly,"
+                )
+            else:
+                fb_source = f"inherited from the failover lag wait, {lag_wait_source}"
+                fb_fix = f"yb.failback.lagWaitTimeoutSecs or {lag_wait_fix}"
+            _warn_once(
+                f"The failback lag wait of {failback_lag_wait_timeout_s}s "
+                f"({fb_source}) is below the floor {fb_needed}s imposed by "
+                f"lagFreshnessSecs={failback_lag_freshness_s} + "
+                f"lagConfirmationSamples={failback_lag_confirmation_samples} "
+                f"× scrapeIntervalSecs={_LAG_SCRAPE_HINT_S} — failback "
+                f"Phase 2 will time out on every planned failback under "
+                f"this config. Raise {fb_fix} so the lag wait is "
+                f"≥{fb_needed}s, lower the failback freshness/confirmation "
+                f"knobs, or disable the gate with "
+                f"yb.failback.lagFreshnessSecs=0."
             )
 
     # YBA client inner timeouts. Scale down when a budget is set on
@@ -928,9 +1049,12 @@ def extract_yb_params(
             secondary_cluster_hosts=secondary_hosts,
             cooldown_s=cooldown,
             check_timeout_s=check_timeout,
+            close_fence_s=close_fence,
             drain_timeout_s=drain_timeout_raw,
             yba_endpoint=yba_endpoint,
             yba_api_token=yba_api_token,
+            yba_verify_ssl=yba_verify_ssl,
+            yba_ca_file=yba_ca_file,
             replication_name=replication_name,
             threshold_replication_lag_ms=threshold_replication_lag_ms,
             lag_wait_timeout_s=lag_wait_timeout,

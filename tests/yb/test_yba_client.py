@@ -13,7 +13,9 @@ Auto-tagged ``yb_unit`` — no database, no network beyond loopback.
 
 from __future__ import annotations
 
+import http.client
 import json
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -283,6 +285,71 @@ def test_get_committed_lag_ms_ignores_not_reported_sentinel(yba_server):
     assert client.get_committed_lag_ms("xcc-1") == pytest.approx(5.5)
 
 
+def test_get_committed_lag_ms_all_sentinel_is_no_data(yba_server):
+    """Every trace carrying the ~1e12 not-reported sentinel is "no data"
+    (None), not caught up (0.0). Pins the behaviour the module comment
+    and docstrings describe (review #15)."""
+    yba_server.routes["/api/v1/session_info"] = {"body": {"customerUUID": "c1"}}
+    yba_server.routes["/api/v1/customers/c1/metrics"] = {
+        "body": {
+            "tserver_async_replication_lag_micros": {
+                "data": [
+                    {"name": "Committed Lag", "y": ["1000000000000"]},
+                    {"name": "Committed Lag", "y": ["1000000000000"]},
+                ],
+            },
+        },
+    }
+    client = YBAClient(yba_server.endpoint, api_token="tok")
+    assert client.get_committed_lag_ms("xcc-1") is None
+    assert client.get_committed_lag_sample("xcc-1") is None
+
+
+# ------------------------------------------------------------- TLS (review #8)
+
+def test_tls_verification_on_by_default():
+    c = YBAClient("https://yba.example.com", api_token="tok")
+    assert c._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+    assert c._ssl_ctx.check_hostname is True
+
+
+def test_tls_verify_off_skips_verification():
+    c = YBAClient("https://yba.example.com", api_token="tok", verify_ssl=False)
+    assert c._ssl_ctx.verify_mode == ssl.CERT_NONE
+    assert c._ssl_ctx.check_hostname is False
+
+
+def test_tls_verify_on_uses_verifying_context():
+    c = YBAClient("https://yba.example.com", api_token="tok", verify_ssl=True)
+    assert c._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+    assert c._ssl_ctx.check_hostname is True
+
+
+def test_tls_cafile_passed_to_context(monkeypatch):
+    seen = {}
+    real = ssl.create_default_context
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return real()
+
+    monkeypatch.setattr(ssl, "create_default_context", spy)
+    c = YBAClient(
+        "https://yba.example.com", api_token="tok",
+        verify_ssl=True, cafile="/etc/yba/ca.pem",
+    )
+    assert seen.get("cafile") == "/etc/yba/ca.pem"
+    assert c._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_tls_missing_cafile_raises_yba_client_error(tmp_path):
+    with pytest.raises(YBAClientError, match="CA file"):
+        YBAClient(
+            "https://yba.example.com", api_token="tok",
+            verify_ssl=True, cafile=str(tmp_path / "missing.pem"),
+        )
+
+
 # ------------------------------------------------------------- extractor unit tests
 
 def test_extract_returns_none_for_non_dict():
@@ -532,6 +599,74 @@ def test_persistent_ssl_eof_still_raises(yba_server):
     client.close()
 
 
+# ------------------------------------------------------------- HTTPException wrapping
+
+def _short_body_server():
+    """Raw server that answers every request with a Content-Length
+    larger than the body it sends, then closes: the client sees
+    ``http.client.IncompleteRead``."""
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            try:
+                conn.recv(65536)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: 100\r\n\r\n{\"cust"
+                )
+            finally:
+                conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    host, port = listener.getsockname()
+    return listener, f"http://{host}:{port}"
+
+
+def test_incomplete_read_wraps_as_yba_client_error():
+    """Review #8 (Amogh): a truncated body raises IncompleteRead, an
+    HTTPException rather than an OSError. It must surface as
+    YBAClientError (so the lag wait counts it as unreachable) and the
+    connection must be reset."""
+    listener, endpoint = _short_body_server()
+    try:
+        client = YBAClient(endpoint, api_token="tok")
+        with pytest.raises(YBAClientError) as ei:
+            client.get_session_info()
+        assert isinstance(ei.value.__cause__, http.client.IncompleteRead)
+        assert ei.value.transient is True
+        assert client._conn is None
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize("exc_factory", [
+    lambda: http.client.LineTooLong("header line"),
+    lambda: http.client.ResponseNotReady("Idle"),
+])
+def test_http_exception_from_getresponse_wraps_and_resets(yba_server, exc_factory):
+    yba_server.routes["/api/v1/session_info"] = {"body": {"customerUUID": "c1"}}
+    client = YBAClient(yba_server.endpoint, api_token="tok")
+    client.get_session_info()
+    conn = client._conn
+
+    def broken_getresponse(*_a, **_kw):
+        raise exc_factory()
+    conn.getresponse = broken_getresponse                               # type: ignore[attr-defined]
+
+    with pytest.raises(YBAClientError, match="protocol error"):
+        client.get_committed_lag_sample("xcc-1")
+    assert client._conn is None
+
+
 # ------------------------------------------------------------- deadline cut
 
 def test_blocked_metrics_call_returns_at_deadline():
@@ -620,3 +755,66 @@ def test_get_committed_lag_report_end_to_end(yba_server):
     r = client.get_committed_lag_report("xcc-1")
     assert r["lag_ms"] == 12.5 and r["sample_ts"] == 1700000000.0
     assert r["leader_reported"] and r["stale"] == []
+
+
+# ------------------------------------------------------------- non-finite values
+
+def test_nan_latest_value_is_not_caught_up():
+    """Review #8 (Amogh): NaN fails every comparison and used to land in
+    the caught-up bucket: ["5000", "NaN"] returned (0.0, ts). The NaN is
+    skipped and the last finite point (with its own x) is used."""
+    from psycopg.yb.yba_client import _max_lag_sample_from_traces
+    r = _max_lag_sample_from_traces([
+        {"name": "Committed Lag", "y": ["5000", "NaN"], "x": ["1000000", "1010000"]},
+    ])
+    assert r == (5000.0, 1000.0)
+
+
+@pytest.mark.parametrize("ys", [["NaN"], ["NaN", "nan"], ["inf"], ["-Infinity", "NaN"]])
+def test_series_with_no_finite_value_is_no_data(ys):
+    from psycopg.yb.yba_client import (
+        _lag_report_from_traces, _max_lag_sample_from_traces,
+    )
+    traces = [{"name": "Committed Lag", "y": ys, "x": ["1000000"] * len(ys)}]
+    assert _max_lag_sample_from_traces(traces) is None
+    assert _max_lag_from_traces(traces) is None
+    assert _lag_report_from_traces(traces) is None
+
+
+def test_nan_node_does_not_hide_lag_in_report():
+    """A node whose newest point is NaN keeps its last finite value and
+    is flagged stale (its series ends early), so the lag wait does not
+    count the sample."""
+    from psycopg.yb.yba_client import _lag_report_from_traces
+    xs = ["1000000", "1010000"]
+    r = _lag_report_from_traces([
+        _trace("n1", ["0.001", "0.001"], xs),
+        _trace("n2", ["0.001", "NaN"], xs),
+    ])
+    assert r["values"] == {"n1": 0.001, "n2": 0.001}
+    assert r["stale"] == ["n2"]
+
+
+def test_extract_committed_lag_ms_nan_only_is_none():
+    resp = {"tserver_async_replication_lag_micros": {"data": [
+        {"name": "Committed Lag", "y": ["NaN"], "x": ["1000000"]},
+    ]}}
+    assert _extract_committed_lag_ms(resp) is None
+
+
+def test_cert_verification_failure_is_permanent(monkeypatch):
+    """With ybaVerifySsl on by default, a YBA behind a self-signed cert
+    fails verification on every call. That is permanent, not transient:
+    bootstrap disables the lag phase and the error names the fix,
+    instead of every lag wait counting YBA as unreachable."""
+    def fail_verify(self, *a, **k):
+        raise ssl.SSLCertVerificationError(1, "self-signed certificate")
+
+    monkeypatch.setattr(http.client.HTTPSConnection, "connect", fail_verify)
+    client = YBAClient("https://yba.example.com", api_token="tok")
+    with pytest.raises(YBAClientError) as ei:
+        client.get_session_info()
+    assert ei.value.transient is False
+    assert ei.value.cert_error is True
+    assert "ybaCaFile" in str(ei.value)
+    assert client._conn is None

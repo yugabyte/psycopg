@@ -149,14 +149,54 @@ accepted as separators between tokens):
        ``-1`` = wait indefinitely, never force-close;
        ``0`` = force-close in-flight transactions immediately;
        ``N > 0`` = wait up to N seconds then force-close survivors.
+   * - ``yb.failover.globalTimeBudgetSecs``
+     - (unset)
+     - Upper bound on a failover's wall-clock time from detection to the
+       routing flip; derives ``drainTimeoutSecs`` (40%) and the lag wait
+       (60%). ``yb.failback.globalTimeBudgetSecs`` sets the failback's.
+       Two exceptions: a failback under ``onPhase2Timeout=fail`` whose
+       only lag-0 YBA samples predate the barrier waits once for YBA's
+       next sample, and can end up to ~11 s (one scrape interval plus
+       one poll) past the budget, with a WARNING; and the close fence
+       (``closeFenceSecs``) isn't counted in the budget.
+   * - ``yb.failover.closeFenceSecs``
+     - ``1``
+     - After a drain closed connections on the outgoing side, the flip
+       waits until this many seconds have passed since the last close,
+       so an app holding session state (e.g. an advisory-lock leader
+       that checks its connection once a second) sees the close before
+       a new session on the other universe can take the same state.
+       Phase 2 time counts towards it. Best effort: the driver can't
+       guarantee a single holder of session-level state across two
+       universes. ``0`` disables it.
    * - ``yb.failback.onPhase2Timeout``
-     - ``proceed``
+     - ``fail``
      - What a failback does when its replication-lag wait (Phase 2)
-       can't confirm the primary has caught up. ``proceed`` = fail back
-       anyway. ``fail`` = when the lag wait times out, or YBA stays
-       unreachable, the failback is aborted: routing stays on the
-       secondary and the probe retries after the cooldown. No effect on
-       failover, which always proceeds.
+       can't confirm the primary has caught up. ``fail`` = when the lag
+       wait times out, or YBA stays unreachable, the failback is
+       aborted: routing stays on the secondary and the probe retries
+       after the cooldown. ``proceed`` = fail back anyway. No effect on
+       failover, which always proceeds. ``fail`` applies only while the
+       secondary is healthy: when the secondary is down, the failback
+       proceeds on timeout, since a primary that may not have caught up
+       is better than no cluster.
+   * - ``yb.failover.autoFailbackEnabled``
+     - ``true``
+     - ``false`` = once routing is on the secondary, stay there when the
+       primary recovers, until an operator fails back. Applies only
+       while the secondary is healthy: when the secondary goes down, the
+       driver fails back to a healthy primary anyway.
+   * - ``yb.failover.ybaVerifySsl``
+     - ``true``
+     - Verify the YBA endpoint's TLS certificate. A YBA behind a
+       self-signed certificate needs ``yb.failover.ybaCaFile`` (path to
+       its CA bundle) or ``ybaVerifySsl=false``. A certificate that fails
+       verification disables the lag-wait phase at bootstrap and is
+       logged at ERROR; failovers then flip without a lag wait, and
+       under ``yb.failback.onPhase2Timeout=fail`` failbacks are refused,
+       before any connection is drained. Each failback attempt re-checks
+       the certificate first, so a fixed one takes effect without a
+       restart.
 
 Example (application):
 

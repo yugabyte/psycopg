@@ -572,6 +572,194 @@ def test_recovery_from_no_viable_skips_phase2(fake_state):
     assert group.secondary_status == HealthResult.HEALTHY
 
 
+class _LagYBA:
+    """Lag source that returns ``lag`` (fresh sample) and records calls."""
+
+    def __init__(self, lag):
+        self.lag = lag
+        self.calls: list[str] = []
+
+    def get_committed_lag_sample(self, uuid):
+        self.calls.append(uuid)
+        return (self.lag, time.time())
+
+
+def _down_after_secondary(fake_state):
+    """Routing on the secondary (primary UNHEALTHY), then the secondary
+    goes UNHEALTHY: no viable cluster, last active side = secondary."""
+    group = _make_group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    return group
+
+
+def test_failback_when_secondary_goes_down_ignores_auto_failback_disabled(
+    fake_state, caplog,
+):
+    """autoFailbackEnabled=false keeps routing on a secondary that is
+    still serving. Once the secondary goes down there is nothing to stay
+    on, so the healthy primary takes over through a real drain."""
+    import logging
+    group = _make_group(fake_state)
+    group.auto_failback_enabled = False
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    caplog.set_level(logging.WARNING, logger="psycopg.yb.drain")
+
+    # Primary healthy while the secondary serves: suppressed.
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert any("failback suppressed" in r.getMessage() for r in caplog.records)
+
+    # Secondary goes down, then the primary's next HEALTHY report.
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    pauses: list[bool] = []
+    orig_pause = group.pause_dispatch
+    group.pause_dispatch = lambda: (pauses.append(True), orig_pause())[1]  # type: ignore[method-assign]
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.HEALTHY
+    assert pauses == [True]
+    assert group.dispatch_paused is False
+    assert any(
+        "failback despite autoFailbackEnabled=false" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_failback_out_of_no_viable_runs_failback_phase2(fake_state):
+    """...and with auto failback on, the failback Phase 2 lag wait runs
+    on the B→A config before the flip."""
+    group = _down_after_secondary(fake_state)
+    yba = _LagYBA(0.0)
+    group.yba_client = yba
+    group.xcluster_config_uuid = "xcc-a2b"
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+    group.failback_lag_freshness_s = 0
+    group.failback_lag_confirmation_samples = 1
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert yba.calls == ["xcc-b2a"]
+    assert group.primary_status == HealthResult.HEALTHY
+    assert group.last_failback_complete_ts > 0
+    assert group.dispatch_paused is False
+
+
+def test_failback_out_of_no_viable_fail_policy_still_flips_on_timeout(fake_state):
+    """onPhase2Timeout=fail keeps routing on the healthy secondary; out
+    of no-viable there is no healthy side, so the flip proceeds after
+    the lag wait times out instead of leaving no viable cluster."""
+    group = _down_after_secondary(fake_state)
+    yba = _LagYBA(5000.0)
+    group.yba_client = yba
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+    group.failback_lag_wait_timeout_s = 1
+    group.failback_lag_freshness_s = 0
+    group.failback_on_phase2_timeout = "fail"
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert yba.calls
+    assert group.primary_status == HealthResult.HEALTHY
+    assert group.last_phase2_timeout_ts == 0.0
+
+
+def test_primary_recovery_when_primary_was_last_active_is_not_a_failback(fake_state):
+    """Routing was on the primary when no-viable began (the secondary had
+    already failed): the primary coming back is not a failback, so it is
+    neither gated nor lag-checked."""
+    group = _make_group(fake_state)
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert group.active_before_no_viable == "primary"
+
+    class _NoPollYBA:
+        def get_committed_lag_sample(self, uuid):
+            raise AssertionError("Phase 2 must be skipped")
+
+    group.yba_client = _NoPollYBA()
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+    group.auto_failback_enabled = False
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def _down_after_primary(fake_state):
+    """Routing on the primary, the secondary fails, then the primary
+    fails: no viable cluster, last active side = primary."""
+    group = _make_group(fake_state)
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert group.active_before_no_viable == "primary"
+    return group
+
+
+def test_secondary_recovery_after_primary_served_runs_failover_phase2(fake_state):
+    """Review #8 follow-up (Amogh): the primary served until no-viable
+    began, so writes it committed just before may still be replicating.
+    The secondary coming back first runs the A→B lag wait."""
+    group = _down_after_primary(fake_state)
+    yba = _LagYBA(0.0)
+    group.yba_client = yba
+    group.xcluster_config_uuid = "xcc-a2b"
+    group.failback_xcluster_config_uuid = "xcc-b2a"
+    group.lag_freshness_s = 0
+    group.lag_confirmation_samples = 1
+
+    trigger_drain(group, "secondary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert yba.calls == ["xcc-a2b"]
+    assert group.secondary_status == HealthResult.HEALTHY
+    assert group.dispatch_paused is False
+
+
+def test_secondary_recovery_after_primary_served_proceeds_on_timeout(fake_state):
+    """...and, like any failover, flips once the lag wait times out,
+    whatever onPhase2Timeout says."""
+    group = _down_after_primary(fake_state)
+    yba = _LagYBA(5000.0)
+    group.yba_client = yba
+    group.xcluster_config_uuid = "xcc-a2b"
+    group.lag_wait_timeout_s = 1
+    group.lag_freshness_s = 0
+    group.failback_on_phase2_timeout = "fail"
+
+    trigger_drain(group, "secondary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert yba.calls and set(yba.calls) == {"xcc-a2b"}
+    assert group.secondary_status == HealthResult.HEALTHY
+    assert group.last_phase2_timeout_ts == 0.0
+
+
+def test_both_down_sequence_drains_and_flips_to_recovered_secondary(fake_state, caplog):
+    """both_down (5379cb5e): A→B drain, B→None (no drain), None→B drain
+    against A that flips routing to B. Unchanged by the failback gate."""
+    import logging
+    group = _make_group(fake_state)
+    group.auto_failback_enabled = False
+    a_conn = _FakeConn(TransactionStatus.IDLE)
+    group.primary.tracked_conns.add(a_conn)
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    trigger_drain(group, "secondary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    late_a_conn = _FakeConn(TransactionStatus.IDLE)
+    group.primary.tracked_conns.add(late_a_conn)
+    trigger_drain(group, "secondary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert a_conn.closed is True
+    assert late_a_conn.closed is True
+    assert group.secondary_status == HealthResult.HEALTHY
+    assert group.primary_status == HealthResult.UNHEALTHY
+    msgs = [r.getMessage() for r in caplog.records]
+    starts = [m for m in msgs if "drain-wait start" in m]
+    assert len(starts) == 2, starts
+    assert all("outgoing=P" in m for m in starts), starts
+    assert sum("routing target flipped" in m for m in msgs) == 2
+
+
 # ------------------------------------------------------- close fence
 
 def test_flip_waits_close_fence_after_closing_outgoing_conns(fake_state, monkeypatch):
@@ -579,9 +767,8 @@ def test_flip_waits_close_fence_after_closing_outgoing_conns(fake_state, monkeyp
     0.24s before the new leader acquired the advisory lock on the other
     universe, but its owner only noticed on its next 1s heartbeat. The
     drain holds dispatch for the close fence after closing conns."""
-    from psycopg.yb import drain as drain_mod
-    monkeypatch.setattr(drain_mod, "_CLOSE_FENCE_S", 1.0)
     group = _make_group(fake_state)
+    group.close_fence_s = 1.0
     conn = _FakeConn(TransactionStatus.IDLE)   # keep a ref: tracked_conns is weak
     group.primary.tracked_conns.add(conn)
 
@@ -596,11 +783,23 @@ def test_flip_waits_close_fence_after_closing_outgoing_conns(fake_state, monkeyp
 
 
 def test_flip_skips_close_fence_when_nothing_was_closed(fake_state, monkeypatch):
-    from psycopg.yb import drain as drain_mod
-    monkeypatch.setattr(drain_mod, "_CLOSE_FENCE_S", 1.0)
     group = _make_group(fake_state)
+    group.close_fence_s = 1.0
 
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
 
+    assert time.monotonic() - t0 < 0.5
+
+
+def test_close_fence_zero_disables_it(fake_state):
+    group = _make_group(fake_state)
+    group.close_fence_s = 0.0
+    conn = _FakeConn(TransactionStatus.IDLE)
+    group.primary.tracked_conns.add(conn)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert conn.closed is True
     assert time.monotonic() - t0 < 0.5

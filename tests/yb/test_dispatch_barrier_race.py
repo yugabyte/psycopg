@@ -230,3 +230,233 @@ async def test_async_full_drain_during_tcp_connect_reroutes(
     assert conn._yb_cluster == "secondary"
     assert made[0].closed
     assert made[0] not in group.primary.tracked_conns
+
+
+
+def _arm_in_generation_read(monkeypatch, group):
+    """Model a drain arming its barrier the moment the first dispatch
+    wait returns, before the connect reads anything else."""
+    import psycopg.yb.state as state_mod
+
+    armed: list[bool] = []
+
+    def arm_once(g):
+        if not armed:
+            armed.append(True)
+            g.pause_dispatch()
+
+    def arm_after(real):
+        def wrapper(g, *a, **k):
+            result = real(g, *a, **k)
+            arm_once(g)
+            return result
+
+        async def awrapper(g, *a, **k):
+            result = await real(g, *a, **k)
+            arm_once(g)
+            return result
+
+        import inspect
+        return awrapper if inspect.iscoroutinefunction(real) else wrapper
+
+    for name in (
+        "wait_for_dispatch", "wait_for_dispatch_async",
+        "wait_for_dispatch_generation", "wait_for_dispatch_generation_async",
+    ):
+        if hasattr(state_mod, name):
+            monkeypatch.setattr(state_mod, name, arm_after(getattr(state_mod, name)))
+
+
+def _finish_drain(group: FailoverGroup) -> None:
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    group.resume_dispatch()
+
+
+def test_drain_armed_between_wait_and_generation_read_reroutes(
+    fresh_registry, fake_state, monkeypatch
+):
+    """Review #10 (Amogh): with the generation read in a second step, a
+    drain armed in between was already counted in it, so the re-check
+    after connect missed the drain and the conn stayed on the primary.
+    The wait now returns the generation from the lock section that saw
+    the pause clear."""
+    group = _install_group(fresh_registry, fake_state)
+    _arm_in_generation_read(monkeypatch, group)
+    made: list[tuple[str, _StubConn]] = []
+
+    def connect(host):
+        c = _StubConn()
+        made.append((host, c))
+        if len(made) == 1 and group.dispatch_paused:
+            _finish_drain(group)
+        return c
+
+    _patch(monkeypatch, fresh_registry, group, connect)
+    from psycopg import Connection
+
+    conn = Connection.connect(DSN)
+
+    assert conn._yb_cluster == "secondary"
+    assert not any(h == "p1" and not c.closed for h, c in made)
+
+
+@pytest.mark.anyio
+async def test_async_drain_armed_between_wait_and_generation_read_reroutes(
+    fresh_registry, fake_state, monkeypatch
+):
+    group = _install_group(fresh_registry, fake_state)
+    _arm_in_generation_read(monkeypatch, group)
+    made: list[_AsyncStubConn] = []
+
+    def aconnect(host):
+        c = _AsyncStubConn()
+        made.append(c)
+        if len(made) == 1 and group.dispatch_paused:
+            _finish_drain(group)
+        return c
+
+    _patch(monkeypatch, fresh_registry, group, lambda h: _StubConn(), aconnect)
+    from psycopg import AsyncConnection
+
+    conn = await AsyncConnection.connect(DSN)
+
+    assert conn._yb_cluster == "secondary"
+
+
+# ------------------------------------------------------- tracked_conns under state.lock
+
+class _LockCheckingWeakSet:
+    """WeakSet stand-in that records whether ``lock`` was held on every
+    add / discard / iteration (Review #10, Amogh: an unsynchronized add
+    while the drain iterates raises "Set changed size during
+    iteration")."""
+
+    def __init__(self, lock) -> None:
+        import weakref
+
+        self._lock = lock
+        self._set = weakref.WeakSet()
+        self.ops: list[tuple[str, bool]] = []
+
+    def add(self, c) -> None:
+        self.ops.append(("add", self._lock.locked()))
+        self._set.add(c)
+
+    def discard(self, c) -> None:
+        self.ops.append(("discard", self._lock.locked()))
+        self._set.discard(c)
+
+    def __iter__(self):
+        self.ops.append(("iter", self._lock.locked()))
+        return iter(list(self._set))
+
+    def __len__(self) -> int:
+        return len(self._set)
+
+    def __contains__(self, c) -> bool:
+        return c in self._set
+
+
+def _check_tracked(state) -> _LockCheckingWeakSet:
+    state.tracked_conns = _LockCheckingWeakSet(state.lock)
+    return state.tracked_conns
+
+
+def test_sync_connect_tracks_and_untracks_under_state_lock(
+    fresh_registry, fake_state, monkeypatch
+):
+    group = _install_group(fresh_registry, fake_state)
+    p_tracked = _check_tracked(group.primary)
+    s_tracked = _check_tracked(group.secondary)
+    made: list[_StubConn] = []
+
+    def connect(host):
+        c = _StubConn()
+        made.append(c)
+        if len(made) == 1:
+            _flip(group)   # first conn is dropped (discard) and re-routed
+        return c
+
+    _patch(monkeypatch, fresh_registry, group, connect)
+    from psycopg import Connection
+
+    Connection.connect(DSN)
+
+    assert p_tracked.ops == [("add", True), ("discard", True)]
+    assert s_tracked.ops == [("add", True)]
+
+
+@pytest.mark.anyio
+async def test_async_connect_tracks_and_untracks_under_state_lock(
+    fresh_registry, fake_state, monkeypatch
+):
+    group = _install_group(fresh_registry, fake_state)
+    p_tracked = _check_tracked(group.primary)
+    s_tracked = _check_tracked(group.secondary)
+    made: list[_AsyncStubConn] = []
+
+    def aconnect(host):
+        c = _AsyncStubConn()
+        made.append(c)
+        if len(made) == 1:
+            _flip(group)
+        return c
+
+    _patch(monkeypatch, fresh_registry, group, lambda h: _StubConn(), aconnect)
+    from psycopg import AsyncConnection
+
+    await AsyncConnection.connect(DSN)
+
+    assert p_tracked.ops == [("add", True), ("discard", True)]
+    assert s_tracked.ops == [("add", True)]
+
+
+def test_drain_iterates_tracked_conns_under_state_lock(fresh_registry, fake_state):
+    from psycopg.pq import TransactionStatus
+    from psycopg.yb.drain import trigger_drain
+
+    class _Idle(_StubConn):
+        def __init__(self) -> None:
+            super().__init__()
+            self.info = type("I", (), {"transaction_status": TransactionStatus.IDLE})()
+
+    group = _install_group(fresh_registry, fake_state)
+    tracked = _check_tracked(group.primary)
+    conn = _Idle()
+    tracked.add(conn)
+    tracked.ops.clear()
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert conn.closed
+    iters = [held for op, held in tracked.ops if op == "iter"]
+    assert iters and all(iters), tracked.ops
+
+
+def test_concurrent_track_and_drain_snapshot_do_not_raise(fake_state):
+    """Connect-side add/discard under state.lock racing the drain's
+    snapshot: no "Set changed size during iteration"."""
+    from psycopg.yb.drain import _in_flight_conns, _tracked_snapshot
+
+    state = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    keep = [_StubConn() for _ in range(200)]
+    stop = threading.Event()
+
+    def churn():
+        while not stop.is_set():
+            for c in keep:
+                with state.lock:
+                    state.tracked_conns.add(c)
+            for c in keep:
+                with state.lock:
+                    state.tracked_conns.discard(c)
+
+    t = threading.Thread(target=churn, daemon=True)
+    t.start()
+    try:
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            _in_flight_conns(_tracked_snapshot(state))
+    finally:
+        stop.set()
+        t.join(timeout=2)

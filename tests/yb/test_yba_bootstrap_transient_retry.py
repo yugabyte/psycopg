@@ -114,6 +114,8 @@ def _params():
         yba_api_token="token",
         yba_connect_timeout_s=2.0,
         yba_read_timeout_s=3.0,
+        yba_verify_ssl=False,
+        yba_ca_file="",
         replication_name="a_to_b",
         failback_replication_name="b_to_a",
         threshold_replication_lag_ms=0,
@@ -157,6 +159,27 @@ def test_transient_bootstrap_failure_keeps_params(fake_state, scripted):
 
     assert group.yba_client is None
     assert group.yba_pending_params is params
+
+
+@pytest.mark.parametrize("verify, cafile, expected_cafile", [
+    (False, "", None),
+    (True, "", None),
+    (True, "/etc/yba/ca.pem", "/etc/yba/ca.pem"),
+])
+def test_wire_passes_tls_settings_to_client(
+    fake_state, scripted, verify, cafile, expected_cafile,
+):
+    """Review #8: ybaVerifySsl / ybaCaFile reach the YBAClient."""
+    group = _group(fake_state)
+    params = _params()
+    params.yba_verify_ssl = verify
+    params.yba_ca_file = cafile
+
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, params)
+
+    assert group.yba_client is not None
+    assert group.yba_client.kw["verify_ssl"] is verify
+    assert group.yba_client.kw["cafile"] == expected_cafile
 
 
 def test_permanent_bootstrap_failure_disables_for_good(fake_state, scripted):
@@ -237,4 +260,177 @@ def test_failback_after_transient_bootstrap_runs_the_lag_wait(fake_state, script
 
     assert waits and waits[0][0] is True, "failback ran without a lag wait"
     assert waits[0][1] is not None
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+# ------------------------------------------------------- certificate errors
+
+def _cert_error():
+    return YBAClientError(
+        "YBA GET /session_info TLS certificate verification failed: self-signed",
+        cert_error=True,
+    )
+
+
+def test_cert_error_logs_at_error_and_marks_failback_refused(
+    fake_state, scripted, caplog,
+):
+    """Review #8 follow-up: a certificate error turned the lag phase off
+    with only a WARNING, and failbacks then skipped the lag check even
+    under onPhase2Timeout=fail."""
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state, failback_on_phase2_timeout="fail")
+
+    with caplog.at_level("WARNING", logger="psycopg.yb.registry"):
+        ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    assert group.yba_client is None
+    assert "certificate" in group.yba_cert_error
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "failbacks are refused" in errors[0].getMessage()
+
+
+@pytest.mark.parametrize("policy, failback_name", [
+    ("proceed", "b_to_a"),
+    ("fail", ""),
+])
+def test_cert_error_leaves_failback_alone_when_nothing_to_check(
+    fake_state, scripted, policy, failback_name,
+):
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state, failback_on_phase2_timeout=policy)
+    params = _params()
+    params.failback_replication_name = failback_name
+
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, params)
+
+    assert group.yba_cert_error == ""
+
+
+def test_cert_error_on_retry_marks_failback_refused(fake_state, scripted):
+    scripted.outcomes = [YBAClientError("timeout", transient=True), _cert_error()]
+    group = _group(fake_state, failback_on_phase2_timeout="fail")
+    reg = ClusterRegistry.instance()
+    reg._wire_yba_lag_phase(group, _params())
+
+    reg.retry_yba_lag_phase(group, deadline=time.monotonic() + 5)
+
+    assert group.yba_pending_params is None
+    assert "certificate" in group.yba_cert_error
+
+
+def _cert_failed_group(fake_state):
+    group = _group(fake_state, failback_on_phase2_timeout="fail")
+    group.primary_status = HealthResult.UNHEALTHY
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+    return group
+
+
+class _Conn:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_failback_refused_after_cert_error(fake_state, scripted, caplog):
+    """Review #26: refused before Phase 1, so the serving secondary is
+    neither paused nor drained."""
+    scripted.outcomes = [_cert_error(), _cert_error()]   # bootstrap, re-probe
+    group = _cert_failed_group(fake_state)
+    conn = _Conn()   # keep a ref: tracked_conns is weak
+    group.secondary.tracked_conns.add(conn)
+
+    with caplog.at_level("INFO", logger="psycopg.yb.drain"):
+        trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
+    assert group.primary_last_transition_time > 0, "cooldown not re-armed"
+    assert conn.closed is False
+    assert group.last_failover_start_ts == 0.0
+    assert not any("drain-wait start" in r.getMessage() for r in caplog.records)
+    assert any("refused before the drain" in r.getMessage() for r in caplog.records)
+    assert scripted.probes == 2
+
+
+def test_fixed_cert_lets_the_failback_run_its_lag_wait(
+    fake_state, scripted, monkeypatch,
+):
+    scripted.outcomes = [_cert_error(), None]   # bootstrap fails, re-probe works
+    group = _cert_failed_group(fake_state)
+    waits = []
+    monkeypatch.setattr(
+        drain_mod, "_wait_for_replication_lag",
+        lambda g, which, is_failback=False, budget_deadline=None, outgoing=None:
+            waits.append(is_failback),
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.yba_cert_error == ""
+    assert group.yba_client is not None
+    assert waits == [True]
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_transient_reprobe_keeps_refusing(fake_state, scripted):
+    scripted.outcomes = [_cert_error(), YBAClientError("timeout", transient=True)]
+    group = _cert_failed_group(fake_state)
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.yba_cert_error
+    assert group.yba_cert_params is not None
+
+
+def test_other_permanent_reprobe_error_disables_the_lag_phase(fake_state, scripted):
+    """Certificate fixed but the token is now rejected: same as that
+    error at bootstrap, the lag phase is off and the failback goes ahead."""
+    scripted.outcomes = [_cert_error(), YBAClientError("HTTP 401", transient=False)]
+    group = _cert_failed_group(fake_state)
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.yba_cert_error == ""
+    assert group.yba_cert_params is None
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_proceed_policy_never_reprobes(fake_state, scripted):
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state, failback_on_phase2_timeout="proceed")
+    group.primary_status = HealthResult.UNHEALTHY
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert scripted.probes == 1
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_failover_still_flips_after_cert_error(fake_state, scripted):
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state)
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts == 0.0
+
+
+def test_failback_out_of_no_viable_proceeds_after_cert_error(fake_state, scripted):
+    """With the secondary down there is no healthy side to stay on, so the
+    failback goes ahead, as it does on a lag-wait timeout."""
+    scripted.outcomes = [_cert_error()]
+    group = _group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    group.secondary_status = HealthResult.UNHEALTHY
+    group.active_before_no_viable = "secondary"
+    ClusterRegistry.instance()._wire_yba_lag_phase(group, _params())
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
     assert group.primary_status == HealthResult.HEALTHY

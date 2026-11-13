@@ -292,10 +292,10 @@ def _active(group: "FailoverGroup", primary: HealthResult, secondary: HealthResu
 
 
 def _close_all(state) -> int:
-    from .drain import _safe_close
+    from .drain import _safe_close, _tracked_snapshot
 
     closed = 0
-    for c in list(state.tracked_conns):
+    for c in _tracked_snapshot(state):
         if c is None or getattr(c, "closed", False):
             continue
         if _safe_close(c) is None:
@@ -315,7 +315,9 @@ def _set_statuses(group: "FailoverGroup", primary: HealthResult, secondary: Heal
 
 
 def _follow_loop(group, follow: SharedFollowState, slot: int, snap: dict, on_parent_gone) -> None:
-    from .drain import _close_idle_tracked_during_drain, _in_flight_conns
+    from .drain import (
+        _close_idle_tracked_during_drain, _in_flight_conns, _tracked_snapshot,
+    )
 
     local_gen = snap["gen"]
     killed_gen = snap["gen"]
@@ -349,8 +351,8 @@ def _follow_loop(group, follow: SharedFollowState, slot: int, snap: dict, on_par
                     local_gen, outgoing.uuid,
                 )
             if paused:
-                _close_idle_tracked_during_drain(outgoing.tracked_conns, outgoing.uuid)
-                in_flight = len(_in_flight_conns(outgoing.tracked_conns))
+                _close_idle_tracked_during_drain(_tracked_snapshot(outgoing), outgoing.uuid)
+                in_flight = len(_in_flight_conns(_tracked_snapshot(outgoing)))
                 if snap["kill_gen"] == local_gen and killed_gen != local_gen:
                     closed = _close_all(outgoing)
                     killed_gen = local_gen

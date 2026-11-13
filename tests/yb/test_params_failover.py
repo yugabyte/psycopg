@@ -362,6 +362,86 @@ def test_yba_params_stripped_from_cleaned_conninfo():
     assert "host=h1" in cleaned
 
 
+def test_yba_api_token_not_in_repr():
+    """The YBA token is an admin credential; repr() of the parsed params
+    must not contain it (review #7)."""
+    yb, _, _ = extract_yb_params(
+        "host=h1 load_balance_hosts=true "
+        "yb.failover.secondaryClusterHosts=s1 "
+        "yb.failover.ybaEndpoint=https://yba.example.com "
+        "yb.failover.ybaApiToken=secret-tok-98765 "
+        "yb.failover.replicationName=rep-abc",
+        {},
+    )
+    assert yb.yba_api_token == "secret-tok-98765"
+    assert "secret-tok-98765" not in repr(yb)
+    assert "yba_api_token" not in repr(yb)
+    assert "https://yba.example.com" in repr(yb)
+
+
+# ----------------------------------------------------------------- YBA TLS (review #8)
+
+_XC = "host=h1 load_balance_hosts=true yb.failover.secondaryClusterHosts=s1 "
+
+
+def test_yba_tls_defaults_on():
+    yb, _, _ = extract_yb_params(_XC, {})
+    assert yb.yba_verify_ssl is True
+    assert yb.yba_ca_file == ""
+
+
+@pytest.mark.parametrize("key", [
+    "yb.failover.ybaVerifySsl",
+    "yb.failover.yba_verify_ssl",
+    "yb-failover-yba-verify-ssl",
+    "yb_failover_yba_verify_ssl",
+    "YB.FAILOVER.YBAVERIFYSSL",
+])
+@pytest.mark.parametrize("value, expected", [
+    ("true", True), ("1", True), ("on", True), ("yes", True),
+    ("false", False), ("0", False), ("off", False), ("no", False),
+])
+def test_yba_verify_ssl_spellings(key, value, expected):
+    yb, cleaned, _ = extract_yb_params(f"{_XC}{key}={value}", {})
+    assert yb.yba_verify_ssl is expected
+    assert "verify" not in cleaned.lower()
+
+
+@pytest.mark.parametrize("key", [
+    "yb.failover.ybaCaFile",
+    "yb.failover.yba_ca_file",
+    "yb-failover-yba-ca-file",
+    "YB.FAILOVER.YBACAFILE",
+])
+def test_yba_ca_file_spellings(key):
+    yb, cleaned, _ = extract_yb_params(f"{_XC}{key}=/etc/yba/ca.pem", {})
+    assert yb.yba_ca_file == "/etc/yba/ca.pem"
+    assert "ca.pem" not in cleaned
+
+
+@pytest.mark.parametrize("kw", [
+    "yb_failover_ybaVerifySsl", "yb_failover_yba_verify_ssl",
+])
+def test_yba_tls_kwargs(kw):
+    """Kwarg forms are pulled out of kwargs (never reach libpq)."""
+    yb, _, cleaned_kwargs = extract_yb_params(
+        _XC, {kw: "true", "yb_failover_ybaCaFile": "/ca.pem"},
+    )
+    assert yb.yba_verify_ssl is True
+    assert yb.yba_ca_file == "/ca.pem"
+    assert cleaned_kwargs == {}
+
+
+def test_yba_verify_ssl_invalid_raises_only_when_xcluster_enabled():
+    with pytest.raises(ValueError, match="ybaVerifySsl"):
+        extract_yb_params(f"{_XC}yb.failover.ybaVerifySsl=maybe", {})
+    # Non-xCluster DSN: stray key is inert, falls back to the default.
+    yb, _, _ = extract_yb_params(
+        "host=h1 load_balance_hosts=true yb.failover.ybaVerifySsl=maybe", {},
+    )
+    assert yb.yba_verify_ssl is True
+
+
 # ============================================================
 # globalTimeBudgetSecs (P1.1) — Amex ask, design doc §3.7
 # ============================================================
@@ -804,9 +884,9 @@ def test_xcluster_socket_defaults_never_override_user_values():
 # exists only under the failback namespace.
 # ============================================================
 
-def test_failback_on_phase2_timeout_default_proceed():
+def test_failback_on_phase2_timeout_default_fail():
     yb, _, _ = extract_yb_params(_dsn_with_secondary(), {})
-    assert yb.failback_on_phase2_timeout == "proceed"
+    assert yb.failback_on_phase2_timeout == "fail"
 
 
 @pytest.mark.parametrize("key_form", [
@@ -842,10 +922,49 @@ def test_failback_on_phase2_timeout_invalid_raises():
 def test_failover_on_phase2_timeout_is_not_a_driver_key(key_form):
     """No yb.failover.* alias: the key is left in the conninfo like any
     other unrecognised yb.failover.* key (libpq then rejects it)."""
-    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=fail"), {})
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=proceed"), {})
     _, unknown_cleaned, _ = extract_yb_params(
         _dsn_with_secondary("yb.failover.noSuchKnob=fail"), {},
     )
-    assert yb.failback_on_phase2_timeout == "proceed"
-    assert f"{key_form}=fail" in cleaned
+    assert yb.failback_on_phase2_timeout == "fail"
+    assert f"{key_form}=proceed" in cleaned
     assert "yb.failover.noSuchKnob=fail" in unknown_cleaned
+
+
+# ============================================================
+# yb.failover.closeFenceSecs (review #19)
+# ============================================================
+
+def test_close_fence_default():
+    yb, _, _ = extract_yb_params(_dsn_with_secondary(), {})
+    assert yb.close_fence_s == 1.0
+
+
+@pytest.mark.parametrize("key_form", [
+    "yb.failover.closeFenceSecs",
+    "yb_failover_close_fence_secs",
+    "yb-failover-close-fence-secs",
+    "YB.FAILOVER.CLOSEFENCESECS",
+])
+def test_close_fence_key_forms(key_form):
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=0.5"), {})
+    assert yb.close_fence_s == 0.5
+    assert "fence" not in cleaned.lower()
+
+
+def test_close_fence_zero_disables():
+    dsn = _dsn_with_secondary("yb.failover.closeFenceSecs=0")
+    yb, _, _ = extract_yb_params(dsn, {})
+    assert yb.close_fence_s == 0.0
+
+
+@pytest.mark.parametrize("value", ["-1", "abc", "inf", "nan"])
+def test_close_fence_invalid_raises_when_xcluster_enabled(value):
+    with pytest.raises(ValueError, match="closeFenceSecs"):
+        dsn = _dsn_with_secondary(f"yb.failover.closeFenceSecs={value}")
+        extract_yb_params(dsn, {})
+
+
+def test_close_fence_invalid_ignored_without_xcluster():
+    yb, _, _ = extract_yb_params("host=h1 yb.failover.closeFenceSecs=-1", {})
+    assert yb.close_fence_s == 1.0

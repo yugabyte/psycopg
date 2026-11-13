@@ -162,6 +162,16 @@ accepted as separators between tokens):
        ``-1`` = wait indefinitely, never force-close;
        ``0`` = force-close in-flight transactions immediately;
        ``N > 0`` = wait up to N seconds then force-close survivors.
+   * - ``yb.failover.ybaVerifySsl``
+     - ``false``
+     - Verify the TLS certificate and hostname of the YBA endpoint used
+       for the replication-lag wait. Off by default because YBA often
+       runs with a self-signed certificate; without verification a
+       man-in-the-middle can capture the YBA API token.
+   * - ``yb.failover.ybaCaFile``
+     - (empty)
+     - Path to a PEM CA bundle to verify the YBA certificate against when
+       ``ybaVerifySsl=true``. Empty uses the system trust store.
 
 Example (application):
 
@@ -224,8 +234,13 @@ Reference implementations under ``demo/samples/``:
 
   .. code-block:: sql
 
-      INSERT INTO yb_failover_signals (group_id, target_status, reason)
-      VALUES ('<primary-uuid>', 'UNHEALTHY', 'planned maintenance');
+      INSERT INTO yb_failover_signals (group_id, which_cluster, target_status, reason)
+      VALUES ('<primary-uuid>', 'primary', 'UNHEALTHY', 'planned maintenance');
+
+  ``which_cluster`` (``'primary'`` or ``'secondary'``) defaults to
+  ``'primary'``. Each CB reads the table through its own cluster's
+  control connection and only the rows for its own slot, so the table
+  can live in a database that xCluster replicates.
 
 Ships in ``psycopg.yb.circuit_breaker``:
 

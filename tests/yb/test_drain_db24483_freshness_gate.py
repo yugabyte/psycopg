@@ -4,17 +4,18 @@ DB-24483 — Phase 2 freshness + liveness gate.
 Covers the full driver-only fix laid out in the design doc:
 
   * Freshness gate rejects any YBA sample whose ``sample_ts`` is older
-    than ``barrier_ts + lag_freshness_s`` (default 25s). A sample that
-    predates the barrier cannot describe post-barrier replication.
+    than ``barrier_ts + lag_freshness_s`` (default 25s). ``barrier_ts``
+    is re-stamped when Phase 1 ends, after the last outgoing commit.
   * Liveness gate requires ``lag_confirmation_samples`` (default 2)
-    distinct post-barrier samples at ``lag ≤ threshold`` before the
-    drain flips routing. One pass is not enough: YBA replays its last
-    sample for ~5min after the primary dies.
+    post-barrier samples at ``lag ≤ threshold``, each one scrape
+    interval after the previous counted one, before the drain flips
+    routing. One pass is not enough: YBA replays its last sample for
+    ~5min after the primary dies.
   * Opt-outs: ``lag_freshness_s=0`` disables the freshness gate;
     ``lag_confirmation_samples=1`` disables the liveness gate.
-  * Bootstrap floor: when both gates are enabled,
-    ``lag_wait_timeout_s`` must fit ``freshness + N × scrape_hint``;
-    otherwise bootstrap raises ``ValueError``.
+  * Bootstrap floor: when both gates are enabled and
+    ``lag_wait_timeout_s`` doesn't fit ``freshness + N × scrape_hint``,
+    bootstrap logs a warning.
 
 Tests parametrise the fake YBA client so each tick can return a
 (lag_ms, sample_ts) pair the suite controls, which lets the gate's
@@ -73,7 +74,8 @@ class _ScriptedYBAClient:
         lag, ts = self._next()
         if lag is None:
             return None
-        # Match the real client contract: never returns a None timestamp.
+        # A None in the script means "now". The real client can return a
+        # None timestamp; test_missing_sample_ts_* covers that path.
         return (lag, ts if ts is not None else time.time())
 
     def get_committed_lag_ms(self, xcluster_uuid: str) -> float | None:
@@ -208,6 +210,55 @@ def test_liveness_gate_requires_two_distinct_samples(fake_state):
     assert len(client.calls) == 3
 
 
+def test_liveness_counts_only_samples_a_scrape_apart(fake_state):
+    """YBA's ``x`` follows the request time, so consecutive 1 s polls
+    return timestamps 1 s apart even when they read the same scrape. A
+    confirmation counts only one scrape interval (10 s) after the last."""
+    ts = time.time() + 10_000.0
+    client = _ScriptedYBAClient(script=[
+        (0.0, ts),          # counted 1/2
+        (0.0, ts + 1.0),    # same scrape window
+        (0.0, ts + 9.0),    # same scrape window
+        (0.0, ts + 10.0),   # counted 2/2
+    ])
+    group = _make_group(
+        fake_state, client,
+        lag_wait_timeout_s=10,
+        lag_freshness_s=25,
+        lag_confirmation_samples=2,
+    )
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 4
+
+
+def test_missing_sample_ts_counts_every_pass_and_warns_once(fake_state, caplog):
+    """A sample with no timestamp can't be gated; every ≤ threshold poll
+    counts, and the lag wait says so once."""
+
+    class _NoTsClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_committed_lag_sample(self, xcluster_uuid):
+            self.calls += 1
+            return (0.0, None)
+
+    client = _NoTsClient()
+    group = _make_group(
+        fake_state, client,  # type: ignore[arg-type]
+        lag_wait_timeout_s=10,
+        lag_freshness_s=25,
+        lag_confirmation_samples=2,
+    )
+    with caplog.at_level("WARNING", logger="psycopg.yb"):
+        trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert client.calls == 2
+    warned = [r for r in caplog.records if "without a timestamp" in r.getMessage()]
+    assert len(warned) == 1
+
+
 def test_liveness_replay_pathology_never_converges(fake_state):
     """YBA replays the last sample for ~5min after the primary dies —
     the test models that with a single sample_ts repeated indefinitely.
@@ -314,6 +365,49 @@ def test_bootstrap_warns_when_timeout_below_floor(caplog):
         "below the floor" in r.getMessage() and r.levelname == "WARNING"
         for r in caplog.records
     ), caplog.records
+
+
+@pytest.fixture(autouse=True)
+def fresh_floor_warnings(monkeypatch):
+    # Floor warnings are logged once per process; each test starts clean.
+    from psycopg.yb import params
+    monkeypatch.setattr(params, "_warned_once", set())
+
+
+def test_bootstrap_floor_warning_names_the_budget_when_derived(
+    caplog, fresh_floor_warnings,
+):
+    """A lag wait derived from globalTimeBudgetSecs is blamed on the
+    budget, not on a lagWaitTimeoutSecs the operator never set."""
+    caplog.set_level("WARNING", logger="psycopg.yb.params")
+    yb, _, _ = extract_yb_params(
+        _dsn(
+            "yb.failover.globalTimeBudgetSecs=50",    # lag wait 30 < 45
+            "yb.failover.lagFreshnessSecs=25",
+            "yb.failover.lagConfirmationSamples=2",
+        ),
+        {},
+    )
+    assert yb.lag_wait_timeout_s == 30
+    msgs = [m for m in (r.getMessage() for r in caplog.records) if "below the floor" in m]
+    assert len(msgs) == 1
+    assert "yb.failover.globalTimeBudgetSecs=50" in msgs[0]
+    assert "lagWaitTimeoutSecs=30" not in msgs[0]
+
+
+def test_bootstrap_floor_warning_logged_once_across_connects(
+    caplog, fresh_floor_warnings,
+):
+    """extract_yb_params runs on every connect; the same config warns once."""
+    caplog.set_level("WARNING", logger="psycopg.yb.params")
+    dsn = _dsn(
+        "yb.failover.lagWaitTimeoutSecs=20",
+        "yb.failover.lagFreshnessSecs=25",
+        "yb.failover.lagConfirmationSamples=2",
+    )
+    for _ in range(3):
+        extract_yb_params(dsn, {})
+    assert sum("below the floor" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_bootstrap_accepts_timeout_at_floor():
@@ -448,6 +542,34 @@ def test_pause_dispatch_stamps_barrier_ts(fake_state):
     assert group.barrier_ts == stamped
 
 
+def test_phase1_end_restamps_barrier_ts(fake_state):
+    """In-flight work keeps committing on the outgoing side until Phase 1
+    ends, so Phase 2's freshness anchor is the end of Phase 1, not the
+    moment pause_dispatch armed the barrier."""
+    seen: list[float] = []
+
+    class _Client(_ScriptedYBAClient):
+        def get_committed_lag_sample(self, xcluster_uuid):
+            seen.append(group.barrier_ts)
+            return super().get_committed_lag_sample(xcluster_uuid)
+
+    client = _Client(script=[(0.0, time.time() + 10_000.0)])
+    group = _make_group(
+        fake_state, client, lag_wait_timeout_s=10, lag_confirmation_samples=1,
+    )
+    original_pause = group.pause_dispatch
+
+    def pause_with_old_stamp() -> None:
+        original_pause()
+        group.barrier_ts = 1.0  # stands in for "armed long before Phase 1 ended"
+
+    group.pause_dispatch = pause_with_old_stamp  # type: ignore[method-assign]
+    before_drain = time.time()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert seen and seen[0] >= before_drain
+
+
 
 # ------------------------------------------------- confirmations by default
 
@@ -486,3 +608,75 @@ def test_pre_barrier_sample_never_confirms_single_confirmation(fake_state):
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
 
     assert len(client.calls) == 2
+
+
+# ------------------------------- failback waits for the first post-barrier sample
+
+def _make_failback_group(fake_state, yba_client, timeout_s: int) -> FailoverGroup:
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.UNHEALTHY,   # already failed over
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0,
+        yba_client=yba_client,
+        xcluster_config_uuid="xcc-a2b",
+        failback_xcluster_config_uuid="xcc-b2a",
+        failback_threshold_replication_lag_ms=0,
+        failback_lag_wait_timeout_s=timeout_s,
+        failback_lag_freshness_s=0,
+        failback_lag_confirmation_samples=1,
+    )
+    group.failback_on_phase2_timeout = "fail"
+    return group
+
+
+@pytest.fixture
+def short_scrape(monkeypatch):
+    from psycopg.yb import drain
+    monkeypatch.setattr(drain, "_LAG_SCRAPE_HINT_S", 3.0)
+
+
+def test_failback_waits_past_timeout_for_first_post_barrier_sample(
+    fake_state, short_scrape,
+):
+    """stress failback_refused_on_timeout/budget_10: lag=0 on every poll of
+    a 6s wait, all on a sample taken just before Phase 1 ended, so the
+    failback aborted. It now waits for the next sample and fails back."""
+    pre = time.time() - 0.5
+    client = _ScriptedYBAClient(script=[
+        (0.0, pre), (0.0, pre), (0.0, pre), (0.0, time.time() + 10_000.0),
+    ])
+    group = _make_failback_group(fake_state, client, timeout_s=1)
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 4
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_failback_extension_runs_once_and_is_bounded(fake_state, short_scrape):
+    pre = time.time() - 0.5
+    client = _ScriptedYBAClient(script=[(0.0, pre)])
+    group = _make_failback_group(fake_state, client, timeout_s=1)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    # 1s timeout + at most one 3s sample interval + one 1s poll.
+    assert elapsed <= 5.5
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_failback_lagged_sample_does_not_extend(fake_state, short_scrape):
+    client = _ScriptedYBAClient(script=[(500.0, time.time() - 0.5)])
+    group = _make_failback_group(fake_state, client, timeout_s=1)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed <= 2.0
+    assert group.primary_status == HealthResult.UNHEALTHY
