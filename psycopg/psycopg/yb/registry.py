@@ -199,6 +199,12 @@ class FailoverGroup:
     dispatch_paused_condition: "threading.Condition | None" = field(
         default=None, repr=False,
     )
+    # Bumped under ``lock`` every time a drain arms the barrier. A connect
+    # records it after passing the barrier and re-checks it once its conn
+    # is in ``tracked_conns``: a conn whose TCP connect straddled the
+    # arming would otherwise miss every drain sweep and write to the
+    # outgoing cluster until the flip (DB-24801, per_txn connects).
+    barrier_generation: int = 0
 
     # YBA lag-wait phase (Amogh's flow, 2026-08-11). ``yba_client`` is set
     # by bootstrap when ``yba_endpoint`` + ``yba_api_token`` +
@@ -274,6 +280,7 @@ class FailoverGroup:
         method rather than relying on callers to remember the notify."""
         with self.lock:
             self.dispatch_paused = True
+            self.barrier_generation += 1
 
     def resume_dispatch(self) -> None:
         """Set ``dispatch_paused = False`` and notify all waiters. Called

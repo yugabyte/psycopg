@@ -11,23 +11,35 @@ It composes:
      ``outgoing.tracked_conns`` (weakref-backed) and count conns with
      ``conn.info.transaction_status`` not in ``(IDLE, UNKNOWN)`` — those
      are "in a transaction" and cannot be safely severed.
-  3. **Force-close survivors at the deadline (parallel with hard-fd escape
-     hatch).** If ``drain_timeout_s`` is positive and elapses with
-     in-flight conns still open, fire ``conn.close()`` on every survivor
-     concurrently via a thread pool, bounded by
-     ``_KILL_AT_TIMEOUT_BUDGET_S`` (default 2 s). Any conn whose
-     ``close()`` hasn't returned within the budget gets its socket fd
-     hard-closed via ``os.close`` as an escape hatch — a stuck TCP
-     ``send()`` in libpq's ``PQfinish`` could otherwise block for
-     ``tcp_retries2`` (~15 min on Linux, worse with TCP keepalive
-     disabled), which would wedge the drain past its own deadline.
-     Bounds total drain wall-clock at
-     ``drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S`` regardless of TCP
-     state. The application sees ``psycopg.OperationalError`` and
-     treats it like any transient disconnect. Sentinels:
-       * ``-1`` — wait indefinitely; never force-close.
-       * ``0`` — force-close immediately; no drain window.
-       * ``N > 0`` — poll for N seconds, then parallel-close survivors.
+  3. **Close every tracked conn on the outgoing cluster at the flip
+     boundary (parallel with hard-fd escape hatch).** The poll loop
+     exits as soon as all in-flight transactions complete, so natural
+     drain stays the fast path; whatever conns remain in the tracked
+     set at that point (idle + any still-in-flight if we hit the
+     deadline) are force-closed in a single parallel pass. Closing
+     idle conns too is required by design doc §3.3 ("no dual-write
+     within a single application") — IDLE is a transient state
+     between two commits on a persistent direct conn, and leaving one
+     alive after the routing flip means the next cursor call commits
+     on the outgoing universe (DB-24801). ``AsyncConnection.close``
+     is a coroutine and the sync executor cannot ``await`` it, so
+     ``_safe_close`` type-dispatches and calls ``pgconn.finish()``
+     for async conns (DB-24960). Close is bounded by
+     ``_KILL_AT_TIMEOUT_BUDGET_S`` (default 2 s); any conn whose
+     close hasn't returned within the budget gets its socket fd
+     hard-closed via ``os.close`` — a stuck TCP ``send()`` in libpq's
+     ``PQfinish`` could otherwise block for ``tcp_retries2`` (~15 min
+     on Linux, worse with TCP keepalive disabled). Bounds total drain
+     wall-clock at ``drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S``
+     regardless of TCP state. The application sees
+     ``psycopg.OperationalError`` on next use of a closed conn and
+     treats it like any transient disconnect. Sentinels on
+     ``drain_timeout_s``:
+       * ``-1`` — wait indefinitely for in-flight to drain; never
+         force-close in-flight ones. Idle ones are still closed at
+         the flip boundary (natural-drain path).
+       * ``0`` — close immediately; no drain window.
+       * ``N > 0`` — poll for N seconds, then close every survivor.
   4. **Apply the status change and resume dispatch.** Under
      ``group.lock``, write the per-cluster status field + transition
      timestamp, then set ``dispatch_paused = False`` and notify all
@@ -73,12 +85,78 @@ logger = logging.getLogger(__name__)
 _KILL_AT_TIMEOUT_BUDGET_S = 2.0
 
 
+def _release_registry_count(c) -> None:
+    """Mirror what ``Connection.close`` does for the registry's per-host
+    counter. The async branch below bypasses ``AsyncConnection.close``
+    (DB-24960) and calls ``pgconn.finish()`` directly — doing so skips
+    the normal close path that calls ``ClusterRegistry.decrement``,
+    leaving the per-host ``connection_count`` permanently high after
+    every drain of async conns. The dispatcher's least-loaded policy
+    then starves that host for the rest of the process lifetime
+    (agent-K PR #13:111). Call this manually on any close path that
+    doesn't flow through ``Connection.close``.
+    """
+    uuid = getattr(c, "_yb_uuid", None)
+    host = getattr(c, "_yb_host", None)
+    if not uuid or not host:
+        # Not a smart-driver conn (control conn, pool bypass, test
+        # fake). The registry didn't increment for it, nothing to do.
+        return
+    try:
+        from .registry import ClusterRegistry
+        ClusterRegistry.instance().decrement(uuid, host)
+    except Exception:
+        # Registry decrement is best-effort — a stale uuid / torn-down
+        # state must not block the actual close path.
+        pass
+
+
 def _safe_close(c) -> "Exception | None":
-    """Call ``c.close()``; return the exception if it raises, else
+    """Call close on ``c``; return the exception if it raises, else
     ``None``. Isolates a raising close so it doesn't blow up the
     executor's worker thread — the caller tracks per-conn outcomes
-    and logs each individually."""
+    and logs each individually.
+
+    Dispatches on connection type (DB-24960): ``AsyncConnection.close``
+    is a coroutine, so calling it from this sync executor returns an
+    un-awaited coroutine object and never actually closes the socket.
+    Logs would still report ``force-closed`` while the TCP session
+    stayed alive and the in-flight transaction would commit on the
+    outgoing universe after the routing flip. For async conns we
+    force-finish the libpq handle directly instead — the same
+    workaround ``ClusterRegistry.clear()`` already uses for the async
+    control conn. The socket is a libpq object; it doesn't need the
+    event loop to be severed. We release the per-host registry
+    counter manually on this path (agent-K PR #13:111) because
+    ``pgconn.finish()`` doesn't walk the normal ``Connection.close``
+    teardown.
+    """
     try:
+        # Lazy import — ``..connection_async`` pulls ``.yb.state`` which
+        # pulls back into this subpackage; top-level import would cycle.
+        from ..connection_async import AsyncConnection
+        if isinstance(c, AsyncConnection):
+            try:
+                c.pgconn.finish()
+            finally:
+                c._closed = True
+                _release_registry_count(c)
+            return None
+        # Pool-borrowed conn: ``psycopg_pool.ConnectionPool`` patches
+        # ``Connection.close`` with ``close_returns=True`` so that
+        # ``c.close()`` reroutes to ``pool.putconn(c)`` — the conn
+        # ends up back in the idle pool, NOT closed. The next
+        # ``pool.getconn()`` hands the same stale-cluster socket to
+        # another worker and the dual-write window re-opens. Bypass
+        # by calling ``pgconn.finish()`` directly for any conn whose
+        # ``_pool`` is set (agent-K PR #13:370). Same pattern H6
+        # uses in ``xcluster_check``.
+        if getattr(c, "_pool", None) is not None:
+            try:
+                c.pgconn.finish()
+            finally:
+                _release_registry_count(c)
+            return None
         c.close()
         return None
     except Exception as exc:
@@ -163,12 +241,47 @@ def trigger_drain(
             new_status == HealthResult.HEALTHY,
         )
 
-    if before_active == after_active or before_active is None:
+    if before_active == after_active:
         # No routing change — apply the status without disturbing
         # dispatch. This covers e.g. "secondary flips while primary is
-        # HEALTHY" and "before was no-viable; new status doesn't change
-        # active".
+        # HEALTHY".
         _apply_status_change(group, which_cluster, new_status)
+        return
+
+    if after_active is None:
+        # Last viable cluster went UNHEALTHY. There is no target to
+        # drain towards, so don't open a drain window: dispatch starts
+        # raising NoViableClusterError and conns on the dead side fail
+        # on their own. Any that survive are closed by the drain that
+        # runs when a cluster comes back (below).
+        logger.warning(
+            "xCluster %s → %s leaves no viable cluster (primary_uuid=%s); "
+            "routing suspended until a cluster recovers",
+            which_cluster, new_status.value, group.primary.uuid,
+        )
+        _apply_status_change(group, which_cluster, new_status)
+        return
+
+    if before_active is None:
+        # Recovery from no-viable. Routing changes (None → after_active),
+        # so run a real drain against the OTHER side: it closes anything
+        # still open there (e.g. conns that outlived a probe-only
+        # outage) before dispatch resumes onto after_active. Phase 2 is
+        # skipped — the other side was not serving, so there is nothing
+        # in flight to replicate.
+        outgoing = group.secondary if after_active == "primary" else group.primary
+        now_start = time.monotonic()
+        with group.lock:
+            group.last_failover_start_ts = now_start
+        _drain_and_apply(
+            group=group,
+            which_cluster=which_cluster,
+            new_status=new_status,
+            outgoing=outgoing,
+            drain_timeout_s=drain_timeout_s,
+            is_failback=after_active == "primary",
+            skip_phase2=True,
+        )
         return
 
     # Auto-failback gate. When the operator has set
@@ -267,8 +380,12 @@ def _drain_and_apply(
     outgoing: "ClusterState",
     drain_timeout_s: int,
     is_failback: bool = False,
+    skip_phase2: bool = False,
 ) -> None:
-    """Full barrier-drain-flip sequence. See module docstring."""
+    """Full barrier-drain-flip sequence. See module docstring.
+
+    ``skip_phase2`` is set for recovery from no-viable, where the
+    outgoing side was not serving and there is no lag to wait for."""
     # Snapshot the initial tracked-conn count for the log line — the
     # weakref set may shrink under GC during the drain.
     initial_tracked = len(outgoing.tracked_conns)
@@ -301,24 +418,43 @@ def _drain_and_apply(
         else:
             deadline = time.monotonic() + drain_timeout_s
 
-        # 3. Poll until either all conns drain OR the deadline hits.
-        survivors: list = []
+        # 3. Poll until either all in-flight transactions drain OR the
+        # deadline hits. The loop exit is driven by in-flight count
+        # alone so natural drain remains the fast path.
+        drained_naturally = False
         while True:
             in_txn = _in_flight_conns(outgoing.tracked_conns)
             if not in_txn:
+                drained_naturally = True
                 logger.debug(
-                    "drain: all conns idle on %s (tracked=%d)",
+                    "drain: all in-flight txns completed on %s (tracked=%d)",
                     outgoing.uuid, len(outgoing.tracked_conns),
                 )
                 break
             now = time.monotonic()
             if now >= deadline:
-                survivors = in_txn
                 break
             # Sleep in short slices so `drain_timeout_s == -1` still
             # returns promptly if all conns drain. 100 ms matches the
             # design doc §3.2 pseudocode.
             time.sleep(0.1)
+
+        # Fix for DB-24801: close EVERY tracked conn on the outgoing
+        # cluster at the deadline, not just the in-flight ones. The
+        # design doc §3.3 promises "no dual-write within a single
+        # application"; sparing IDLE conns violates that because IDLE
+        # is a transient state between two commits — whether a
+        # persistent direct conn happens to be IDLE at the barrier
+        # instant is pure timing luck, and the next moment it goes
+        # right back into INTRANS and commits on the OUTGOING cluster.
+        # The app's next cursor call on a closed conn raises
+        # OperationalError and reconnects to the active cluster. Pool
+        # conns are already evicted by ``xcluster_check`` on next
+        # ``getconn``; closing them here is redundant but harmless.
+        survivors = [
+            c for c in list(outgoing.tracked_conns)
+            if c is not None and not getattr(c, "closed", False)
+        ]
 
         # 4. Kill at timeout (step 3 in design doc §3). Force-close
         # any conns still in-flight at the deadline. Only reached with
@@ -336,13 +472,26 @@ def _drain_and_apply(
         # drain_timeout_s + _KILL_AT_TIMEOUT_BUDGET_S regardless of
         # TCP state.
         if survivors:
-            logger.warning(
-                "xCluster drain-wait deadline (%ss elapsed) — "
-                "force-closing %d survivor(s) on %s "
-                "(parallel, budget=%ss)",
-                drain_timeout_s, len(survivors), outgoing.uuid,
-                _KILL_AT_TIMEOUT_BUDGET_S,
-            )
+            if drained_naturally:
+                # All in-flight transactions completed before the
+                # deadline; the surviving conns are IDLE tracked conns
+                # we're closing at the flip boundary to prevent
+                # post-flip dual-write (DB-24801).
+                logger.info(
+                    "xCluster drain: closing %d tracked conn(s) on %s "
+                    "at flip boundary (all in-flight txns drained "
+                    "naturally; parallel, budget=%ss)",
+                    len(survivors), outgoing.uuid,
+                    _KILL_AT_TIMEOUT_BUDGET_S,
+                )
+            else:
+                logger.warning(
+                    "xCluster drain-wait deadline (%ss elapsed) — "
+                    "force-closing %d survivor(s) on %s "
+                    "(parallel, budget=%ss)",
+                    drain_timeout_s, len(survivors), outgoing.uuid,
+                    _KILL_AT_TIMEOUT_BUDGET_S,
+                )
             # Snapshot fds BEFORE close() nulls the pgconn state —
             # we need them for the hard-fd escape hatch.
             snapshot = []
@@ -382,11 +531,25 @@ def _drain_and_apply(
                     if fut.done():
                         exc = fut.result()
                         if exc is None:
-                            logger.info(
-                                "kill-at-timeout: %s force-closed "
-                                "(was in-flight on %s)",
-                                conn_id, outgoing.uuid,
-                            )
+                            # agent-K PR #13:391 — this block runs both
+                            # on the natural-drain path (closing IDLE
+                            # tracked conns at the flip boundary, no
+                            # txns were force-closed) and on the
+                            # deadline-hit path. Split the log so an
+                            # operator doesn't see "force-closed in
+                            # flight" when nothing was in flight.
+                            if drained_naturally:
+                                logger.info(
+                                    "flip-boundary close: %s closed "
+                                    "(was IDLE on %s)",
+                                    conn_id, outgoing.uuid,
+                                )
+                            else:
+                                logger.info(
+                                    "kill-at-timeout: %s force-closed "
+                                    "(was in-flight on %s)",
+                                    conn_id, outgoing.uuid,
+                                )
                         else:
                             logger.log(
                                 5,   # TRACE
@@ -438,34 +601,46 @@ def _drain_and_apply(
 
         # Phase 1 complete — record the boundary and log the outcome so
         # the operator can tell at a glance which of the three cases
-        # this was: (a) all conns naturally drained, (b) some conns
-        # force-closed at deadline, (c) no work to do because they were
-        # already idle/closed at start.
+        # this was:
+        #   (a) initial_tracked == 0 — no work at all.
+        #   (b) drained naturally — all in-flight txns completed within
+        #       the window; closed any remaining IDLE tracked conns at
+        #       the flip boundary to prevent post-flip dual-write
+        #       (DB-24801).
+        #   (c) deadline hit — force-closed every tracked conn still
+        #       alive at the deadline (in-flight + idle). The in-flight
+        #       count at the deadline moment is reported separately.
         now = time.monotonic()
         phase1_elapsed = now - (
             group.last_failover_start_ts or now
         )
-        if initial_in_flight == 0:
+        if initial_tracked == 0:
             logger.info(
                 "xCluster drain: Phase 1 exited early after %.2fs — "
-                "no in-flight txns to wait on (initial_tracked=%d, "
-                "in_flight_at_start=0)",
-                phase1_elapsed, initial_tracked,
+                "no tracked conns on %s",
+                phase1_elapsed, outgoing.uuid,
             )
-        elif not survivors:
+        elif drained_naturally:
             logger.info(
                 "xCluster drain: Phase 1 completed in %.2fs — all %d "
-                "in-flight conns drained naturally before deadline "
-                "(force_closed=0)",
-                phase1_elapsed, initial_in_flight,
+                "in-flight txn(s) drained naturally; closed %d idle "
+                "tracked conn(s) at flip boundary (DB-24801)",
+                phase1_elapsed, initial_in_flight, len(survivors),
             )
         else:
+            # Count how many survivors were in-flight at the deadline
+            # moment vs. just idle tracked conns we closed for the
+            # flip-boundary guarantee.
+            at_deadline_in_flight = len(in_txn)
+            at_deadline_idle = len(survivors) - at_deadline_in_flight
             logger.info(
                 "xCluster drain: Phase 1 hit the %ds drain-wait deadline "
-                "→ kill-at-timeout fired: %d/%d conns force-closed, "
-                "%d completed naturally",
-                drain_timeout_s, len(survivors), initial_in_flight,
-                initial_in_flight - len(survivors),
+                "→ kill-at-timeout fired: %d tracked conn(s) force-closed "
+                "(%d in-flight + %d idle at deadline), %d completed "
+                "naturally before deadline",
+                drain_timeout_s, len(survivors),
+                at_deadline_in_flight, at_deadline_idle,
+                initial_in_flight - at_deadline_in_flight,
             )
         with group.lock:
             group.last_phase1_complete_ts = now
@@ -476,7 +651,7 @@ def _drain_and_apply(
         #                            (per §3.5.1 symmetric behaviour).
         # A missing config UUID in either direction fails open — same
         # semantics as YBA being unreachable.
-        if group.yba_client is not None:
+        if group.yba_client is not None and not skip_phase2:
             if new_status == HealthResult.UNHEALTHY and group.xcluster_config_uuid:
                 _wait_for_replication_lag(group, which_cluster, is_failback=False)
             elif (

@@ -79,3 +79,21 @@ def wait_for_dispatch(
             lambda: not group.dispatch_paused,
             timeout=timeout_s,
         )
+
+
+def dispatch_generation(group: "FailoverGroup") -> int:
+    """Barrier generation to pair with :func:`barrier_crossed`. Read it
+    after :func:`wait_for_dispatch` returns and before routing."""
+    with group.lock:
+        return group.barrier_generation
+
+
+def barrier_crossed(group: "FailoverGroup", generation: int) -> bool:
+    """True if a drain armed its barrier after ``generation`` was read.
+
+    Call after the new conn is in ``tracked_conns``. Both sides hold
+    ``group.lock``, so either this sees the arming, or the conn was
+    already tracked when the drain armed and the drain's sweeps own it.
+    """
+    with group.lock:
+        return group.dispatch_paused or group.barrier_generation != generation
