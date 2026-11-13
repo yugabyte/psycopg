@@ -95,6 +95,11 @@ def _make_group_with_yba(
     threshold_ms: int = 0,
     lag_wait_timeout_s: int = 5,
     with_yba_client: bool = True,
+    # DB-24483: these tests predate the freshness + liveness gates and
+    # exercise the pre-fix single-sample convergence. Opt out by
+    # default; test_drain_db24483_freshness_gate.py covers the gate.
+    lag_freshness_s: int = 0,
+    lag_confirmation_samples: int = 1,
 ) -> tuple[FailoverGroup, _FakeYBAClient]:
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
@@ -108,6 +113,10 @@ def _make_group_with_yba(
         xcluster_config_uuid="xcc-abcd",
         threshold_replication_lag_ms=threshold_ms,
         lag_wait_timeout_s=lag_wait_timeout_s,
+        lag_freshness_s=lag_freshness_s,
+        lag_confirmation_samples=lag_confirmation_samples,
+        failback_lag_freshness_s=lag_freshness_s,
+        failback_lag_confirmation_samples=lag_confirmation_samples,
     )
     return group, client
 
@@ -151,7 +160,7 @@ def test_lag_wait_converges_after_multiple_polls(fake_state):
 # ------------------------------------------------------- exit condition: timeout
 
 def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
-    """`onPhase2Timeout=fail` only gates FAILBACK. A failover lag wait
+    """`yb.failback.onPhase2Timeout=fail` only gates FAILBACK. A failover lag wait
     that times out still flips — staying on the side the CB just
     declared dead is worse than a lagged target."""
     group, client = _make_group_with_yba(
@@ -160,7 +169,7 @@ def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
         threshold_ms=1,
         lag_wait_timeout_s=2,
     )
-    group.on_phase2_timeout = "fail"
+    group.failback_on_phase2_timeout = "fail"
     import time
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
@@ -173,7 +182,7 @@ def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
 
 
 def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
-    """`onPhase2Timeout=proceed` (default) — flip anyway once the lag
+    """`yb.failback.onPhase2Timeout=proceed` (default) — flip anyway once the lag
     wait times out."""
     group, client = _make_group_with_yba(
         fake_state,
@@ -181,7 +190,7 @@ def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
         threshold_ms=1,
         lag_wait_timeout_s=2,
     )
-    group.on_phase2_timeout = "proceed"
+    group.failback_on_phase2_timeout = "proceed"
     import time
     t0 = time.monotonic()
     trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
@@ -343,6 +352,11 @@ def _make_group_with_failback_yba(
     failback_threshold_ms: int = 0,
     failback_timeout_s: int = 5,
     failback_config_uuid: str = "xcc-b2a",
+    # DB-24483: default both sides to pre-fix single-sample semantics so
+    # existing tests keep testing the direction/UUID selection they were
+    # written for; the gate itself has dedicated tests.
+    lag_freshness_s: int = 0,
+    lag_confirmation_samples: int = 1,
 ) -> tuple[FailoverGroup, _FakeYBAClient]:
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
@@ -359,6 +373,10 @@ def _make_group_with_failback_yba(
         failback_xcluster_config_uuid=failback_config_uuid,
         failback_threshold_replication_lag_ms=failback_threshold_ms,
         failback_lag_wait_timeout_s=failback_timeout_s,
+        lag_freshness_s=lag_freshness_s,
+        lag_confirmation_samples=lag_confirmation_samples,
+        failback_lag_freshness_s=lag_freshness_s,
+        failback_lag_confirmation_samples=lag_confirmation_samples,
     )
     return group, client
 
@@ -474,3 +492,223 @@ def test_lag_wait_timeout_uses_nearly_full_budget_with_fast_polls(fake_state, ca
     msgs = [r.getMessage() for r in caplog.records]
     assert any(m.startswith("lag wait timeout after") for m in msgs), msgs
     assert not any("near-timeout" in m for m in msgs)
+
+
+# ------------------------------------------------------- globalTimeBudgetSecs
+
+class _InFlightConn(_FakeConn):
+    """In a transaction that never commits; the drain deadline closes it."""
+
+    def __init__(self) -> None:
+        super().__init__(TransactionStatus.INTRANS)
+        import types
+        self.pgconn = types.SimpleNamespace(socket=-1)
+
+
+def test_budget_caps_lag_wait_from_drain_start(fake_state):
+    """Stress budget_split: drain start → drain complete must fit
+    globalTimeBudgetSecs. Phase 1 used its whole share, so the lag wait
+    only gets what is left of the budget, not its own full timeout."""
+    import time
+
+    group, client = _make_group_with_yba(
+        fake_state, yba_responses=[500.0], threshold_ms=1, lag_wait_timeout_s=3,
+    )
+    group.global_time_budget_secs = 3
+    conn = _InFlightConn()
+    group.primary.tracked_conns.add(conn)
+
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=1)
+    elapsed = time.monotonic() - t0
+
+    assert conn.closed
+    assert 2.4 <= elapsed <= 3.0, elapsed
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_failback_uses_failback_budget(fake_state):
+    import time
+
+    group, client = _make_group_with_failback_yba(
+        fake_state, yba_responses=[500.0], failback_threshold_ms=1,
+        failback_timeout_s=3,
+    )
+    group.global_time_budget_secs = 60
+    group.failback_global_time_budget_secs = 1
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    assert time.monotonic() - t0 <= 1.2
+
+
+# ------------------------------------------------------- per-node lag report
+
+class _ReportYBAClient:
+    """Returns per-node lag reports like YBAClient.get_committed_lag_report."""
+
+    def __init__(self, reports: list) -> None:
+        self.reports = list(reports)
+        self.calls = 0
+
+    def get_committed_lag_report(self, xcluster_uuid, deadline=None):
+        import time as _time
+        self.calls += 1
+        r = self.reports[0] if len(self.reports) == 1 else self.reports.pop(0)
+        return dict(r, sample_ts=_time.time() + 1)
+
+
+def _report(values, stale=()):
+    return {
+        "lag_ms": max([v for v in values.values() if v > 1.0], default=0.0),
+        "sample_ts": None,
+        "values": values,
+        "stale": list(stale),
+        "leader_reported": any(v > 0 for n, v in values.items() if n not in stale),
+    }
+
+
+def _group_with_reports(fake_state, reports, timeout_s=2):
+    group, _ = _make_group_with_yba(
+        fake_state, yba_responses=[], threshold_ms=0, lag_wait_timeout_s=timeout_s,
+    )
+    client = _ReportYBAClient(reports)
+    group.yba_client = client
+    return group, client
+
+
+def test_all_zero_lag_from_producer_does_not_converge(fake_state, caplog):
+    """Stress phase2_claim (a_majority_down): the A nodes still up
+    reported 0 because no tablet had a leader. Not a caught-up A."""
+    import logging, time
+    group, client = _group_with_reports(fake_state, [_report({"n1": 0.0, "n3": 0.0})])
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    t0 = time.monotonic()
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert time.monotonic() - t0 >= 1.5
+    assert "no tablet leader reporting" in caplog.text
+    assert "lag wait converged" not in caplog.text
+    assert "lag wait timeout" in caplog.text
+
+
+def test_node_that_stopped_reporting_blocks_converge(fake_state, caplog):
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.001}, stale=["n2"])],
+    )
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert "n2 stopped reporting" in caplog.text
+    assert "lag wait converged" not in caplog.text
+
+
+def test_caught_up_leader_report_converges(fake_state, caplog):
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.0, "n3": 0.001})], timeout_s=10,
+    )
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert client.calls == 1
+    assert "lag wait converged" in caplog.text
+    assert "nodes=n1:0.001,n2:0,n3:0.001" in caplog.text
+
+
+def test_outgoing_all_nodes_down_does_not_converge(fake_state, caplog):
+    """Stress phase2_claim (region_outage_with_yba, a_outage_into_limited_b):
+    with every A process stopped, YBA kept returning 1us for all three A
+    nodes after the barrier. The driver had all of them quarantined."""
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.001, "n3": 0.001})],
+    )
+    for n in group.primary.nodes.values():
+        n.is_down = True
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert "every node of the outgoing universe is down" in caplog.text
+    assert "lag wait converged" not in caplog.text
+    assert "lag wait timeout" in caplog.text
+    assert group.primary_status == HealthResult.UNHEALTHY
+
+
+def test_outgoing_node_up_again_converges(fake_state, caplog):
+    import logging
+    group, client = _group_with_reports(
+        fake_state, [_report({"n1": 0.001, "n2": 0.001, "n3": 0.001})], timeout_s=10,
+    )
+    node = next(iter(group.primary.nodes.values()))
+    node.is_down = True
+    group.primary.nodes["p2"] = type(node)(
+        host="p2", public_ip=None, port=5433, placement=node.placement,
+        node_type=node.node_type,
+    )
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+    assert client.calls == 1
+    assert "lag wait converged" in caplog.text
+
+
+def test_failback_outgoing_all_nodes_down_does_not_converge(fake_state, caplog):
+    import logging
+    group, _ = _make_group_with_failback_yba(
+        fake_state, yba_responses=[], failback_timeout_s=2,
+    )
+    group.yba_client = _ReportYBAClient([_report({"n1": 0.001})])
+    for n in group.secondary.nodes.values():
+        n.is_down = True
+    caplog.set_level(logging.INFO, logger="psycopg.yb.drain")
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+    assert "every node of the outgoing universe is down" in caplog.text
+    assert "lag wait converged" not in caplog.text
+
+
+# ------------------------------------------------------- unreachable + yb.failback.onPhase2Timeout=fail
+
+def _failback_group(fake_state, responses, policy):
+    group, client = _make_group_with_yba(
+        fake_state, yba_responses=responses, threshold_ms=0, lag_wait_timeout_s=30,
+    )
+    group.primary_status = HealthResult.UNHEALTHY
+    group.failback_xcluster_config_uuid = "xcc-ba"
+    group.failback_lag_wait_timeout_s = 30
+    group.failback_on_phase2_timeout = policy
+    return group, client
+
+
+def test_failback_yba_unreachable_aborts_with_fail_policy(fake_state):
+    """`yb.failback.onPhase2Timeout=fail` means "don't fail back onto a primary we
+    can't confirm has caught up"; an unreachable YBA is that case. The
+    failback aborts, routing stays on the healthy secondary."""
+    group, client = _failback_group(
+        fake_state, [YBAClientError("net down")] * 3, "fail",
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert len(client.calls) == 3
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
+    assert group.dispatch_paused is False
+
+
+def test_failback_yba_unreachable_proceeds_with_proceed_policy(fake_state):
+    group, client = _failback_group(
+        fake_state, [YBAClientError("net down")] * 3, "proceed",
+    )
+
+    trigger_drain(group, "primary", HealthResult.HEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_failover_yba_unreachable_proceeds_even_with_fail_policy(fake_state):
+    group, client = _make_group_with_yba(
+        fake_state, yba_responses=[YBAClientError("net down")] * 3,
+        threshold_ms=0, lag_wait_timeout_s=30,
+    )
+    group.failback_on_phase2_timeout = "fail"
+
+    trigger_drain(group, "primary", HealthResult.UNHEALTHY, drain_timeout_s=0)
+
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.dispatch_paused is False

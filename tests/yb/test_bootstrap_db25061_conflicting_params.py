@@ -51,7 +51,7 @@ class _Params:
             "secondary_cluster_hosts",
             "replication_name",
             "failback_replication_name",
-            "on_phase2_timeout",
+            "failback_on_phase2_timeout",
         ):
             setattr(self, name, "")
         for name in (

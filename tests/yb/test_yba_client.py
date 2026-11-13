@@ -527,3 +527,96 @@ def test_persistent_ssl_eof_still_raises(yba_server):
 
     with pytest.raises(YBAClientError, match="connection error"):
         client.get_committed_lag_ms("xcc-1")
+    # The poisoned keep-alive conn stays open otherwise, and the
+    # single-threaded mock server's shutdown() blocks on it.
+    client.close()
+
+
+# ------------------------------------------------------------- deadline cut
+
+def test_blocked_metrics_call_returns_at_deadline():
+    """A YBA that accepts and never answers holds a call for the full
+    socket timeout; under a globalTimeBudgetSecs deadline the call is cut
+    when the deadline arrives (stress budget_split overshoot)."""
+    import socket
+    import time
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    host, port = listener.getsockname()
+    try:
+        client = YBAClient(
+            f"http://{host}:{port}", api_token="tok",
+            connect_timeout_s=2.0, read_timeout_s=3.0,
+        )
+        client._customer_uuid = "cust-1"
+        t0 = time.monotonic()
+        with pytest.raises(YBAClientError):
+            client.get_committed_lag_sample("xcc-1", deadline=t0 + 0.5)
+        assert time.monotonic() - t0 < 1.2
+        client.close()
+    finally:
+        listener.close()
+
+
+def test_call_past_deadline_fails_without_network():
+    client = YBAClient("http://127.0.0.1:9", api_token="tok")
+    client._customer_uuid = "cust-1"
+    with pytest.raises(YBAClientError):
+        client.get_committed_lag_sample("xcc-1", deadline=0.0)
+
+
+# ------------------------------------------------------------- per-node lag report
+
+def _trace(node, ys, xs, name="Committed Lag"):
+    return {"name": name, "instanceName": node, "y": ys, "x": xs}
+
+
+def test_lag_report_healthy_nodes_caught_up():
+    from psycopg.yb.yba_client import _lag_report_from_traces
+    xs = ["1000000", "1010000"]
+    traces = [
+        _trace("n1", ["0.001", "0.001"], xs),
+        _trace("n2", ["0", "0.001"], xs),
+        _trace("n3", ["0.001", "0"], xs),
+        _trace("n1", ["5", "5"], xs, name="Sent Lag"),
+    ]
+    r = _lag_report_from_traces(traces)
+    assert r["lag_ms"] == 0.0 and r["sample_ts"] == 1010.0
+    assert r["stale"] == [] and r["leader_reported"] is True
+    assert r["values"] == {"n1": 0.001, "n2": 0.001, "n3": 0.0}
+
+
+def test_lag_report_all_zero_means_no_leader():
+    """ClearMetrics stores 0 on a node that leads no tablet; a caught-up
+    leader stores 1 us. All zeros: the producer lost its leaders."""
+    from psycopg.yb.yba_client import _lag_report_from_traces
+    xs = ["1000000", "1010000"]
+    r = _lag_report_from_traces([_trace("n1", ["0.001", "0"], xs)])
+    assert r["lag_ms"] == 0.0
+    assert r["leader_reported"] is False
+
+
+def test_lag_report_flags_node_whose_series_ended():
+    from psycopg.yb.yba_client import _lag_report_from_traces
+    r = _lag_report_from_traces([
+        _trace("n1", ["0.001", "0.001"], ["1000000", "1010000"]),
+        _trace("n2", ["0.001"], ["1000000"]),
+    ])
+    assert r["stale"] == ["n2"]
+    assert r["leader_reported"] is True
+
+
+def test_get_committed_lag_report_end_to_end(yba_server):
+    yba_server.routes["/api/v1/session_info"] = {"body": {"customerUUID": "c1"}}
+    yba_server.routes["/api/v1/customers/c1/metrics"] = {"body": {
+        "tserver_async_replication_lag_micros": {"data": [
+            _trace("n1", ["12.5"], ["1700000000000"]),
+            _trace("n2", ["0.001"], ["1700000000000"]),
+        ]},
+    }}
+    client = YBAClient(yba_server.endpoint, api_token="tok")
+    r = client.get_committed_lag_report("xcc-1")
+    assert r["lag_ms"] == 12.5 and r["sample_ts"] == 1700000000.0
+    assert r["leader_reported"] and r["stale"] == []

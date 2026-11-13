@@ -149,6 +149,14 @@ accepted as separators between tokens):
        ``-1`` = wait indefinitely, never force-close;
        ``0`` = force-close in-flight transactions immediately;
        ``N > 0`` = wait up to N seconds then force-close survivors.
+   * - ``yb.failback.onPhase2Timeout``
+     - ``proceed``
+     - What a failback does when its replication-lag wait (Phase 2)
+       can't confirm the primary has caught up. ``proceed`` = fail back
+       anyway. ``fail`` = when the lag wait times out, or YBA stays
+       unreachable, the failback is aborted: routing stays on the
+       secondary and the probe retries after the cooldown. No effect on
+       failover, which always proceeds.
 
 Example (application):
 

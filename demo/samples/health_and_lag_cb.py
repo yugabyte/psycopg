@@ -195,34 +195,21 @@ class HealthAndLagCircuitBreaker:
         self.last_trip_time: float = 0.0
         self.last_recovery_time: float = 0.0
         self._last_reported: HealthResult = HealthResult.HEALTHY
-        # agent-K PR #15:G9 — DB-24852/DB-24483 interaction. If the
-        # operator attaches this CB AND the driver's Phase 2 lag wait
-        # is also enabled on the group (``yba_client`` set), both gates
-        # run back-to-back on every planned failover, doubling the
-        # wall-clock. Log once per CB instance when ``check()`` first
-        # observes both are wired, so operators see the misconfig in
-        # their logs without hunting through two layers of config.
+        # When the driver's Phase 2 lag wait is wired on the group the
+        # CB leaves the lag gate to it (see check()). Logged once.
         self._double_wait_warned = False
 
     # ---------------------------------------------------------- check()
 
     def check(self, group: "FailoverGroup") -> HealthResult:
-        # agent-K PR #15:G9 — warn once if driver Phase 2 is ALSO
-        # enabled on the group. The CB already gates on lag inside its
-        # UNHEALTHY path; running the driver's Phase 2 after that is
-        # redundant and doubles planned-failover wall-clock. Operators
-        # should set ``drainTimeoutSecs=0`` (and treat Phase 2 as a
-        # no-op) when attaching this CB. Checked here rather than at
-        # construction time because the CB is attached BEFORE
-        # ``_bootstrap_yba_lag_phase`` wires ``yba_client`` on the group.
+        # Checked here rather than at construction time because the CB
+        # is attached BEFORE ``_bootstrap_yba_lag_phase`` wires
+        # ``yba_client`` on the group.
         if not self._double_wait_warned and getattr(group, "yba_client", None):
-            logger.warning(
-                "%s: HealthAndLagCircuitBreaker is attached AND driver "
-                "Phase 2 (yb.failover.ybaEndpoint) is wired on the "
-                "group — BOTH gate on lag back-to-back, doubling the "
-                "planned-failover wall-clock. Either remove the YBA "
-                "DSN knobs or set yb.failover.drainTimeoutSecs=0 so "
-                "Phase 2 skips the lag wait (the CB will do it).",
+            logger.info(
+                "%s: driver Phase 2 (yb.failover.ybaEndpoint) is wired on "
+                "the group; this CB leaves the lag gate to it and trips "
+                "on the health probe alone",
                 self.which_cluster,
             )
             self._double_wait_warned = True
@@ -257,6 +244,24 @@ class HealthAndLagCircuitBreaker:
 
         # Step 2: health says bad. Consult lag before agreeing.
         client, config_uuid = self._resolve_yba(group)
+
+        # The driver's own Phase 2 is wired for this direction: it waits
+        # on the same lag after the dispatch barrier, when the app has
+        # stopped writing and lag can reach the threshold. Gating here
+        # measures lag while the app is still writing, which never
+        # reaches 0 ms, so every planned failover sat out the full
+        # max_hold_ticks backstop (stress timing_detect_s: 60.4 s on
+        # health_lag_cb). Same deferral as the failback gate in
+        # _failback_lag_drained.
+        if (
+            self._yba_client_override is None
+            and self._xcluster_config_uuid_override is None
+            and getattr(group, "yba_client", None) is not None
+            and config_uuid
+        ):
+            self._hold_ticks = 0
+            self._record_unhealthy(reason="health-fail, lag gated by driver Phase 2")
+            return HealthResult.UNHEALTHY
 
         # No YBA path available — fall back to health-only. Fail-open:
         # better to trip than to wedge waiting for a control plane we

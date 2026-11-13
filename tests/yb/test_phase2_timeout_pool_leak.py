@@ -28,7 +28,7 @@ Root cause (two bugs compounding):
 
 Fix (this PR):
 
-  (a) `on_phase2_timeout="fail"` (opt-in; default is "proceed"): on a
+  (a) `failback_on_phase2_timeout="fail"` (opt-in; default is "proceed"): on a
       failback timeout, raise `Phase2TimeoutError`; the drain catches it
       and SKIPS the status change. Routing stays on the current side.
       Operator-visible `last_phase2_timeout_ts` stamped.
@@ -86,7 +86,7 @@ class _FakeYBAClient:
         return (self.lag_ms, time.time())
 
 
-def _make_group(fake_state, *, yba_client=None, on_phase2_timeout="fail"):
+def _make_group(fake_state, *, yba_client=None, failback_on_phase2_timeout="fail"):
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="PRIMARY-A")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="SECONDARY-B")
     group = FailoverGroup(
@@ -100,7 +100,7 @@ def _make_group(fake_state, *, yba_client=None, on_phase2_timeout="fail"):
         threshold_replication_lag_ms=0,
         lag_wait_timeout_s=2,
         failback_lag_wait_timeout_s=2,
-        on_phase2_timeout=on_phase2_timeout,
+        failback_on_phase2_timeout=failback_on_phase2_timeout,
     )
     return group
 
@@ -167,7 +167,7 @@ def test_default_policy_failback_timeout_proceeds(fake_state, fresh_registry):
         lag_wait_timeout_s=2,
         failback_lag_wait_timeout_s=2,
     )
-    assert group.on_phase2_timeout == "proceed"
+    assert group.failback_on_phase2_timeout == "proceed"
 
     trigger_drain(
         group,
@@ -183,10 +183,10 @@ def test_default_policy_failback_timeout_proceeds(fake_state, fresh_registry):
 
 def test_proceed_policy_preserves_pre_fix_behavior(fake_state, fresh_registry):
     """Operators who want aggressive failover can opt in via
-    `onPhase2Timeout=proceed`. The driver still flips to the known-stale
+    `yb.failback.onPhase2Timeout=proceed`. The driver still flips to the known-stale
     side — same as before this fix."""
     yba = _FakeYBAClient(lag_ms=5000.0)
-    group = _make_group(fake_state, yba_client=yba, on_phase2_timeout="proceed")
+    group = _make_group(fake_state, yba_client=yba, failback_on_phase2_timeout="proceed")
 
     trigger_drain(
         group,

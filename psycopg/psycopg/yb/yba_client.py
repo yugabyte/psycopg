@@ -63,7 +63,17 @@ class YBAClientError(Exception):
     """Raised when a YBA API call fails (HTTP error, timeout, malformed
     response). Callers should treat this as "YBA unreachable this poll" —
     the failover sequence counts consecutive failures and proceeds without
-    lag confirmation after N strikes."""
+    lag confirmation after N strikes.
+
+    ``transient`` is True for failures that can clear on their own — a
+    connect failure, a timeout, a dropped connection or an HTTP 5xx — and
+    False for the rest (4xx such as a bad token, an unknown replication
+    name, a malformed response). Bootstrap retries only transient ones.
+    """
+
+    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 # ------------------------------------------------------------------- client
@@ -136,7 +146,19 @@ class YBAClient:
 
     # ------------------------------------------------------------- HTTP core
 
-    def _open_connection(self) -> http.client.HTTPConnection:
+    def _op_timeout(self, deadline: "float | None") -> float:
+        """Per-op socket timeout: max(connect, read), cut to what is left
+        before ``deadline`` (monotonic) when one is given."""
+        timeout = max(self.connect_timeout_s, self.read_timeout_s)
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError("deadline reached")
+        return timeout
+
+    def _open_connection(
+        self, deadline: "float | None" = None,
+    ) -> http.client.HTTPConnection:
         """Open a fresh HTTP(S) connection. Idempotent — closes any
         existing one first."""
         self._close_connection()
@@ -151,7 +173,7 @@ class YBAClient:
         # Phase 2 drain loop in `drain.py` checks the elapsed budget
         # before each poll (and now also inside the YBA request path —
         # see `_request_with_elapsed_cap` below). agent-K PR #8:144.
-        timeout = max(self.connect_timeout_s, self.read_timeout_s)
+        timeout = self._op_timeout(deadline)
         if self._is_https:
             self._conn = http.client.HTTPSConnection(
                 self._host,
@@ -194,6 +216,7 @@ class YBAClient:
         path: str,
         body: dict | None = None,
         query: dict | None = None,
+        deadline: "float | None" = None,
     ) -> Any:
         """Execute one HTTP call over the persistent connection. Returns
         parsed JSON on 2xx, raises :class:`YBAClientError` otherwise.
@@ -202,6 +225,9 @@ class YBAClient:
         ``RemoteDisconnected``) reconnects once and retries. Anything
         after that surfaces to the caller — the poll loop's 3-strike
         rule handles it from there.
+
+        ``deadline`` (monotonic) caps every socket op at the time left
+        before it, so a blocked call returns at the deadline.
         """
         request_target = f"/api/v1{path}"
         if query:
@@ -221,15 +247,24 @@ class YBAClient:
             for attempt in (1, 2):
                 if self._conn is None or attempt_reconnect:
                     try:
-                        self._open_connection()
+                        if deadline is None:
+                            self._open_connection()
+                        else:
+                            self._open_connection(deadline)
                     except (TimeoutError, OSError, ssl.SSLError) as exc:
                         raise YBAClientError(
-                            f"YBA {method} {path} connect failed: {exc}"
+                            f"YBA {method} {path} connect failed: {exc}",
+                            transient=True,
                         ) from exc
                     attempt_reconnect = False
 
                 try:
                     assert self._conn is not None
+                    timeout = self._op_timeout(deadline)
+                    self._conn.timeout = timeout
+                    sock = getattr(self._conn, "sock", None)
+                    if sock is not None:
+                        sock.settimeout(timeout)
                     self._conn.request(method, request_target, body=data, headers=headers)
                     resp = self._conn.getresponse()
                     raw = resp.read()
@@ -254,21 +289,24 @@ class YBAClient:
                         attempt_reconnect = True
                         continue
                     raise YBAClientError(
-                        f"YBA {method} {path} connection error: {exc}"
+                        f"YBA {method} {path} connection error: {exc}",
+                        transient=True,
                     ) from exc
                 except (TimeoutError, OSError, ssl.SSLError) as exc:
                     # Force a reconnect on the next call — http.client's
                     # state machine may be wedged after this.
                     self._close_connection()
                     raise YBAClientError(
-                        f"YBA {method} {path} timeout: {exc}"
+                        f"YBA {method} {path} timeout: {exc}",
+                        transient=True,
                     ) from exc
                 break
 
         if status >= 400:
             err_body = raw.decode("utf-8", "replace")[:200] if raw else ""
             raise YBAClientError(
-                f"YBA {method} {path} → HTTP {status}: {err_body}"
+                f"YBA {method} {path} → HTTP {status}: {err_body}",
+                transient=status >= 500,
             )
 
         if not raw:
@@ -282,13 +320,13 @@ class YBAClient:
 
     # ------------------------------------------------------------- API surface
 
-    def get_session_info(self) -> str:
+    def get_session_info(self, deadline: "float | None" = None) -> str:
         """Fetch the customer UUID from ``/session_info``. Cached after
         first successful call — subsequent calls return the cached value
         without a network round-trip."""
         if self._customer_uuid is not None:
             return self._customer_uuid
-        info = self._request("GET", "/session_info")
+        info = self._request("GET", "/session_info", deadline=deadline)
         if not isinstance(info, dict):
             raise YBAClientError("/session_info returned non-JSON-object")
         cid = info.get("customerUUID")
@@ -297,7 +335,9 @@ class YBAClient:
         self._customer_uuid = cid
         return cid
 
-    def resolve_xcluster_config_uuid(self, replication_name: str) -> str:
+    def resolve_xcluster_config_uuid(
+        self, replication_name: str, deadline: "float | None" = None,
+    ) -> str:
         """Resolve a human-readable ``replicationName`` to its xCluster
         config UUID.
 
@@ -318,12 +358,15 @@ class YBAClient:
 
         Raises :class:`YBAClientError` when no config with a matching
         name is found, or when multiple configs share the same name.
+        ``deadline`` (monotonic) caps every call, as in ``_request``.
         """
-        cid = self.get_session_info()
+        cid = self.get_session_info(deadline=deadline)
 
         # 1. List all universes; collect every UUID mentioned in any
         #    universe's sourceXClusterConfigs list. One HTTP call.
-        universes = self._request("GET", f"/customers/{cid}/universes")
+        universes = self._request(
+            "GET", f"/customers/{cid}/universes", deadline=deadline,
+        )
         if not isinstance(universes, list):
             raise YBAClientError(
                 "/universes returned non-list; cannot enumerate xCluster configs"
@@ -349,7 +392,7 @@ class YBAClient:
         for uuid in candidates:
             cfg = self._request(
                 "GET", f"/customers/{cid}/xcluster_configs/{uuid}",
-                query={"syncWithDB": "false"},
+                query={"syncWithDB": "false"}, deadline=deadline,
             )
             if not isinstance(cfg, dict):
                 continue
@@ -385,6 +428,7 @@ class YBAClient:
         self,
         xcluster_config_uuid: str,
         lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
+        deadline: "float | None" = None,
     ) -> "tuple[float | None, float | None] | None":
         """Return ``(lag_ms, sample_epoch_s)`` for the given xCluster
         config: the max committed replication lag in milliseconds, and
@@ -418,7 +462,31 @@ class YBAClient:
         unreachable poll" and moves on — three consecutive
         unreachables trigger the graceful degradation path.
         """
-        cid = self.get_session_info()
+        return _extract_committed_lag_sample(
+            self._fetch_lag_metrics(xcluster_config_uuid, lookback_s, deadline)
+        )
+
+    def get_committed_lag_report(
+        self,
+        xcluster_config_uuid: str,
+        lookback_s: int = _MIN_METRICS_LOOKBACK_SEC,
+        deadline: "float | None" = None,
+    ) -> "dict | None":
+        """:meth:`get_committed_lag_sample` plus what each producer node
+        reported, so the lag wait can tell a caught-up universe from one
+        whose nodes stopped reporting. See :func:`_lag_report_from_traces`.
+        """
+        return _extract_committed_lag_report(
+            self._fetch_lag_metrics(xcluster_config_uuid, lookback_s, deadline)
+        )
+
+    def _fetch_lag_metrics(
+        self, xcluster_config_uuid: str, lookback_s: int, deadline: "float | None",
+    ) -> Any:
+        # Deadline passed only when set, so subclasses and test doubles
+        # that override these without it keep working.
+        kw = {} if deadline is None else {"deadline": deadline}
+        cid = self.get_session_info(**kw)
         end_ts = int(time.time())
         start_ts = end_ts - max(int(lookback_s), _MIN_METRICS_LOOKBACK_SEC)
         body = {
@@ -433,8 +501,9 @@ class YBAClient:
             # accepted by YBA's /metrics endpoint.
             "step": "10",
         }
-        resp = self._request("POST", f"/customers/{cid}/metrics", body=body)
-        return _extract_committed_lag_sample(resp)
+        return self._request(
+            "POST", f"/customers/{cid}/metrics", body=body, **kw,
+        )
 
 
 # ------------------------------------------------------------------- helpers
@@ -526,6 +595,69 @@ def _max_lag_sample_from_traces(
             continue
         newest_ts = x if newest_ts is None else max(newest_ts, x)
     return (0.0, newest_ts)
+
+
+def _lag_report_from_traces(
+    traces: list, name_hints: Iterable[str] = _COMMITTED_LAG_TRACE_NAMES,
+) -> "dict | None":
+    """Per-node view of the committed-lag traces (one trace per producer
+    tserver). ``lag_ms`` / ``sample_ts`` match
+    :func:`_max_lag_sample_from_traces`; on top of that:
+
+      * ``values`` — node → latest value (ms), for the poll log.
+      * ``stale`` — nodes whose series ends before the newest point.
+        YBA evaluates every live series at the same 10 s steps, so a
+        shorter series is a node that stopped being scraped.
+      * ``leader_reported`` — some node at the newest point reported
+        more than 0. A tablet leader that has caught up stores 1 us
+        (cdc_service.cc UpdateTabletXClusterMetrics); a node that leads
+        no tablet stores exactly 0 (XClusterTabletMetrics::ClearMetrics).
+        With every value at 0, no leader is reporting: the producer has
+        lost its leaders, not caught up.
+
+    ``None`` when no matching trace carries a value.
+    """
+    latest: dict[str, tuple[float, float | None]] = {}
+    for trace in traces:
+        name = (trace.get("name") or trace.get("metricName") or "").strip()
+        if name_hints and not any(hint in name for hint in name_hints):
+            continue
+        y, x = _latest_xy(trace)
+        if y is None or y >= _NOT_REPORTED_THRESHOLD_MS or y < 0:
+            continue
+        node = str(trace.get("instanceName") or name or len(latest))
+        latest[node] = (y, x)
+    if not latest:
+        return None
+    sample = _max_lag_sample_from_traces(traces, name_hints)
+    xs = [x for _, x in latest.values() if x is not None]
+    newest = max(xs) if xs else None
+    stale = sorted(
+        node for node, (_, x) in latest.items()
+        if newest is not None and x is not None and x < newest
+    )
+    leader_reported = any(
+        y > 0 for node, (y, x) in latest.items() if node not in stale
+    )
+    return {
+        "lag_ms": None if sample is None else sample[0],
+        "sample_ts": None if sample is None else sample[1],
+        "values": {node: y for node, (y, _) in sorted(latest.items())},
+        "stale": stale,
+        "leader_reported": leader_reported,
+    }
+
+
+def _extract_committed_lag_report(response: Any) -> "dict | None":
+    if not isinstance(response, dict):
+        return None
+    block = response.get("tserver_async_replication_lag_micros")
+    if not isinstance(block, dict) or block.get("error"):
+        return None
+    data = block.get("data")
+    if not isinstance(data, list):
+        return None
+    return _lag_report_from_traces(data)
 
 
 def _extract_committed_lag_ms(response: Any) -> float | None:
