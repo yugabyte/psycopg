@@ -357,7 +357,7 @@ after a switch:
 With ``yb.failover.autoFailbackEnabled=false``, the driver stays on the
 secondary after the primary recovers, until you fail back yourself. A
 manual failback is triggered from application code: call
-``reset_failover_group`` on the driver's registry, for example from an
+``trigger_failback`` on the driver's registry, for example from an
 admin endpoint or a maintenance script that runs in the application
 process. It runs the same drain and replication-lag wait as an automatic
 failback, and blocks until they finish:
