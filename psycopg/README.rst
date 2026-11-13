@@ -338,11 +338,31 @@ automatic one, and blocks until they finish:
     # (primary status, secondary status, last change times)
     print(registry.get_failover_status(group.primary.uuid))
 
-Call ``reset_failover_group`` in the process that created the group. In a
-forked worker of a pre-fork server it has no effect. It returns ``False``
-if a switch is already in progress; call it again once that has finished.
-Like an automatic failback, it is postponed if the replication-lag wait
-runs out of time.
+``reset_failover_group`` only fails back; it never moves connections from
+the primary to the secondary. It marks the primary healthy, overriding
+its circuit breaker:
+
+* If connections are on the secondary, it runs a failback. Like an
+  automatic failback, the failback is postponed if the replication-lag
+  wait runs out of time.
+* If neither universe is usable, it moves connections to the primary.
+* If connections are already on the primary, it changes nothing.
+
+In every case it restarts the primary's cooldown, so for
+``cooldownSecs`` afterwards (25 minutes by default) the primary's circuit
+breaker can't trigger a failover. Call it only when connections are on
+the secondary and the primary is known to be healthy.
+
+Call it in the process that created the group. In a forked worker of a
+pre-fork server it has no effect. It returns ``False`` if a switch is
+already in progress; call it again once that has finished. Otherwise it
+returns ``True`` once the failback has been attempted, even if it was
+postponed; ``get_failover_status`` shows the result.
+
+To fail over manually, use a circuit breaker that an operator can
+control, such as ``ExternalSignalCircuitBreaker``: inserting a row that
+marks the primary ``UNHEALTHY`` triggers a normal failover on the next
+check.
 
 All other parameters are listed below.
 
