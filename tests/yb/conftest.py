@@ -1218,3 +1218,13 @@ def _clear_registry_after_integration_tests(request):
         # Late import to avoid import cost for tests that don't need it.
         from psycopg.yb.registry import ClusterRegistry
         ClusterRegistry.instance().clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_close_fence_in_unit_tests(request, monkeypatch):
+    """Unit tests time drains to the millisecond; the 1 s close fence
+    would swamp those bounds. Tests that exercise the fence set it back
+    explicitly."""
+    if request.node.get_closest_marker("yb_unit") is not None:
+        from psycopg.yb import drain
+        monkeypatch.setattr(drain, "_CLOSE_FENCE_S", 0.0)
