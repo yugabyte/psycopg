@@ -48,9 +48,12 @@ in the psycopg docs.
 .. __: https://www.psycopg.org/psycopg3/docs/basic/install.html#local-installation
 
 The fork can't be installed next to upstream ``psycopg`` in the same
-environment: both install into ``site-packages/psycopg/``. The ``[pool]``
-extra pulls the unmodified upstream ``psycopg-pool``; its ``import psycopg``
-resolves to this driver, so pooled connections get the same behaviour.
+environment: both install into ``site-packages/psycopg/``.
+
+There is no fork of the connection pool. The ``[pool]`` extra installs the
+regular ``psycopg-pool`` package from PyPI. The pool imports ``psycopg``,
+which in this environment is this driver, so every pooled connection goes
+through the smart driver.
 
 
 Load balancing
@@ -333,20 +336,31 @@ They aren't part of the installed package; copy the one you want.
   lag check, for setups that don't configure the driver's own
   replication-lag wait.
 
-With ``psycopg-pool``, pass ``xcluster_check`` so the pool drops
-connections to the old universe after a switch:
+A connection pool needs the same setup: create the failover group and
+attach the circuit breakers first, then create the pool with the same DSN.
+The pool opens connections as soon as it starts, and they fail with
+``MissingCircuitBreakerError`` if the circuit breakers aren't attached yet.
+Pass ``xcluster_check`` so the pool drops connections to the old universe
+after a switch:
 
 .. code-block:: python
 
     from psycopg.yb.pool import xcluster_check   # xcluster_check_async for AsyncConnectionPool
     from psycopg_pool import ConnectionPool
 
+    group = bootstrap_failover_group(DSN)
+    group.primary_circuit_breaker = MyCircuitBreaker("primary")
+    group.secondary_circuit_breaker = MyCircuitBreaker("secondary")
+
     pool = ConnectionPool(DSN, check=xcluster_check, min_size=4, max_size=20)
 
 With ``yb.failover.autoFailbackEnabled=false``, the driver stays on the
-secondary after the primary recovers, until you fail back yourself. The
-manual failback runs the same drain and replication-lag wait as an
-automatic one, and blocks until they finish:
+secondary after the primary recovers, until you fail back yourself. A
+manual failback is triggered from application code: call
+``reset_failover_group`` on the driver's registry, for example from an
+admin endpoint or a maintenance script that runs in the application
+process. It runs the same drain and replication-lag wait as an automatic
+failback, and blocks until they finish:
 
 .. code-block:: python
 
