@@ -141,18 +141,18 @@ def test_get_failover_group_by_uuid_searches_both_sides(fresh_registry, fake_sta
 
 # ----------------------------------------------------------------- operator API
 
-def test_reset_failover_group_returns_false_for_unknown(fresh_registry):
-    assert fresh_registry.reset_failover_group("nonexistent") is False
+def test_trigger_failback_returns_false_for_unknown(fresh_registry):
+    assert fresh_registry.trigger_failback("nonexistent") is False
 
 
-def test_reset_failover_group_flips_to_healthy(fresh_registry, fake_state):
+def test_trigger_failback_flips_to_healthy(fresh_registry, fake_state):
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = _install_group(fresh_registry, p, s)
     group.force_primary_status(HealthResult.UNHEALTHY)
     assert group.primary_status == HealthResult.UNHEALTHY
 
-    assert fresh_registry.reset_failover_group("P") is True
+    assert fresh_registry.trigger_failback("P") is True
     assert group.primary_status == HealthResult.HEALTHY
 
 
@@ -171,7 +171,7 @@ class _ResetConn:
         self.info.transaction_status = TransactionStatus.UNKNOWN
 
 
-def test_reset_failover_group_runs_the_failback_drain(fresh_registry, fake_state):
+def test_trigger_failback_runs_the_failback_drain(fresh_registry, fake_state):
     """Review #10 (Amogh): an operator failback goes through the same
     drain as an automatic one: barrier, the secondary's conns closed,
     then the flip. autoFailbackEnabled=false does not block it."""
@@ -185,7 +185,7 @@ def test_reset_failover_group_runs_the_failback_drain(fresh_registry, fake_state
     s.tracked_conns.add(conn_on_b)
     generation = group.barrier_generation
 
-    assert fresh_registry.reset_failover_group("P") is True
+    assert fresh_registry.trigger_failback("P") is True
 
     assert group.primary_status == HealthResult.HEALTHY
     assert group.barrier_generation == generation + 1
@@ -194,18 +194,18 @@ def test_reset_failover_group_runs_the_failback_drain(fresh_registry, fake_state
     assert group.drain_in_progress is False
 
 
-def test_reset_failover_group_refused_while_a_drain_runs(fresh_registry, fake_state):
+def test_trigger_failback_refused_while_a_drain_runs(fresh_registry, fake_state):
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
     group = _install_group(fresh_registry, p, s, cooldown_s=0)
     group.force_primary_status(HealthResult.UNHEALTHY)
     group.drain_in_progress = True
 
-    assert fresh_registry.reset_failover_group("P") is False
+    assert fresh_registry.trigger_failback("P") is False
     assert group.primary_status == HealthResult.UNHEALTHY
 
 
-def test_reset_failover_group_honours_fail_on_lag_timeout(fresh_registry, fake_state):
+def test_trigger_failback_honours_fail_on_lag_timeout(fresh_registry, fake_state):
     """Same Phase 2 rules as an automatic failback: under
     onPhase2Timeout=fail an unconfirmed lag keeps routing on the
     secondary."""
@@ -224,7 +224,7 @@ def test_reset_failover_group_honours_fail_on_lag_timeout(fresh_registry, fake_s
     group.failback_lag_wait_timeout_s = 1
     group.failback_on_phase2_timeout = "fail"
 
-    assert fresh_registry.reset_failover_group("P") is True
+    assert fresh_registry.trigger_failback("P") is True
     assert group.primary_status == HealthResult.UNHEALTHY
     assert group.last_phase2_timeout_ts > 0
 
@@ -251,6 +251,33 @@ def test_get_failover_status_returns_state_and_timestamp(fresh_registry, fake_st
     assert s_ts2 > 0.0
 
     assert fresh_registry.get_failover_status("nonexistent") is None
+
+
+def test_reset_failover_group_is_an_alias_of_trigger_failback(
+    fresh_registry, fake_state
+):
+    """The former name keeps working: same drain, same result."""
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    generation = group.barrier_generation
+
+    assert fresh_registry.reset_failover_group("nonexistent") is False
+    assert fresh_registry.reset_failover_group("P") is True
+    assert group.primary_status == HealthResult.HEALTHY
+    assert group.barrier_generation == generation + 1
+
+
+def test_reset_failover_group_calls_trigger_failback(fresh_registry, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        type(fresh_registry), "trigger_failback",
+        lambda self, uuid: calls.append(uuid) or "result",
+    )
+    assert fresh_registry.reset_failover_group("P") == "result"
+    assert calls == ["P"]
 
 
 # ----------------------------------------------------------------- bootstrap

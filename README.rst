@@ -337,12 +337,12 @@ automatic one, and blocks until they finish:
     from psycopg.yb.registry import ClusterRegistry
 
     registry = ClusterRegistry.instance()
-    registry.reset_failover_group(group.primary.uuid)
+    registry.trigger_failback(group.primary.uuid)
 
     # (primary status, secondary status, last change times)
     print(registry.get_failover_status(group.primary.uuid))
 
-``reset_failover_group`` only fails back; it never moves connections from
+``trigger_failback`` only fails back; it never moves connections from
 the primary to the secondary. It marks the primary healthy, overriding
 its circuit breaker:
 
@@ -362,6 +362,9 @@ pre-fork server it has no effect. It returns ``False`` if a switch is
 already in progress; call it again once that has finished. Otherwise it
 returns ``True`` once the failback has been attempted, even if it was
 postponed; ``get_failover_status`` shows the result.
+
+``reset_failover_group``, the name used up to 3.3.4.2, still works and
+does the same thing.
 
 To fail over manually, use a circuit breaker that an operator can
 control, such as ``ExternalSignalCircuitBreaker``: inserting a row that

@@ -572,7 +572,7 @@ def trigger_drain(
 
     Called from the probe thread — see health_probe.HealthProbe._maybe_apply
     — and, with ``operator=True``, from
-    ``ClusterRegistry.reset_failover_group``. An operator failback runs
+    ``ClusterRegistry.trigger_failback``. An operator failback runs
     the same drain and Phase 2 as an automatic one; only the
     autoFailbackEnabled gate does not apply, since the operator is the
     manual failback that setting waits for.
