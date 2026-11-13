@@ -30,16 +30,20 @@ Installation
 
 .. code-block:: bash
 
+    pip install "psycopg-yugabytedb[binary]"    # C speedups, prebuilt with libpq bundled
     pip install psycopg-yugabytedb              # pure Python, uses the system libpq
     pip install "psycopg-yugabytedb[pool]"      # adds the upstream psycopg-pool
-    pip install "psycopg-yugabytedb[c]"         # adds the C speedups, built from source
+    pip install "psycopg-yugabytedb[c]"         # C speedups, built from source
     pip install psycopg-yugabytedb==3.3.4.2     # pin a release
 
-``psycopg-yugabytedb`` needs the ``libpq`` client library on the system
-(``apt install libpq5``, ``brew install libpq``). The ``[c]`` extra
-compiles against it, so it also needs a C compiler and the ``libpq``
-headers; see `Local installation`__ in the psycopg docs. There is no
-``[binary]`` package for this fork yet.
+The ``[binary]`` extra installs a prebuilt C extension with ``libpq``
+bundled, so nothing else is needed on the machine. Binary wheels are
+published for Linux x86_64 and macOS on Apple Silicon (arm64), for
+CPython 3.10 to 3.14. Elsewhere, install the plain package, which needs
+the ``libpq`` client library on the system (``apt install libpq5``,
+``brew install libpq``). The ``[c]`` extra compiles against it, so it also
+needs a C compiler and the ``libpq`` headers; see `Local installation`__
+in the psycopg docs.
 
 .. __: https://www.psycopg.org/psycopg3/docs/basic/install.html#local-installation
 
@@ -166,9 +170,9 @@ The driver checks both circuit breakers periodically in the background.
 
 The two universes, their circuit breakers and the current routing state
 together make up a **failover group**. A process has one failover group
-for each connection target (the primary hosts, port, database and user).
-Every connection opened with that target belongs to the group, so they
-all switch universes together.
+for each primary universe. Every connection to that universe belongs to
+the group, even with a different database or user, so they all switch
+universes together.
 
 A switch from one universe to the other happens in two phases:
 
@@ -188,11 +192,14 @@ the application isn't moved back to a primary that is still missing
 recent writes.
 
 If both universes are unhealthy, new connections fail with
-``NoViableClusterError``. Each Python process tracks the universes on its
-own, so the workers of a multi-process application switch independently.
-A worker forked after the group was created (for example by a pre-fork
-server such as gunicorn) gets its own copy of the group, with its own
-background health checks.
+``NoViableClusterError``.
+
+Processes that each create their own failover group switch independently.
+In a pre-fork server (gunicorn ``--preload``, Celery prefork), the process
+that created the group runs the health checks and makes the decision;
+forked workers follow its switches, pausing, draining their own
+connections and resuming with it. A worker starts its own health checks
+only if that process exits.
 
 Usage
 ~~~~~
@@ -288,8 +295,8 @@ pools created with the same DSN, use this group.
 
     conn = psycopg.connect(DSN)
 
-A second connection string for the same target must use the same
-failover settings; if it doesn't, ``bootstrap_failover_group`` raises
+Every connection string that points at the same primary universe must
+use the same failover settings; if one doesn't, ``bootstrap_failover_group`` raises
 ``ConflictingFailoverConfigError`` naming the settings that differ. Use a
 separate circuit breaker instance for each universe. A ``check()``
 call that takes longer than ``yb.failover.checkTimeoutSecs`` is ignored
@@ -331,9 +338,11 @@ automatic one, and blocks until they finish:
     # (primary status, secondary status, last change times)
     print(registry.get_failover_status(group.primary.uuid))
 
-``reset_failover_group`` returns ``False`` if a switch is already in
-progress; call it again once that has finished. Like an automatic
-failback, it is postponed if the replication-lag wait runs out of time.
+Call ``reset_failover_group`` in the process that created the group. In a
+forked worker of a pre-fork server it has no effect. It returns ``False``
+if a switch is already in progress; call it again once that has finished.
+Like an automatic failback, it is postponed if the replication-lag wait
+runs out of time.
 
 All other parameters are listed below.
 
