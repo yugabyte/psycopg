@@ -307,18 +307,9 @@ use the same failover settings; if one doesn't, ``bootstrap_failover_group`` rai
 ``ConflictingFailoverConfigError`` naming the settings that differ. Use a
 separate circuit breaker instance for each universe. A ``check()``
 call that takes longer than ``yb.failover.checkTimeoutSecs`` is ignored
-and the previous status is kept.
-
-Ready-made circuit breakers are in ``demo/samples/`` in this repository.
-They aren't part of the installed package; copy the one you want.
-
-* ``TrackerTableCircuitBreaker`` - reads a small table spread over every
-  tablet server and reports ``UNHEALTHY`` when it can't.
-* ``ExternalSignalCircuitBreaker`` - an operator inserts a row into a
-  ``yb_failover_signals`` table to fail over or fail back on demand.
-* ``HealthAndLagCircuitBreaker`` - a health check combined with a YBA
-  lag check, for setups that don't configure the driver's own
-  replication-lag wait.
+and the previous status is kept. Ready-made circuit breakers you can use
+instead of writing your own are described in `Sample circuit breakers`_
+below.
 
 A connection pool needs the same setup: create the failover group and
 attach the circuit breakers first, then create the pool with the same DSN.
@@ -381,6 +372,72 @@ To fail over manually, use a circuit breaker that an operator can
 control, such as ``ExternalSignalCircuitBreaker``: inserting a row that
 marks the primary ``UNHEALTHY`` triggers a normal failover on the next
 check.
+
+Sample circuit breakers
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Three ready-made circuit breakers are in `demo/samples/
+<https://github.com/yugabyte/psycopg/tree/3.3.4.1/demo/samples>`_ in this
+repository. They aren't part of the installed package. To use one:
+
+1. Copy the file into a package in your application, for example
+   ``myapp/circuit_breakers/`` (with an ``__init__.py``). Take the files
+   from the same release as the installed driver, and copy them again
+   when you upgrade: the samples use internal driver functions that can
+   change between releases. ``health_and_lag_cb.py`` also needs
+   ``tracker_table_cb.py`` in the same package.
+2. Import the class and attach one instance per universe, with
+   ``which_cluster`` set to ``"primary"`` or ``"secondary"``:
+
+.. code-block:: python
+
+    from psycopg.yb import bootstrap_failover_group
+    from myapp.circuit_breakers.tracker_table_cb import TrackerTableCircuitBreaker
+
+    group = bootstrap_failover_group(DSN)
+    group.primary_circuit_breaker = TrackerTableCircuitBreaker(which_cluster="primary")
+    group.secondary_circuit_breaker = TrackerTableCircuitBreaker(which_cluster="secondary")
+
+Each sample works in the database named in the DSN, on each universe, and
+creates its table there on its first check.
+
+``TrackerTableCircuitBreaker(which_cluster, tracker_table_tablets=9, max_update_failures_allowed=0, app_databases=None)``
+    Reads a small table, ``yb_cluster_health_tracker``, that is split into
+    ``tracker_table_tablets`` tablets so the read reaches tablets across
+    the universe. It reports ``UNHEALTHY`` after
+    ``max_update_failures_allowed + 1`` failed checks in a row, and
+    ``HEALTHY`` again after the same number of successful ones. It also
+    reports ``UNHEALTHY`` when one of the application's databases (or
+    those in ``app_databases``) is set to
+    ``default_transaction_read_only``. Authentication, permission and
+    missing-database errors count as misconfiguration, not as failures.
+
+``ExternalSignalCircuitBreaker(which_cluster)``
+    Lets an operator fail over and fail back on demand. It reads the
+    newest row for its universe from ``yb_failover_signals``. To fail
+    over, insert a row marking the primary ``UNHEALTHY``; to fail back,
+    insert one marking it ``HEALTHY``. ``group_id`` is the primary
+    universe's uuid (``group.primary.uuid``):
+
+    .. code-block:: sql
+
+        INSERT INTO yb_failover_signals (group_id, which_cluster, target_status, reason)
+        VALUES ('<primary uuid>', 'primary', 'UNHEALTHY', 'planned maintenance');
+
+    With no row for its universe, it reports ``HEALTHY``.
+
+``HealthAndLagCircuitBreaker(which_cluster, threshold_lag_ms=0, health_probe=None, ...)``
+    Combines a health check (``TrackerTableCircuitBreaker`` by default, or
+    any circuit breaker passed as ``health_probe``) with a YBA lag check,
+    for setups that don't configure the driver's own replication-lag
+    wait. It reports ``UNHEALTHY`` only when the health check fails and
+    the other universe's replication lag is at or below
+    ``threshold_lag_ms``. If the lag stays above the threshold, it reports
+    ``UNHEALTHY`` anyway after ``max_hold_ticks`` checks (default ``12``),
+    so a primary that is down still fails over. Pass ``yba_client`` and
+    ``xcluster_config_uuid`` to use it without the driver's YBA settings.
+    When the driver's own lag wait is configured, it leaves the lag check
+    to the driver and uses the health check alone.
 
 All other parameters are listed below.
 
