@@ -110,6 +110,26 @@ Connections only go to tservers that match a key. If none of them are
 reachable, connecting fails; the driver doesn't fall back to the rest of
 the cluster.
 
+Unreachable nodes
+~~~~~~~~~~~~~~~~~
+
+When a connection to a node fails, the driver tries another node and skips
+the failed one for ``failed_host_reconnect_delay_secs``. How quickly a node
+is skipped depends on how the connect failed:
+
+* **Refused** (the node answers with an error, for example nothing is
+  listening on the port): the node is skipped after the first failure.
+* **Timed out** (no answer within ``connect_timeout``): the node is
+  skipped after three timeouts in a row. Connects from several threads that
+  time out at the same moment count as one. A successful connect resets
+  the count. This keeps a node that is only briefly slow in rotation.
+
+Until a node that times out has been skipped, new connections can still
+pick it and wait up to ``connect_timeout`` before moving to another node,
+so expect slower connects for roughly three times ``connect_timeout`` when
+a node stops answering. Releases up to 3.3.4.1 skipped a node after its
+first timeout.
+
 Load-balancing parameters:
 
 .. list-table::
@@ -145,8 +165,8 @@ Load-balancing parameters:
    * - ``failed_host_reconnect_delay_secs``
      - seconds (integer)
      - ``5``
-     - How long to skip a node after a failed connect. Clamped to
-       ``[0, 60]``.
+     - How long to skip a node after it fails (see `Unreachable nodes`_).
+       Clamped to ``[0, 60]``.
 
 
 xCluster failover
