@@ -379,9 +379,6 @@ already in progress; call it again once that has finished. Otherwise it
 returns ``True`` once the failback has been attempted, even if it was
 postponed; ``get_failover_status`` shows the result.
 
-``reset_failover_group``, the name used up to 3.3.4.2, still works and
-does the same thing.
-
 To fail over manually, use a circuit breaker that an operator can
 control, such as ``ExternalSignalCircuitBreaker``: inserting a row that
 marks the primary ``UNHEALTHY`` triggers a normal failover on the next
