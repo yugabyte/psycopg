@@ -28,7 +28,7 @@ Root cause (two bugs compounding):
 
 Fix (this PR):
 
-  (a) `failback_on_phase2_timeout="fail"` (opt-in; default is "proceed"): on a
+  (a) `failback_on_phase2_timeout="fail"` (the default): on a
       failback timeout, raise `Phase2TimeoutError`; the drain catches it
       and SKIPS the status change. Routing stays on the current side.
       Operator-visible `last_phase2_timeout_ts` stamped.
@@ -202,9 +202,9 @@ def test_failback_abort_line_reads_as_abort(
     assert len(aborted) == 1 and reason in aborted[0], aborted
 
 
-def test_default_policy_failback_timeout_proceeds(fake_state, fresh_registry):
-    """Default is "proceed": a failback whose lag wait times out still
-    flips back to primary. ``fail`` stays opt-in until DB-25803 lands."""
+def test_default_policy_failback_timeout_does_not_flip(fake_state, fresh_registry):
+    """Default is "fail": a failback whose lag wait times out stays on
+    the secondary. ``proceed`` is the opt-out (see the test below)."""
     yba = _FakeYBAClient(lag_ms=5000.0)
     p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="PRIMARY-A")
     s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="SECONDARY-B")
@@ -220,7 +220,7 @@ def test_default_policy_failback_timeout_proceeds(fake_state, fresh_registry):
         lag_wait_timeout_s=2,
         failback_lag_wait_timeout_s=2,
     )
-    assert group.failback_on_phase2_timeout == "proceed"
+    assert group.failback_on_phase2_timeout == "fail"
 
     trigger_drain(
         group,
@@ -229,8 +229,8 @@ def test_default_policy_failback_timeout_proceeds(fake_state, fresh_registry):
         drain_timeout_s=0,
     )
 
-    assert group.primary_status is HealthResult.HEALTHY
-    assert group.last_failback_complete_ts > 0
+    assert group.primary_status is HealthResult.UNHEALTHY
+    assert group.last_phase2_timeout_ts > 0
     assert group.dispatch_paused is False
 
 

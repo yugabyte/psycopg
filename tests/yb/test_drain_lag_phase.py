@@ -182,7 +182,7 @@ def test_lag_wait_timeout_failover_proceeds_even_with_fail_policy(fake_state):
 
 
 def test_lag_wait_timeout_when_never_converges_proceed_policy(fake_state):
-    """`yb.failback.onPhase2Timeout=proceed` (default) — flip anyway once the lag
+    """`yb.failback.onPhase2Timeout=proceed` (opt-in) — flip anyway once the lag
     wait times out."""
     group, client = _make_group_with_yba(
         fake_state,

@@ -884,9 +884,9 @@ def test_xcluster_socket_defaults_never_override_user_values():
 # exists only under the failback namespace.
 # ============================================================
 
-def test_failback_on_phase2_timeout_default_proceed():
+def test_failback_on_phase2_timeout_default_fail():
     yb, _, _ = extract_yb_params(_dsn_with_secondary(), {})
-    assert yb.failback_on_phase2_timeout == "proceed"
+    assert yb.failback_on_phase2_timeout == "fail"
 
 
 @pytest.mark.parametrize("key_form", [
@@ -922,12 +922,12 @@ def test_failback_on_phase2_timeout_invalid_raises():
 def test_failover_on_phase2_timeout_is_not_a_driver_key(key_form):
     """No yb.failover.* alias: the key is left in the conninfo like any
     other unrecognised yb.failover.* key (libpq then rejects it)."""
-    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=fail"), {})
+    yb, cleaned, _ = extract_yb_params(_dsn_with_secondary(f"{key_form}=proceed"), {})
     _, unknown_cleaned, _ = extract_yb_params(
         _dsn_with_secondary("yb.failover.noSuchKnob=fail"), {},
     )
-    assert yb.failback_on_phase2_timeout == "proceed"
-    assert f"{key_form}=fail" in cleaned
+    assert yb.failback_on_phase2_timeout == "fail"
+    assert f"{key_form}=proceed" in cleaned
     assert "yb.failover.noSuchKnob=fail" in unknown_cleaned
 
 
