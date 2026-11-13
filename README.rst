@@ -377,7 +377,7 @@ Sample circuit breakers
 ^^^^^^^^^^^^^^^^^^^^^^^
 
 Three ready-made circuit breakers are in `demo/samples/
-<https://github.com/yugabyte/psycopg/tree/3.3.4.1/demo/samples>`_ in this
+<https://github.com/yugabyte/psycopg/tree/3.3.4.x/demo/samples>`_ in this
 repository. They aren't part of the installed package. To use one:
 
 1. Copy the file into a package in your application, for example
