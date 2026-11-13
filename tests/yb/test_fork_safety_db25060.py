@@ -544,7 +544,7 @@ def test_real_fork_while_bootstrap_lock_held_does_not_hang_child(
 def test_reset_for_child_clears_drain_in_progress(fake_state, fresh_registry):
     """Review #9 (Amogh): a fork during a drain must not leave the child
     with drain_in_progress=True, or its probes would defer every
-    transition and reset_failover_group would always return False."""
+    transition and trigger_failback would always return False."""
     group, _ = _make_group_with_probes(fake_state)
     group.drain_in_progress = True
 

@@ -174,7 +174,7 @@ def test_dispatcher_routes_to_secondary_after_force_unhealthy(
 
 def test_failback_routes_back_to_primary(yb_xcluster_clusters):
     """Set UNHEALTHY → route to secondary. Reset to HEALTHY (via
-    `reset_failover_group`) → route to primary again."""
+    `trigger_failback`) → route to primary again."""
     group, primary_uuid = _bootstrap_group_and_get(_XCLUSTER_DSN)
     group.force_primary_status(HealthResult.UNHEALTHY)
 
@@ -184,7 +184,7 @@ def test_failback_routes_back_to_primary(yb_xcluster_clusters):
     finally:
         c1.close()
 
-    assert ClusterRegistry.instance().reset_failover_group(primary_uuid) is True
+    assert ClusterRegistry.instance().trigger_failback(primary_uuid) is True
 
     c2 = psycopg.connect(_XCLUSTER_DSN)
     try:

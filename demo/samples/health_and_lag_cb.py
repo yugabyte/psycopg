@@ -65,7 +65,7 @@ The hold row returns the status the driver has applied for this slot
     (DB-25154).
   * applied HEALTHY → HEALTHY, even if this CB returned UNHEALTHY on
     an earlier tick. The driver did not apply that trip (deferred,
-    discarded, aborted, or reset by ``reset_failover_group``), and
+    discarded, aborted, or reset by ``trigger_failback``), and
     the target is behind now, so the trip is withdrawn.
 
 The primary slot's failback gate (health HEALTHY but B→A lag not
@@ -407,7 +407,7 @@ class HealthAndLagCircuitBreaker:
         # what this CB last returned: the driver drops or defers
         # verdicts (cool-down, another drain in flight, a check that
         # overran checkTimeoutSecs, the bootstrap check, an aborted
-        # Phase 2 flip, reset_failover_group). Holding a trip the
+        # Phase 2 flip, trigger_failback). Holding a trip the
         # driver never applied would hand it UNHEALTHY now, with the
         # target measured as behind this tick, and it would fail over
         # onto a secondary that hasn't caught up.

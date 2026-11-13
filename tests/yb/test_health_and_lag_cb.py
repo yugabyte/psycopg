@@ -259,8 +259,8 @@ def test_hold_after_applied_trip_keeps_unhealthy(which):
     assert cb._last_reported is HealthResult.UNHEALTHY
 
 
-def test_hold_after_reset_failover_group_returns_healthy():
-    """reset_failover_group forces the status back to HEALTHY while
+def test_hold_after_trigger_failback_returns_healthy():
+    """trigger_failback forces the status back to HEALTHY while
     the CB still remembers its trip. The next hold follows the applied
     HEALTHY instead of re-tripping onto a lagging target."""
     cb, group = _tripping_cb("primary", [0.0, 5000.0, 5000.0])

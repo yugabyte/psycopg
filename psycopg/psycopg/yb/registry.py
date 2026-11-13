@@ -1038,8 +1038,9 @@ class ClusterRegistry:
       * `get_failover_group(primary_uuid)` — by primary uuid
       * `get_failover_group_by_uuid(any_uuid)` — searches both primary AND
         secondary uuids (used by `xcluster_check` pool callback)
-      * `reset_failover_group(primary_uuid)` — operator failback API:
-        flips status back to HEALTHY immediately
+      * `trigger_failback(primary_uuid)` — operator failback API: runs
+        a failback through the normal drain (`reset_failover_group` is
+        its former name, kept as an alias)
       * `get_failover_status(primary_uuid)` — read current status + last
         transition timestamp
 
@@ -2038,7 +2039,7 @@ class ClusterRegistry:
         with self._lock:
             return {k.dbname for k, u in self._key_to_uuid.items() if u == uuid}
 
-    def reset_failover_group(self, primary_uuid: str) -> bool:
+    def trigger_failback(self, primary_uuid: str) -> bool:
         """Operator failback API (the equivalent of JDBC's JMX failback
         operation, design doc §8). Marks the primary HEALTHY through the
         same drain as an automatic failback: barrier, close the conns on
@@ -2060,7 +2061,10 @@ class ClusterRegistry:
         Blocks the calling thread for the whole drain and lag wait, up to
         ``drainTimeoutSecs`` + ``lagWaitTimeoutSecs``. From async code, run
         it off the event loop:
-        ``await asyncio.to_thread(registry.reset_failover_group, uuid)``.
+        ``await asyncio.to_thread(registry.trigger_failback, uuid)``.
+
+        Its former name, ``reset_failover_group``, dates from when it reset
+        both statuses to HEALTHY with no drain; that name stays as an alias.
         """
         from .drain import trigger_drain
         from .health import HealthResult
@@ -2071,7 +2075,7 @@ class ClusterRegistry:
             if group.dispatch_paused or group.drain_in_progress:
                 logger.warning(
                     "operator failback not started: a drain is in flight "
-                    "(primary_uuid=%s); call reset_failover_group again "
+                    "(primary_uuid=%s); call trigger_failback again "
                     "once it has finished", primary_uuid,
                 )
                 return False
@@ -2091,6 +2095,11 @@ class ClusterRegistry:
             with group.lock:
                 group.drain_in_progress = False
         return True
+
+    def reset_failover_group(self, primary_uuid: str) -> bool:
+        """Former name of :meth:`trigger_failback`, kept so existing
+        callers keep working. Same behaviour and return value."""
+        return self.trigger_failback(primary_uuid)
 
     def get_failover_status(
         self, primary_uuid: str

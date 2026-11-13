@@ -348,7 +348,7 @@ after a switch:
 With ``yb.failover.autoFailbackEnabled=false``, the driver stays on the
 secondary after the primary recovers, until you fail back yourself. A
 manual failback is triggered from application code: call
-``reset_failover_group`` on the driver's registry, for example from an
+``trigger_failback`` on the driver's registry, for example from an
 admin endpoint or a maintenance script that runs in the application
 process. It runs the same drain and replication-lag wait as an automatic
 failback, and blocks until they finish:
@@ -358,12 +358,12 @@ failback, and blocks until they finish:
     from psycopg.yb.registry import ClusterRegistry
 
     registry = ClusterRegistry.instance()
-    registry.reset_failover_group(group.primary.uuid)
+    registry.trigger_failback(group.primary.uuid)
 
     # (primary status, secondary status, last change times)
     print(registry.get_failover_status(group.primary.uuid))
 
-``reset_failover_group`` only fails back; it never moves connections from
+``trigger_failback`` only fails back; it never moves connections from
 the primary to the secondary. It marks the primary healthy, overriding
 its circuit breaker:
 
