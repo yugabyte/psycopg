@@ -3,6 +3,11 @@ YugabyteDB Psycopg 3: Database adapter for Python
 
 Psycopg 3 is a modern implementation of a PostgreSQL adapter for Python.
 This is the YugabyteDB smart-driver fork, distributed as ``psycopg-yugabytedb``.
+It adds two features on top of psycopg 3: cluster-aware **load balancing**
+and **xCluster failover** between two `YugabyteDB`_ universes. The import
+name stays ``psycopg``, so existing code is unchanged.
+
+.. _YugabyteDB: https://www.yugabyte.com/
 
 This distribution contains the pure Python package ``psycopg``.
 
@@ -18,17 +23,56 @@ This distribution contains the pure Python package ``psycopg``.
     .. _psycopg2: https://pypi.org/project/psycopg2/
 
 
-YugabyteDB smart driver
------------------------
 
-This fork (distribution name ``psycopg-yugabytedb``) extends psycopg 3 with
-cluster-aware and topology-aware connection load balancing for `YugabyteDB`_.
-The import name stays ``psycopg`` — existing code is unchanged. Adding
-``load_balance_hosts=true`` to the conninfo string opts into the smart driver.
 
-.. _YugabyteDB: https://www.yugabyte.com/
+Installation
+------------
 
-Opt in with one parameter:
+.. code-block:: bash
+
+    pip install psycopg-yugabytedb              # pure Python, uses the system libpq
+    pip install "psycopg-yugabytedb[pool]"      # adds the upstream psycopg-pool
+    pip install "psycopg-yugabytedb[c]"         # adds the C speedups, built from source
+    pip install psycopg-yugabytedb==3.3.4.2     # pin a release
+
+``psycopg-yugabytedb`` needs the ``libpq`` client library on the system
+(``apt install libpq5``, ``brew install libpq``). The ``[c]`` extra
+compiles against it, so it also needs a C compiler and the ``libpq``
+headers; see `Local installation`__ in the psycopg docs. There is no
+``[binary]`` package for this fork yet.
+
+.. __: https://www.psycopg.org/psycopg3/docs/basic/install.html#local-installation
+
+The fork can't be installed next to upstream ``psycopg`` in the same
+environment: both install into ``site-packages/psycopg/``. The ``[pool]``
+extra pulls the unmodified upstream ``psycopg-pool``; its ``import psycopg``
+resolves to this driver, so pooled connections get the same behaviour.
+
+
+Load balancing
+--------------
+
+The driver can spread connections across the tservers of a YugabyteDB
+cluster in two ways:
+
+* **Cluster-aware**: across every tserver in the cluster.
+* **Topology-aware**: only across tservers in the placements (cloud,
+  region, zone) you list.
+
+Both start the same way. On the first connect the driver asks the cluster
+for its live tservers (``yb_servers()``). After that, each new connection
+goes to the eligible tserver with the fewest connections from this process
+(ties broken at random). One reachable host in ``host=`` is enough; the
+rest are discovered, and the list is refreshed every
+``yb_servers_refresh_interval`` seconds.
+
+``psycopg-pool`` works unchanged with either: the pool's connections go
+through the same load balancer.
+
+Cluster-aware load balancing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Add ``load_balance_hosts=true`` to the connection string:
 
 .. code-block:: python
 
@@ -39,12 +83,30 @@ Opt in with one parameter:
         "load_balance_hosts=true"
     )
 
-The driver discovers every live tserver via ``yb_servers()`` on the first
-connect, then distributes subsequent connects across them with a least-loaded
-picker (random tie-break, atomic under a per-cluster lock). One contact point
-in ``host=…`` is enough to bootstrap; the rest of the cluster is discovered.
+Connections go to every live tserver in the cluster.
 
-Smart-driver conninfo parameters:
+Topology-aware load balancing
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Add ``topology_keys`` as well, to keep connections in one or more zones or
+regions, for example the ones closest to the application:
+
+.. code-block:: python
+
+    conn = psycopg.connect(
+        "host=h1,h2,h3 port=5433 user=yugabyte dbname=yugabyte "
+        "load_balance_hosts=true "
+        "topology_keys=cloud1.datacenter1.zoneA"
+    )
+
+Each key is ``cloud.region.zone``. Use ``*`` for the zone to allow every
+zone in a region (``cloud1.datacenter1.*``), and separate several keys
+with commas (``cloud1.datacenter1.zoneA,cloud1.datacenter1.zoneB``).
+Connections only go to tservers that match a key. If none of them are
+reachable, connecting fails; the driver doesn't fall back to the rest of
+the cluster.
+
+Load-balancing parameters:
 
 .. list-table::
    :header-rows: 1
@@ -58,82 +120,233 @@ Smart-driver conninfo parameters:
      - ``true`` / ``false`` /
        ``disable`` / ``random``
      - absent
-     - ``true`` enables the smart driver. ``false`` is equivalent to libpq's
-       ``disable``. ``disable`` / ``random`` pass through to libpq unchanged.
+     - ``true`` enables the smart driver. ``false`` is the same as libpq's
+       ``disable``. ``disable`` and ``random`` pass through to libpq
+       unchanged.
    * - ``topology_keys``
      - ``cloud.region.zone``
        (comma-separated for
        multiple keys)
      - none
-     - Restrict picks to tservers matching at least one placement. Zone may
-       be ``*`` for any zone in that cloud/region. Cloud / region wildcards
-       are rejected. Strict in v1 — no cluster-wide fallback if all
-       matching nodes are down.
+     - Only connect to tservers in one of these placements. The zone may
+       be ``*`` for any zone in that cloud and region; wildcards for the
+       cloud or region are rejected. There is no fallback to the rest of
+       the cluster if every matching node is down.
    * - ``yb_servers_refresh_interval``
      - seconds (integer)
      - ``300``
-     - How often to re-query ``yb_servers()``. Clamped to ``[0, 600]``.
+     - How often to re-read ``yb_servers()``. Clamped to ``[0, 600]``.
+       With xCluster failover this is also how often the health checks
+       run (see below).
    * - ``failed_host_reconnect_delay_secs``
      - seconds (integer)
      - ``5``
-     - How long to quarantine a node after a failed connect, before
-       reconsidering it. Clamped to ``[0, 60]``.
+     - How long to skip a node after a failed connect. Clamped to
+       ``[0, 60]``.
 
-Topology-aware example — bind traffic to one zone:
+
+xCluster failover
+-----------------
+
+xCluster failover lets an application keep running when a YugabyteDB
+universe becomes unavailable. It is meant for two universes that already
+replicate to each other with xCluster: a **primary** universe that the
+application normally uses, and a **secondary** universe.
+
+* **Failover.** When the primary becomes unavailable, the driver sends
+  new connections to the secondary.
+* **Failback.** When the primary is available again, the driver moves
+  connections back to it.
+
+The driver doesn't decide by itself whether a universe is available. The
+application provides a **circuit breaker** for each universe: an object
+that reports whether that universe is healthy, based on whatever signal
+the application trusts (a probe query, a monitoring system, an operator).
+The driver checks both circuit breakers periodically in the background.
+
+The two universes, their circuit breakers and the current routing state
+together make up a **failover group**. A process has one failover group
+for each connection target (the primary hosts, port, database and user).
+Every connection opened with that target belongs to the group, so they
+all switch universes together.
+
+A switch from one universe to the other happens in two phases:
+
+* **Drain.** The driver stops opening new connections and gives the
+  transactions already running on the current universe time to finish.
+  Connections that are still open when the time is up are closed, so no
+  more writes reach the universe being left.
+* **Replication-lag wait.** If YugabyteDB Anywhere (YBA) is configured,
+  the driver checks the xCluster replication lag and waits until the
+  other universe has received the writes made before the drain. Without
+  YBA, this phase is skipped.
+
+New connections then go to the other universe. If the replication-lag
+wait runs out of time, a failover goes ahead anyway, since the primary is
+unavailable. A failback is postponed and tried again after a cooldown, so
+the application isn't moved back to a primary that is still missing
+recent writes.
+
+If both universes are unhealthy, new connections fail with
+``NoViableClusterError``. Each Python process tracks the universes on its
+own, so the workers of a multi-process application switch independently.
+A worker forked after the group was created (for example by a pre-fork
+server such as gunicorn) gets its own copy of the group, with its own
+background health checks.
+
+Usage
+~~~~~
+
+These connection parameters enable xCluster failover and control its
+main behaviour:
+
+* ``host`` - the hosts of the **primary** universe, as for any
+  connection. One reachable host is enough; the rest are discovered.
+* ``load_balance_hosts=true`` - required; xCluster failover is part of
+  the smart driver.
+* ``yb.failover.secondaryClusterHosts`` - comma-separated hosts of the
+  **secondary** universe. Setting it turns on xCluster failover.
+* ``yb_servers_refresh_interval`` - how often, in seconds, the circuit
+  breakers are checked (default ``300``). Set it to a few seconds for
+  timely detection.
+* ``yb.failover.drainTimeoutSecs`` - how long running transactions get to
+  finish during the drain (default ``10``). ``-1`` waits for all of them;
+  ``0`` closes connections immediately.
+* ``yb.failover.lagWaitTimeoutSecs`` - how long the replication-lag wait
+  may take (default ``30``).
+* ``yb.failover.globalTimeBudgetSecs`` - an upper limit on the whole
+  switch (unset by default). When set, it is split between the drain
+  (40%) and the replication-lag wait (60%), unless those are set
+  explicitly.
+
+For example, an application whose primary universe has the nodes ``a1``,
+``a2`` and ``a3`` and whose secondary has ``b1``, ``b2`` and ``b3``:
 
 .. code-block:: python
 
-    conn = psycopg.connect(
-        "host=h1,h2,h3 port=5433 user=yugabyte dbname=yugabyte "
+    DSN = (
+        "host=a1,a2,a3 port=5433 user=yugabyte dbname=yugabyte "
         "load_balance_hosts=true "
-        "topology_keys=cloud1.datacenter1.zoneA"
+        "yb.failover.secondaryClusterHosts=b1,b2,b3 "
+        "yb_servers_refresh_interval=5 "
+        "yb.failover.drainTimeoutSecs=10 "
+        "options='-c statement_timeout=10000'"
     )
 
-The upstream ``psycopg-pool`` connection pool works unchanged with the smart
-driver — the dispatcher sits underneath the pool, so pool-managed connections
-honour the configured policy too. Install it via the ``[pool]`` extra:
+With these settings the circuit breakers are checked every 5 seconds,
+and running transactions get up to 10 seconds to finish before a switch.
+The ``statement_timeout`` keeps queries within the drain window (see
+`statement_timeout`_ below).
 
-.. code-block:: bash
+To enable the replication-lag wait, add the YBA endpoint and API token,
+and the names of the two xCluster replication configs in YBA: the one
+from the primary to the secondary (used on failover) and the one from the
+secondary to the primary (used on failback):
 
-    pip install "psycopg-yugabytedb[pool]"
+.. code-block:: python
 
-That pulls our driver plus the unmodified upstream ``psycopg-pool``; the
-pool's ``import psycopg`` resolves to our driver and every conn the pool
-opens goes through the dispatcher.
+    DSN += (
+        " yb.failover.ybaEndpoint=https://yba.example.com"
+        " yb.failover.ybaApiToken=<YBA API token>"
+        " yb.failover.replicationName=primary-to-secondary"
+        " yb.failback.replicationName=secondary-to-primary"
+        " yb.failover.lagWaitTimeoutSecs=30"
+    )
 
-Install without the ``[pool]`` extra with ``pip install psycopg-yugabytedb``,
-or pin to a specific version (``3.3.4.1`` is the first GA release). The fork
-cannot coexist with upstream ``psycopg`` in the same environment — both
-install into ``site-packages/psycopg/``.
+Instead of setting the drain and lag-wait timeouts separately, you can set
+one limit for the whole switch. ``yb.failover.globalTimeBudgetSecs=60``
+gives a 24-second drain and a 36-second replication-lag wait.
 
-xCluster failover
-~~~~~~~~~~~~~~~~~
+Next, create the failover group with ``bootstrap_failover_group(DSN)``
+(``abootstrap_failover_group`` in asyncio applications). Call it once
+when the application starts: it connects to both universes, discovers
+their nodes, starts the background health checks, and returns the group.
+Then attach a circuit breaker for each universe to the group before
+opening the first connection; connecting without them raises
+``MissingCircuitBreakerError``. Later ``psycopg.connect(DSN)`` calls, and
+pools created with the same DSN, use this group.
 
-The driver can be configured with a secondary YugabyteDB cluster to fail
-over to when the primary becomes unusable. Opt-in is gated on BOTH
-``load_balance_hosts=true`` AND a non-empty
-``yb.failover.secondaryClusterHosts`` — when those conditions hold, the
-driver eagerly bootstraps both clusters, starts one background probe
-thread per cluster, and routes new connections through whichever cluster
-the dual-CB state machine picks. ``psycopg-pool``'s ``check=`` callback
-evicts stale connections on failover via the bundled ``xcluster_check``
-helper.
+.. code-block:: python
 
-Architecture at a glance:
+    import psycopg
+    from psycopg.yb import bootstrap_failover_group
+    from psycopg.yb.health import HealthResult
 
-* Two ``CircuitBreaker`` instances per ``FailoverGroup`` — one per
-  cluster. Each is polled independently by its own probe thread.
-* State machine: primary HEALTHY → serve primary; primary UNHEALTHY +
-  secondary HEALTHY → serve secondary; both UNHEALTHY → raise
-  ``NoViableClusterError``.
-* On a routing transition, the driver runs a **barrier-with-timeout
-  drain**: new connects are paused, in-flight transactions on the
-  outgoing cluster get up to ``drainTimeoutSecs`` to commit or abort,
-  survivors are force-closed at the deadline, then dispatch resumes
-  against the new active cluster.
+    class MyCircuitBreaker:
+        def __init__(self, which_cluster):
+            self.which_cluster = which_cluster   # "primary" or "secondary"
 
-Configuration (libpq conninfo keys; ``.``, ``_``, and ``-`` are all
-accepted as separators between tokens):
+        def check(self, group):
+            # Ask your monitoring whether this universe is usable.
+            if universe_is_down(self.which_cluster):
+                return HealthResult.UNHEALTHY
+            return HealthResult.HEALTHY
+
+    group = bootstrap_failover_group(DSN)
+    group.primary_circuit_breaker = MyCircuitBreaker("primary")
+    group.secondary_circuit_breaker = MyCircuitBreaker("secondary")
+
+    conn = psycopg.connect(DSN)
+
+A second connection string for the same target must use the same
+failover settings; if it doesn't, ``bootstrap_failover_group`` raises
+``ConflictingFailoverConfigError`` naming the settings that differ. Use a
+separate circuit breaker instance for each universe. A ``check()``
+call that takes longer than ``yb.failover.checkTimeoutSecs`` is ignored
+and the previous status is kept.
+
+Ready-made circuit breakers are in ``demo/samples/`` in this repository.
+They aren't part of the installed package; copy the one you want.
+
+* ``TrackerTableCircuitBreaker`` - reads a small table spread over every
+  tablet server and reports ``UNHEALTHY`` when it can't.
+* ``ExternalSignalCircuitBreaker`` - an operator inserts a row into a
+  ``yb_failover_signals`` table to fail over or fail back on demand.
+* ``HealthAndLagCircuitBreaker`` - a health check combined with a YBA
+  lag check, for setups that don't configure the driver's own
+  replication-lag wait.
+
+With ``psycopg-pool``, pass ``xcluster_check`` so the pool drops
+connections to the old universe after a switch:
+
+.. code-block:: python
+
+    from psycopg.yb.pool import xcluster_check   # xcluster_check_async for AsyncConnectionPool
+    from psycopg_pool import ConnectionPool
+
+    pool = ConnectionPool(DSN, check=xcluster_check, min_size=4, max_size=20)
+
+With ``yb.failover.autoFailbackEnabled=false``, the driver stays on the
+secondary after the primary recovers, until you fail back yourself. The
+manual failback runs the same drain and replication-lag wait as an
+automatic one, and blocks until they finish:
+
+.. code-block:: python
+
+    from psycopg.yb.registry import ClusterRegistry
+
+    registry = ClusterRegistry.instance()
+    registry.reset_failover_group(group.primary.uuid)
+
+    # (primary status, secondary status, last change times)
+    print(registry.get_failover_status(group.primary.uuid))
+
+``reset_failover_group`` returns ``False`` if a switch is already in
+progress; call it again once that has finished. Like an automatic
+failback, it is postponed if the replication-lag wait runs out of time.
+
+All other parameters are listed below.
+
+Other connection parameters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All options go in the connection string. ``.``, ``_`` and ``-`` are all
+accepted between words (``yb.failover.drainTimeoutSecs``,
+``yb_failover_drain_timeout_secs``). The ``yb.failback.*`` options apply to
+the failback direction; each one you leave out uses the matching
+``yb.failover.*`` value, except ``yb.failback.replicationName``.
+
+General:
 
 .. list-table::
    :header-rows: 1
@@ -144,162 +357,156 @@ accepted as separators between tokens):
      - Description
    * - ``yb.failover.secondaryClusterHosts``
      - (empty)
-     - Comma-separated secondary-cluster host list. One host is enough —
-       the rest of the cluster is discovered via ``yb_servers()``.
-       Setting this is the opt-in trigger for xCluster failover.
-   * - ``yb.failover.cooldownSecs``
-     - ``1500``
-     - Minimum interval between status transitions in either direction
-       on a single CB. Prevents rapid ping-pong when a cluster flaps.
+     - Comma-separated hosts of the secondary universe. One is enough;
+       the rest are discovered. Setting this (with
+       ``load_balance_hosts=true``) turns on xCluster failover.
+   * - ``yb_servers_refresh_interval``
+     - ``300``
+     - Seconds between circuit-breaker checks (and ``yb_servers()``
+       refreshes). Lower it, e.g. to ``5``, for faster detection.
+       The checks run at most once a second.
    * - ``yb.failover.checkTimeoutSecs``
      - ``max(1, refresh/2)``
-     - Wall-clock cap on each ``CircuitBreaker.check()`` call. Ticks
-       that exceed the cap are abandoned; the previous status is
-       preserved. Prevents a blocking custom CB from stalling failover.
+     - Time limit for one ``check()`` call. A check that runs longer is
+       ignored and the previous status is kept.
+   * - ``yb.failover.cooldownSecs``
+     - ``1500``
+     - Minimum time between two status changes of the same circuit
+       breaker, so a flapping universe doesn't switch back and forth.
+       This also delays a failback after a failover.
+   * - ``yb.failover.autoFailbackEnabled``
+     - ``true``
+     - ``false`` = stay on the secondary when the primary recovers, until
+       an operator fails back. While the secondary is down, the driver
+       fails back to a healthy primary anyway.
+
+Drain:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 15 47
+
+   * - Parameter
+     - Default
+     - Description
    * - ``yb.failover.drainTimeoutSecs``
      - ``10``
-     - Barrier-with-timeout drain behaviour. Sentinel values:
-       ``-1`` = wait indefinitely, never force-close;
-       ``0`` = force-close in-flight transactions immediately;
-       ``N > 0`` = wait up to N seconds then force-close survivors.
+     - How long transactions on the old universe get to finish before
+       their connections are closed. ``-1`` = wait as long as it takes,
+       never close. ``0`` = close at once.
+   * - ``yb.failover.closeFenceSecs``
+     - ``1``
+     - After the drain closed connections, wait until this many seconds
+       have passed since the last close before switching, so an app that
+       holds session state (such as an advisory lock) notices the close
+       first. Time spent in the lag check counts towards it. ``0`` turns
+       it off.
+   * - ``yb.failover.globalTimeBudgetSecs``
+     - (unset)
+     - Upper limit on a switch, from detection to the new universe.
+       Splits into drain (40%) and lag check (60%) unless those are set
+       explicitly; setting them to more than the budget is an error.
+       Two exceptions: a failback under ``onPhase2Timeout=fail`` can run
+       up to ~11 s over while it waits for YBA's next sample (logged as
+       a WARNING), and ``closeFenceSecs`` isn't counted.
+   * - ``yb.failback.drainTimeoutSecs``
+     - failover value
+     - Drain timeout for failbacks.
+   * - ``yb.failback.globalTimeBudgetSecs``
+     - failover value
+     - Time budget for failbacks.
+
+Replication-lag check (YBA):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 15 47
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``yb.failover.ybaEndpoint``
+     - (empty)
+     - YBA base URL, e.g. ``https://yba.example.com``. The lag check runs
+       only when this, ``ybaApiToken`` and ``replicationName`` are all
+       set.
+   * - ``yb.failover.ybaApiToken``
+     - (empty)
+     - YBA API token.
+   * - ``yb.failover.replicationName``
+     - (empty)
+     - Name of the A→B xCluster replication config in YBA.
+   * - ``yb.failback.replicationName``
+     - (empty)
+     - Name of the B→A config. No fallback: if unset, failbacks skip the
+       lag check.
    * - ``yb.failover.ybaVerifySsl``
-     - ``false``
-     - Verify the TLS certificate and hostname of the YBA endpoint used
-       for the replication-lag wait. Off by default because YBA often
-       runs with a self-signed certificate; without verification a
-       man-in-the-middle can capture the YBA API token.
+     - ``true``
+     - Verify YBA's TLS certificate. If verification fails, the lag check
+       is turned off (logged at ERROR): failovers switch without it, and
+       under ``onPhase2Timeout=fail`` failbacks are refused before any
+       connection is drained. Each failback attempt checks the
+       certificate again, so a fixed certificate works without a restart.
    * - ``yb.failover.ybaCaFile``
      - (empty)
-     - Path to a PEM CA bundle to verify the YBA certificate against when
-       ``ybaVerifySsl=true``. Empty uses the system trust store.
+     - CA bundle for a YBA with a self-signed certificate.
+   * - ``yb.failover.thresholdReplicationLagMs``
+     - ``0``
+     - Switch once the lag is at or below this many milliseconds.
+   * - ``yb.failover.lagWaitTimeoutSecs``
+     - ``30``
+     - How long to wait for the lag to reach the threshold. On failover
+       the driver switches anyway when it runs out.
+   * - ``yb.failover.lagFreshnessSecs``
+     - ``0`` (off)
+     - Ignore YBA samples taken less than this many seconds after the
+       drain finished. ``25`` covers the tserver's 15 s metric update plus
+       YBA's 10 s scrape. Raise ``lagWaitTimeoutSecs`` to at least
+       ``lagFreshnessSecs + lagConfirmationSamples × 10``; the driver
+       warns at startup if it's lower.
+   * - ``yb.failover.lagConfirmationSamples``
+     - ``1``
+     - Number of YBA samples, at least 10 s apart, that must show the lag
+       at or below the threshold before switching.
+   * - ``yb.failback.onPhase2Timeout``
+     - ``fail``
+     - What a failback does when the lag check times out or YBA can't be
+       reached. ``fail`` = cancel the failback, stay on the secondary,
+       and retry after ``cooldownSecs``. ``proceed`` = fail back anyway.
+       While the secondary is down, the failback goes ahead regardless.
+       Failover always goes ahead.
+   * - ``yb.failback.thresholdReplicationLagMs``,
+       ``yb.failback.lagWaitTimeoutSecs``,
+       ``yb.failback.lagFreshnessSecs``,
+       ``yb.failback.lagConfirmationSamples``
+     - failover value
+     - The same settings for the failback direction.
 
-Example (application):
+``statement_timeout``
+~~~~~~~~~~~~~~~~~~~~~
 
-.. code-block:: python
-
-    import psycopg
-
-    conn = psycopg.connect(
-        "host=primary1,primary2,primary3 port=5433 user=yugabyte dbname=yugabyte "
-        "load_balance_hosts=true "
-        "yb.failover.secondaryClusterHosts=secondary1,secondary2,secondary3 "
-        "yb.failover.drainTimeoutSecs=10 "
-        # Recommended: bound in-flight queries to the drain window (see below):
-        "options='-c statement_timeout=10000'"
-    )
-
-With ``psycopg-pool``:
-
-.. code-block:: python
-
-    from psycopg.yb.pool import xcluster_check
-    from psycopg_pool import ConnectionPool
-
-    pool = ConnectionPool(
-        "host=primary1,primary2,primary3 load_balance_hosts=true "
-        "yb.failover.secondaryClusterHosts=secondary1,secondary2,secondary3 "
-        "yb.failover.drainTimeoutSecs=10 options='-c statement_timeout=10000'",
-        check=xcluster_check,
-        min_size=4, max_size=20,
-    )
-
-Pluggable circuit breaker
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Health signals enter the driver through a ``CircuitBreaker`` object —
-any class with ``check(group) -> HealthResult`` satisfies the contract.
-**The driver ships no default.** After bootstrap you MUST attach an
-implementation to BOTH ``group.primary_circuit_breaker`` and
-``group.secondary_circuit_breaker`` before opening any connection —
-``psycopg.connect(...)`` raises ``MissingCircuitBreakerError``
-otherwise.
-
-.. code-block:: python
-
-    from psycopg.yb import bootstrap_failover_group
-    from demo.samples.tracker_table_cb import TrackerTableCircuitBreaker
-
-    group = bootstrap_failover_group(dsn)
-    group.primary_circuit_breaker   = TrackerTableCircuitBreaker(which_cluster="primary")
-    group.secondary_circuit_breaker = TrackerTableCircuitBreaker(which_cluster="secondary")
-
-Reference implementations under ``demo/samples/``:
-
-* ``TrackerTableCircuitBreaker`` — UPDATE-based probe over
-  ``yb_cluster_health_tracker``. Tablet-splits the table so the UPDATE
-  touches every leader, catching partial-cluster failures.
-* ``ExternalSignalCircuitBreaker`` — reads ``target_status`` from a
-  well-known signal table. Operator writes a row to trigger a manual
-  failover / failback:
-
-  .. code-block:: sql
-
-      INSERT INTO yb_failover_signals (group_id, which_cluster, target_status, reason)
-      VALUES ('<primary-uuid>', 'primary', 'UNHEALTHY', 'planned maintenance');
-
-  ``which_cluster`` (``'primary'`` or ``'secondary'``) defaults to
-  ``'primary'``. Each CB reads the table through its own cluster's
-  control connection and only the rows for its own slot, so the table
-  can live in a database that xCluster replicates.
-
-Ships in ``psycopg.yb.circuit_breaker``:
-
-* ``CircuitBreaker`` — the Protocol every CB implements.
-* ``AlwaysHealthyCircuitBreaker`` — inert; for tests only.
-
-Manual failover from Python (test / migration):
-
-.. code-block:: python
-
-    from psycopg.yb.health import HealthResult
-    from psycopg.yb.registry import ClusterRegistry
-
-    group = ClusterRegistry.instance().get_failover_group(primary_uuid)
-    group.force_primary_status(HealthResult.UNHEALTHY)   # → serve secondary
-    # ...
-    ClusterRegistry.instance().reset_failover_group(primary_uuid)  # failback
-
-Server ``statement_timeout`` coordination
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-YugabyteDB does not cancel a running query when its client socket
-closes (see `yugabyte-db#28983
-<https://github.com/yugabyte/yugabyte-db/issues/28983>`_ and
-`#29379 <https://github.com/yugabyte/yugabyte-db/issues/29379>`_). For
-the drain's force-close to actually stop server-side execution, the
-server-side ``statement_timeout`` must be no larger than the drain
-window. Otherwise a session force-closed by the driver can still commit
-its in-flight work AFTER the driver has flipped the dispatcher —
-replicated to the other cluster by xCluster, that's a silent dual-write.
-
-The driver **does not modify** ``statement_timeout``. It reads the GUC
-once at bootstrap and emits a WARNING at ``psycopg.yb`` if it's
-unbounded (``0``) or larger than ``drainTimeoutSecs``. Set it at the
-DSN (``options='-c statement_timeout=<ms>'``) or role level.
-
-Per-process semantics
-^^^^^^^^^^^^^^^^^^^^^
-
-Each Python process maintains its own ``ClusterRegistry`` and therefore
-its own xCluster status flags. In a multi-worker deployment (gunicorn,
-``ProcessPoolExecutor``, Celery), workers independently observe failures
-and independently decide to fail over. Brief divergence during the
-detection window is expected and accepted for v1.
+YugabyteDB doesn't cancel a running query when its client connection is
+closed (`yugabyte-db#28983
+<https://github.com/yugabyte/yugabyte-db/issues/28983>`_, `#29379
+<https://github.com/yugabyte/yugabyte-db/issues/29379>`_). For the drain
+to actually stop work on the old universe, set the server's
+``statement_timeout`` no higher than ``drainTimeoutSecs``, in the
+connection string (``options='-c statement_timeout=<ms>'``) or on the
+role. The driver doesn't change it; it logs a WARNING at startup if it is
+unset (``0``) or larger than the drain timeout.
 
 Logging
-~~~~~~~
+-------
 
-Every smart-driver module logs to its own logger under ``psycopg.yb.*``.
-Levels follow the standard library, plus a custom ``TRACE`` level (numeric
-5, finer than ``DEBUG``) for counter-mutation-level firehose detail.
+Every smart-driver module logs under ``psycopg.yb.*``, with the standard
+levels plus ``TRACE`` (5, below ``DEBUG``):
 
-* ``WARNING`` — driver gave up (no eligible nodes, control conn re-open failed)
-* ``INFO`` — cluster bootstrap, topology change observed, host quarantined,
-  control conn re-opened on a survivor
-* ``DEBUG`` — per-pick, per-refresh, per-control-conn open/close
-* ``TRACE`` — every counter increment / decrement, every filtered candidate
-
-Enable:
+* ``WARNING``: the driver gave up on something (no eligible nodes, a
+  control connection couldn't reopen)
+* ``INFO``: cluster bootstrap, topology changes, quarantined hosts,
+  failover and failback steps
+* ``DEBUG``: each pick, refresh and control-connection open or close
+* ``TRACE``: every connection-counter change and filtered candidate
 
 .. code-block:: python
 
@@ -307,32 +514,8 @@ Enable:
     from psycopg.yb import TRACE
 
     logging.basicConfig(level=logging.INFO)
-
-    # Lifecycle events only (default INFO above is fine):
-    logging.getLogger("psycopg.yb").setLevel(logging.INFO)
-
-    # Per-operation debug:
-    logging.getLogger("psycopg.yb").setLevel(logging.DEBUG)
-
-    # Full firehose:
-    logging.getLogger("psycopg.yb").setLevel(TRACE)
-
-    # Or narrow to one subsystem:
-    logging.getLogger("psycopg.yb.policy").setLevel(logging.DEBUG)
-
-
-Installation
-------------
-
-In short, run the following::
-
-    pip install --upgrade pip           # to upgrade pip
-    pip install "psycopg[binary,pool]"  # to install package and dependencies
-
-If something goes wrong, and for more information about installation, please
-check out the `Installation documentation`__.
-
-.. __: https://www.psycopg.org/psycopg3/docs/basic/install.html#
+    logging.getLogger("psycopg.yb").setLevel(logging.DEBUG)   # or TRACE
+    logging.getLogger("psycopg.yb.policy").setLevel(logging.DEBUG)  # one module
 
 
 Hacking
@@ -340,7 +523,7 @@ Hacking
 
 For development information check out `the project readme`__.
 
-.. __: https://github.com/psycopg/psycopg#readme
+.. __: https://github.com/yugabyte/psycopg#readme
 
 
 Copyright (C) 2020 The Psycopg Team
