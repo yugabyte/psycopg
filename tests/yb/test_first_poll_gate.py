@@ -273,3 +273,83 @@ def test_wait_for_first_check_no_probes_returns_true(fake_state):
     group = _make_group(fake_state)
     # primary_probe / secondary_probe both None by default.
     assert group.wait_for_first_check() is True
+
+
+# --------------------------------------------- DB-25738: verdict applied
+
+
+def _probes(group):
+    group.primary_probe = HealthProbe(
+        group, interval_s=999, which_cluster="primary", check_timeout_s=1.0,
+    )
+    group.secondary_probe = HealthProbe(
+        group, interval_s=999, which_cluster="secondary", check_timeout_s=1.0,
+    )
+    group.primary_probe.start()
+    group.secondary_probe.start()
+
+
+def _stop(group):
+    group.primary_probe.stop()
+    group.secondary_probe.stop()
+
+
+def _cbs(monkeypatch, primary, secondary):
+    import psycopg.yb.health_probe as hp_mod
+    monkeypatch.setattr(hp_mod, "check_primary_cluster", lambda g: primary)
+    monkeypatch.setattr(hp_mod, "check_secondary_cluster", lambda g: secondary)
+
+
+def test_first_unhealthy_verdict_routes_first_connect(fake_state, monkeypatch):
+    """DB-25738: a reachable primary whose CB says UNHEALTHY. Once
+    wait_for_first_check returns, routing is on the secondary, with no
+    drain and no cooldown started."""
+    from psycopg.yb.state import active_cluster
+
+    _cbs(monkeypatch, HealthResult.UNHEALTHY, HealthResult.HEALTHY)
+    group = _make_group(fake_state, cooldown_s=60)
+    generation = group.barrier_generation
+    _probes(group)
+    try:
+        assert group.wait_for_first_check(timeout_s=3.0) is True
+        assert group.primary_status == HealthResult.UNHEALTHY
+        assert active_cluster(group) == "secondary"
+        assert group.barrier_generation == generation      # no drain
+        assert group.primary_last_transition_time == 0.0   # no cooldown
+    finally:
+        _stop(group)
+
+
+def test_first_verdict_not_applied_when_conns_exist(fake_state, monkeypatch):
+    """Conns already on the primary need a drain: leave the verdict to
+    the daemon tick."""
+    _cbs(monkeypatch, HealthResult.UNHEALTHY, HealthResult.HEALTHY)
+    group = _make_group(fake_state)
+
+    class _Conn:
+        pass
+
+    conn = _Conn()
+    group.primary.tracked_conns.add(conn)
+    _probes(group)
+    try:
+        assert group.wait_for_first_check(timeout_s=3.0) is True
+        assert group.primary_status == HealthResult.HEALTHY
+    finally:
+        _stop(group)
+
+
+def test_first_healthy_verdict_does_not_revive_unreachable_side(
+    fake_state, monkeypatch
+):
+    """A side unreachable at bootstrap (UNHEALTHY placeholder) stays
+    UNHEALTHY until the daemon tick reconnects it."""
+    _cbs(monkeypatch, HealthResult.HEALTHY, HealthResult.HEALTHY)
+    group = _make_group(fake_state)
+    group.primary_status = HealthResult.UNHEALTHY
+    _probes(group)
+    try:
+        assert group.wait_for_first_check(timeout_s=3.0) is True
+        assert group.primary_status == HealthResult.UNHEALTHY
+    finally:
+        _stop(group)

@@ -901,8 +901,10 @@ class FailoverGroup:
         on the caller's thread, so the outer ``timeout_s`` is now a
         real bound; previously a bootstrap-time first check could
         trigger a Phase 2 lag wait of up to ``lag_wait_timeout_s``
-        inside this call. The daemon's next natural tick applies any
-        differing verdict normally. If ``timeout_s`` is provided, this
+        inside this call. An UNHEALTHY verdict for a side with no conns
+        yet is applied before this returns, so the first connects route
+        on it (DB-25738); any other change is applied by the daemon's next
+        natural tick, with the normal drain. If ``timeout_s`` is provided, this
         call gives up after that many seconds and returns ``False``
         (individual probes may still complete afterwards). Returns
         ``True`` only when every probe's first check completed with a
