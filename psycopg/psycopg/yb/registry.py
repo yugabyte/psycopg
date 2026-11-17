@@ -19,6 +19,7 @@ adaptations for Python:
 
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import time
@@ -32,6 +33,34 @@ from .node import NodeInfo
 from ..errors import OperationalError as _PsycopgOperationalError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(eq=False)
+class ConnLease:
+    """A smart-driver connection's claim on one unit of its host's
+    ``connection_count``. ``released`` makes the release at-most-once
+    across ``close()``, the drain, the pool check and garbage collection.
+    Kept apart from the connection so the GC finalizer can read it after
+    the connection is gone (DB-25800)."""
+
+    uuid: str
+    host: str
+    released: bool = False
+
+
+# DB-25800: leases of connections garbage-collected without ``close()``
+# (psycopg_pool drops a conn the server broke without closing it). The
+# finalizer runs during GC, possibly on a thread that already holds the
+# (non-reentrant) ``state.lock``, so it only appends here — deque.append
+# is atomic and takes no lock. ``ClusterRegistry.apply_gc_releases``
+# releases them under the lock at the start of the next smart connect,
+# the only place the counts are read.
+_gc_released: "collections.deque[ConnLease]" = collections.deque()
+
+
+def _on_conn_gc(lease: ConnLease) -> None:
+    if not lease.released:
+        _gc_released.append(lease)
 
 # Prune a host after this many consecutive refreshes in which `yb_servers()`
 # does not list it. One refresh (per `refresh_interval_s`, default 300s) is
@@ -423,6 +452,9 @@ def _after_fork_in_child() -> None:
     # the child yet.
     ClusterRegistry._instance_lock = threading.Lock()
     health_probe._STARTUP_NOTICE_LOCK = threading.Lock()
+    # Pending GC releases are the parent's connections, counted in the
+    # parent's counters (DB-25800).
+    _gc_released.clear()
     inst = ClusterRegistry._instance
     if inst is None:
         return
@@ -869,8 +901,10 @@ class FailoverGroup:
         on the caller's thread, so the outer ``timeout_s`` is now a
         real bound; previously a bootstrap-time first check could
         trigger a Phase 2 lag wait of up to ``lag_wait_timeout_s``
-        inside this call. The daemon's next natural tick applies any
-        differing verdict normally. If ``timeout_s`` is provided, this
+        inside this call. An UNHEALTHY verdict for a side with no conns
+        yet is applied before this returns, so the first connects route
+        on it (DB-25738); any other change is applied by the daemon's next
+        natural tick, with the normal drain. If ``timeout_s`` is provided, this
         call gives up after that many seconds and returns ``False``
         (individual probes may still complete afterwards). Returns
         ``True`` only when every probe's first check completed with a
@@ -976,6 +1010,18 @@ class FailoverGroup:
         # Per-cluster: fresh lock, dropped sockets, dropped WeakSet.
         for state in (self.primary, self.secondary):
             state.lock = threading.Lock()
+            # DB-26384: the counts below are zeroed, so the conns opened
+            # before the fork no longer hold one here. Mark them released,
+            # or a child that closes one (or lets it be collected) would
+            # decrement a count it never took.
+            for conn in list(state.tracked_conns):
+                lease = getattr(conn, "_yb_lease", None)
+                if isinstance(lease, ConnLease):
+                    lease.released = True
+                try:
+                    conn._yb_released = True
+                except Exception:
+                    pass
             state.tracked_conns = weakref.WeakSet()
             # DROP (don't close) — closing would FIN the socket that is
             # still shared with the parent. Null out the references and
@@ -2055,8 +2101,10 @@ class ClusterRegistry:
         Returns True once the failback has been attempted; like an
         automatic one, it can still be refused under
         ``onPhase2Timeout=fail`` (``get_failover_status`` shows the
-        result). Returns False if no group exists for ``primary_uuid``, or
-        if a drain is already running (call again once it has finished).
+        result). Returns False if no group exists for ``primary_uuid``, if
+        a drain is already running (call again once it has finished), or
+        if this is a forked worker following its parent's group: only the
+        process that created the group can fail it back (DB-26378).
 
         Blocks the calling thread for the whole drain and lag wait, up to
         ``drainTimeoutSecs`` + ``lagWaitTimeoutSecs``. From async code, run
@@ -2070,6 +2118,20 @@ class ClusterRegistry:
         from .health import HealthResult
         group = self.get_failover_group(primary_uuid)
         if group is None:
+            return False
+        # DB-26378: a forked worker follows its parent's statuses. A drain
+        # here would flip only the worker's copy (the status is published
+        # only by the leader), and the follower would undo it within ~20 ms
+        # and close the conns it just opened. Refuse instead of reporting
+        # a failback that never happens.
+        if fork_follow.is_following(group):
+            logger.warning(
+                "operator failback not started: this process (pid=%d) is a "
+                "forked worker following the failover group of pid %d; call "
+                "trigger_failback in the process that created the group "
+                "(primary_uuid=%s)",
+                os.getpid(), group._follow.parent_pid, primary_uuid,
+            )
             return False
         with group.lock:
             if group.dispatch_paused or group.drain_in_progress:
@@ -2555,16 +2617,50 @@ class ClusterRegistry:
                 ni.connection_count = max(0, ni.connection_count - 1)
                 logger.log(TRACE, "decrement: %s → %d", host, ni.connection_count)
 
+    def attach_lease(self, conn: object) -> None:
+        """Give a newly counted conn its :class:`ConnLease` and release the
+        count when the conn is garbage-collected without ``close()``
+        (DB-25800). Call once ``_yb_uuid`` / ``_yb_host`` are set."""
+        lease = ConnLease(conn._yb_uuid, conn._yb_host)  # type: ignore[attr-defined]
+        conn._yb_lease = lease  # type: ignore[attr-defined]
+        fin = weakref.finalize(conn, _on_conn_gc, lease)
+        fin.atexit = False
+
+    def apply_gc_releases(self) -> None:
+        """Release the counts of conns garbage-collected without
+        ``close()`` (see ``_gc_released``). Must not be called with a
+        ``state.lock`` held."""
+        while True:
+            try:
+                lease = _gc_released.popleft()
+            except IndexError:
+                return
+            state = self._clusters.get(lease.uuid)
+            if state is None:
+                continue
+            with state.lock:
+                if lease.released:
+                    continue
+                lease.released = True
+                if (ni := state.nodes.get(lease.host)) is not None:
+                    ni.connection_count = max(0, ni.connection_count - 1)
+                    logger.log(
+                        TRACE, "release (gc): %s → %d",
+                        lease.host, ni.connection_count,
+                    )
+
     def release_conn(self, conn: object) -> None:
         """Release ``conn``'s per-host counter, at most once per conn.
 
         Several close paths can each see the same conn: ``close()``, the
-        drain's direct ``pgconn.finish()`` and the pool's
-        ``xcluster_check`` on the finished conn it later hands out.
-        Review #18: each used to decrement, so the counter drifted low.
-        The ``_yb_released`` flag is checked and set under ``state.lock``,
-        the lock the counter itself uses, so concurrent closers release
-        once. No-op for conns without ``_yb_uuid`` / ``_yb_host``.
+        drain's direct ``pgconn.finish()``, the pool's ``xcluster_check``
+        on the finished conn it later hands out, and garbage collection
+        (DB-25800). Review #18: each used to decrement, so the counter
+        drifted low. The conn's :class:`ConnLease` (or, for a conn without
+        one, its ``_yb_released`` flag) is checked and set under
+        ``state.lock``, the lock the counter itself uses, so concurrent
+        closers release once. No-op for conns without ``_yb_uuid`` /
+        ``_yb_host``.
         """
         uuid = getattr(conn, "_yb_uuid", None)
         host = getattr(conn, "_yb_host", None)
@@ -2573,9 +2669,16 @@ class ClusterRegistry:
         state = self._clusters.get(uuid)
         if state is None:
             return
+        lease = getattr(conn, "_yb_lease", None)
+        if not isinstance(lease, ConnLease):
+            lease = None
         with state.lock:
+            if lease is not None:
+                if lease.released:
+                    return
+                lease.released = True
             # ``is True``: a test double's auto-attribute isn't a release.
-            if getattr(conn, "_yb_released", False) is True:
+            elif getattr(conn, "_yb_released", False) is True:
                 return
             conn._yb_released = True  # type: ignore[attr-defined]
             if (ni := state.nodes.get(host)) is not None:

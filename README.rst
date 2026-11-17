@@ -363,8 +363,9 @@ breaker can't trigger a failover. Call it only when connections are on
 the secondary and the primary is known to be healthy.
 
 Call it in the process that created the group. In a forked worker of a
-pre-fork server it has no effect. It returns ``False`` if a switch is
-already in progress; call it again once that has finished. Otherwise it
+pre-fork server it does nothing, logs a warning, and returns ``False``.
+It also returns ``False`` if a switch is already in progress; call it
+again once that has finished. Otherwise it
 returns ``True`` once the failback has been attempted, even if it was
 postponed; ``get_failover_status`` shows the result.
 

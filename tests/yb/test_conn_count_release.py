@@ -145,3 +145,64 @@ def test_untagged_conn_never_touches_counters(group):
     c.close()
     _release_registry_count(c)
     assert _count(group) == 2
+
+
+# ---------------------------------------------------------- DB-25800 (GC)
+
+
+def _leased(registry, broken=False) -> _SyncConn:
+    c = _SyncConn("S", "s1", broken=broken)
+    registry.attach_lease(c)
+    return c
+
+
+def test_gc_without_close_releases_count(group, fresh_registry):
+    """DB-25800: psycopg_pool drops a conn the server broke without
+    close(); its count is released once the conn is collected."""
+    import gc
+
+    c = _leased(fresh_registry, broken=True)
+    del c
+    gc.collect()
+    assert _count(group) == 2          # applied lazily, not in the finalizer
+    fresh_registry.apply_gc_releases()
+    assert _count(group) == 1
+    fresh_registry.apply_gc_releases()
+    assert _count(group) == 1
+
+
+def test_close_then_gc_releases_once(group, fresh_registry):
+    import gc
+
+    c = _leased(fresh_registry)
+    c.close()
+    assert _count(group) == 1
+    del c
+    gc.collect()
+    fresh_registry.apply_gc_releases()
+    assert _count(group) == 1
+
+
+def test_drain_release_then_gc_releases_once(group, fresh_registry):
+    import gc
+
+    c = _leased(fresh_registry)
+    c.pgconn.finish()                   # the drain finishes it directly
+    _release_registry_count(c)
+    del c
+    gc.collect()
+    fresh_registry.apply_gc_releases()
+    assert _count(group) == 1
+
+
+def test_gc_finalizer_does_not_take_state_lock(group, fresh_registry):
+    """The finalizer can run during GC on a thread that already holds
+    state.lock (non-reentrant): it must only queue the release."""
+    import gc
+
+    c = _leased(fresh_registry, broken=True)
+    with group.secondary.lock:
+        del c
+        gc.collect()                    # would deadlock if it took the lock
+    fresh_registry.apply_gc_releases()
+    assert _count(group) == 1

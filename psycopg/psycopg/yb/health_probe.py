@@ -244,8 +244,10 @@ class HealthProbe:
         ``run_first_check_synchronously`` — the goal there is to seed the
         gate for the first connect, not to fire a full drain on the
         caller's thread while they're still inside
-        ``bootstrap_failover_group`` (agent-K PR #10:284). The next
-        natural daemon tick will apply the verdict normally.
+        ``bootstrap_failover_group`` (agent-K PR #10:284). Instead
+        ``_apply_first_verdict`` applies an UNHEALTHY verdict directly
+        when there is nothing to drain (DB-25738); anything else is left
+        to the next daemon tick.
 
         Enforcement: run the check on a daemon thread and wait for it up
         to the cap. If the check exceeds the cap, we abandon it and log a
@@ -307,20 +309,8 @@ class HealthProbe:
                     # fire a drain inside wait_for_first_check — the
                     # caller is still inside bootstrap_failover_group
                     # and trigger_drain's Phase 2 lag wait would
-                    # dwarf wait_for_first_check's own timeout. Mirror
-                    # ``_maybe_apply``'s "same status, no-op" fast path
-                    # here: when the verdict matches the current
-                    # status (the common bootstrap case) nothing was
-                    # going to fire anyway, so stashing the result for
-                    # the next daemon tick is correct. When they
-                    # differ, the daemon's natural first tick (interval
-                    # later) will apply the verdict normally.
-                    logger.debug(
-                        "%s probe: first-check verdict %s (apply "
-                        "deferred to next daemon tick, primary_uuid=%s)",
-                        self._which, result.value,
-                        self._group.primary.uuid,
-                    )
+                    # dwarf wait_for_first_check's own timeout.
+                    self._apply_first_verdict(result)
                 # Only count a successfully applied verdict as "first
                 # check complete". agent-K PR #9:260: previously the
                 # finally fired the event on skip/timeout paths too,
@@ -350,6 +340,58 @@ class HealthProbe:
                 exc_info=True,
             )
 
+    def _apply_first_verdict(self, result: HealthResult) -> None:
+        """DB-25738: apply the first CB verdict from
+        ``wait_for_first_check`` without a drain, so the first connects
+        route on it instead of on the connectability default for a whole
+        refresh interval.
+
+        Applied only when no drain is needed and nothing can undo it:
+
+        * HEALTHY → UNHEALTHY only. A side that was unreachable at
+          bootstrap is a placeholder with no nodes; the daemon tick
+          reconnects it and applies HEALTHY with the normal semantics.
+        * No conns tracked on this side yet. If the app connected before
+          calling ``wait_for_first_check``, the daemon tick drains them.
+        * Not in a forked worker following its parent: its statuses are
+          the parent's.
+
+        ``last_transition_time`` is left alone, so no cooldown starts.
+        Otherwise the verdict waits for the next daemon tick, as before.
+        """
+        from . import fork_follow
+
+        group = self._group
+        status_attr = f"{self._which}_status"
+        state = group.primary if self._which == "primary" else group.secondary
+        applied = False
+        if not fork_follow.is_following(group):
+            with group.lock:
+                current = getattr(group, status_attr)
+                if (
+                    current == HealthResult.HEALTHY
+                    and result == HealthResult.UNHEALTHY
+                    and len(state.tracked_conns) == 0
+                ):
+                    setattr(group, status_attr, result)
+                    applied = True
+        if applied:
+            if fork_follow.is_leader(group):
+                group._follow.publish_statuses(
+                    group.primary_status, group.secondary_status,
+                )
+            logger.warning(
+                "%s probe: first check reported UNHEALTHY; applied before "
+                "the first connect (primary_uuid=%s)",
+                self._which, group.primary.uuid,
+            )
+        else:
+            logger.debug(
+                "%s probe: first-check verdict %s (left to the next daemon "
+                "tick, primary_uuid=%s)",
+                self._which, result.value, group.primary.uuid,
+            )
+
     @property
     def first_check_complete(self) -> bool:
         return self._first_check_complete.is_set()
@@ -364,9 +406,10 @@ class HealthProbe:
         this path (agent-K PR #10:284): we only want to seed the gate
         before the first connect, not fire a Phase 2 lag wait on the
         caller's thread while they're still inside
-        ``bootstrap_failover_group``. The daemon's next natural tick
-        will apply the verdict with the normal cooldown + drain
-        semantics."""
+        ``bootstrap_failover_group``. An UNHEALTHY verdict with nothing to
+        drain is applied directly (``_apply_first_verdict``, DB-25738);
+        any other change waits for the daemon's next natural tick, with
+        the normal cooldown + drain semantics."""
         if self._first_check_complete.is_set():
             return
         self._tick_check(apply_verdict=False)

@@ -80,6 +80,7 @@ class Connection(BaseConnection[Row]):
     _yb_uuid: str | None = None
     _yb_host: str | None = None
     _yb_released: bool = False  # set once the per-host count is released
+    _yb_lease: Any = None  # registry.ConnLease, once the count is taken
     _yb_cluster: str | None = None  # "primary"/"secondary" when xCluster-routed
 
     def __init__(
@@ -141,6 +142,8 @@ class Connection(BaseConnection[Row]):
             yb_params.xcluster_enabled,
         )
         registry = ClusterRegistry.instance()
+        # Conns garbage-collected without close() (DB-25800).
+        registry.apply_gc_releases()
         route = yb_dispatch.resolve(
             registry, yb_params, cleaned_conninfo, cleaned_kwargs
         )
@@ -215,6 +218,7 @@ class Connection(BaseConnection[Row]):
             conn._yb_uuid = state.uuid
             conn._yb_host = node.host
             conn._yb_cluster = route.cluster
+            registry.attach_lease(conn)
             # A drain armed during the connect: drop the conn and route again.
             if rerouted := yb_dispatch.track_or_reroute(route, conn, node.host):
                 route = rerouted
