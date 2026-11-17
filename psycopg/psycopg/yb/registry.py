@@ -2055,8 +2055,10 @@ class ClusterRegistry:
         Returns True once the failback has been attempted; like an
         automatic one, it can still be refused under
         ``onPhase2Timeout=fail`` (``get_failover_status`` shows the
-        result). Returns False if no group exists for ``primary_uuid``, or
-        if a drain is already running (call again once it has finished).
+        result). Returns False if no group exists for ``primary_uuid``, if
+        a drain is already running (call again once it has finished), or
+        if this is a forked worker following its parent's group: only the
+        process that created the group can fail it back (DB-26378).
 
         Blocks the calling thread for the whole drain and lag wait, up to
         ``drainTimeoutSecs`` + ``lagWaitTimeoutSecs``. From async code, run
@@ -2070,6 +2072,20 @@ class ClusterRegistry:
         from .health import HealthResult
         group = self.get_failover_group(primary_uuid)
         if group is None:
+            return False
+        # DB-26378: a forked worker follows its parent's statuses. A drain
+        # here would flip only the worker's copy (the status is published
+        # only by the leader), and the follower would undo it within ~20 ms
+        # and close the conns it just opened. Refuse instead of reporting
+        # a failback that never happens.
+        if fork_follow.is_following(group):
+            logger.warning(
+                "operator failback not started: this process (pid=%d) is a "
+                "forked worker following the failover group of pid %d; call "
+                "trigger_failback in the process that created the group "
+                "(primary_uuid=%s)",
+                os.getpid(), group._follow.parent_pid, primary_uuid,
+            )
             return False
         with group.lock:
             if group.dispatch_paused or group.drain_in_progress:

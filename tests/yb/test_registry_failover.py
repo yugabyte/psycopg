@@ -205,6 +205,81 @@ def test_trigger_failback_refused_while_a_drain_runs(fresh_registry, fake_state)
     assert group.primary_status == HealthResult.UNHEALTHY
 
 
+class _ParentFollow:
+    """Stand-in for SharedFollowState created by another process."""
+
+    def __init__(self, parent_pid: int) -> None:
+        self.parent_pid = parent_pid
+
+
+def test_trigger_failback_refused_in_following_worker(
+    fresh_registry, fake_state, monkeypatch
+):
+    """DB-26378: in a forked worker that follows its parent, a failback
+    would flip only the worker's copy; the follower undoes it. Refuse
+    (False, no drain) instead of reporting success."""
+    import os
+    from psycopg.yb import drain as drain_mod
+
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    group._follow = _ParentFollow(parent_pid=os.getpid() + 1)
+    stop = threading.Event()
+    follower = threading.Thread(target=stop.wait, daemon=True)
+    follower.start()
+    group._follower_thread = follower
+    calls = []
+    monkeypatch.setattr(drain_mod, "trigger_drain", lambda *a, **k: calls.append(a))
+    try:
+        assert fresh_registry.trigger_failback("P") is False
+    finally:
+        stop.set()
+        follower.join(timeout=2)
+    assert calls == []
+    assert group.primary_status == HealthResult.UNHEALTHY
+    assert group.drain_in_progress is False
+
+
+def test_trigger_failback_allowed_in_worker_running_own_probes(
+    fresh_registry, fake_state
+):
+    """A worker whose follower has stopped (parent gone, or nothing to
+    follow at fork) runs its own probes; its failback goes ahead."""
+    import os
+
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    group._follow = _ParentFollow(parent_pid=os.getpid() + 1)
+    group._follower_thread = None
+
+    assert fresh_registry.trigger_failback("P") is True
+    assert group.primary_status == HealthResult.HEALTHY
+
+
+def test_trigger_failback_allowed_in_leader(fresh_registry, fake_state):
+    """The process that created the group (the leader) fails back and
+    publishes the new status to its workers."""
+    from psycopg.yb.fork_follow import SharedFollowState
+
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary"), uuid="P")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="S")
+    group = _install_group(fresh_registry, p, s, cooldown_s=0)
+    group._probe_drain_timeout_s = 0
+    group.force_primary_status(HealthResult.UNHEALTHY)
+    follow = SharedFollowState(group.primary_status, group.secondary_status)
+    group._follow = follow
+
+    assert fresh_registry.trigger_failback("P") is True
+    assert group.primary_status == HealthResult.HEALTHY
+    assert follow.read()["primary"] == HealthResult.HEALTHY
+
+
 def test_trigger_failback_honours_fail_on_lag_timeout(fresh_registry, fake_state):
     """Same Phase 2 rules as an automatic failback: under
     onPhase2Timeout=fail an unconfirmed lag keeps routing on the

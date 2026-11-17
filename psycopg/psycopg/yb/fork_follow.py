@@ -241,6 +241,16 @@ def is_leader(group: "FailoverGroup") -> bool:
     return follow is not None and follow.parent_pid == os.getpid()
 
 
+def is_following(group: "FailoverGroup") -> bool:
+    """True while this process is a forked worker whose follower thread
+    mirrors the parent's statuses. False in the parent, and in a worker
+    that runs its own probes (nothing to follow, or the parent exited)."""
+    if is_leader(group):
+        return False
+    t = getattr(group, "_follower_thread", None)
+    return t is not None and t.is_alive()
+
+
 def ensure_shared_state(group: "FailoverGroup") -> None:
     """Allocate the mapping in the process that runs the probes. Called
     from ``_start_probe``, which always runs before an app forks."""
