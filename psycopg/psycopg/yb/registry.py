@@ -1008,6 +1008,18 @@ class FailoverGroup:
         # Per-cluster: fresh lock, dropped sockets, dropped WeakSet.
         for state in (self.primary, self.secondary):
             state.lock = threading.Lock()
+            # DB-26384: the counts below are zeroed, so the conns opened
+            # before the fork no longer hold one here. Mark them released,
+            # or a child that closes one (or lets it be collected) would
+            # decrement a count it never took.
+            for conn in list(state.tracked_conns):
+                lease = getattr(conn, "_yb_lease", None)
+                if isinstance(lease, ConnLease):
+                    lease.released = True
+                try:
+                    conn._yb_released = True
+                except Exception:
+                    pass
             state.tracked_conns = weakref.WeakSet()
             # DROP (don't close) — closing would FIN the socket that is
             # still shared with the parent. Null out the references and

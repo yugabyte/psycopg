@@ -498,6 +498,47 @@ def test_reset_for_child_zeroes_connection_counts(fake_state, fresh_registry):
     assert [n.connection_count for n in s.nodes.values()] == [0]
 
 
+class _InheritedConn:
+    """A counted conn the parent opened before the fork."""
+
+    def __init__(self, uuid: str, host: str) -> None:
+        self._yb_uuid = uuid
+        self._yb_host = host
+
+
+def test_reset_for_child_marks_inherited_conns_released(fake_state, fresh_registry):
+    """DB-26384: the child zeroes the counts, so a conn opened before the
+    fork must not decrement the child's count when the child closes it
+    or it is garbage-collected."""
+    import gc
+
+    p = fake_state(("p1", "aws", "us-west", "us-west-1a", "primary", 2), uuid="PRIMARY-A")
+    s = fake_state(("s1", "aws", "us-east", "us-east-1a", "primary"), uuid="SECONDARY-B")
+    group = FailoverGroup(
+        primary=p, secondary=s, lock=threading.Lock(),
+        primary_status=HealthResult.HEALTHY,
+        secondary_status=HealthResult.HEALTHY,
+        cooldown_s=0,
+    )
+    fresh_registry._clusters[p.uuid] = p
+    fresh_registry._clusters[s.uuid] = s
+    fresh_registry._failover_groups[p.uuid] = group
+    closed = _InheritedConn("PRIMARY-A", "p1")
+    collected = _InheritedConn("PRIMARY-A", "p1")
+    for c in (closed, collected):
+        fresh_registry.attach_lease(c)
+        p.tracked_conns.add(c)
+
+    group._reset_for_child()
+    fresh_registry.increment("PRIMARY-A", "p1")    # the child's own conn
+
+    fresh_registry.release_conn(closed)
+    del collected
+    gc.collect()
+    fresh_registry.apply_gc_releases()
+    assert p.nodes["p1"].connection_count == 1
+
+
 def _child_body_bootstrap_lock(_, out_queue):
     try:
         _after_fork_in_child()
